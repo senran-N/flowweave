@@ -1,8 +1,17 @@
-use std::{env, fmt::Write as _, fs, io, process::Command, time::Duration};
+use std::{
+    env,
+    fmt::Write as _,
+    fs, io,
+    net::Ipv4Addr,
+    process::Command,
+    sync::atomic::{AtomicU64, Ordering},
+    time::{Duration, Instant},
+};
 
 use flowweave_lab::{
-    DatagramMeasurement, FailoverReport, LabResult, MultipathScheduler, NetworkBenchmarkConfig,
-    NetworkBenchmarkReport, PathMode, SustainedBenchmarkConfig, run_blackhole_failover,
+    CapacityProbeConfig, CapacityProbeReport, DatagramMeasurement, FailoverReport, LabResult,
+    MultipathScheduler, NetworkBenchmarkConfig, NetworkBenchmarkReport, PathMode,
+    SustainedBenchmarkConfig, run_blackhole_failover, run_local_capacity_probe,
     run_network_benchmark, run_sustained_network_benchmark,
 };
 
@@ -12,6 +21,7 @@ const SCREENING_TRANSFER_SIZE: usize = 2 * MIB;
 const LONG_WARMUP_DURATION: Duration = Duration::from_secs(2);
 const LONG_MEASUREMENT_DURATION: Duration = Duration::from_secs(20);
 const LONG_CHUNK_SIZE: usize = 512 * KIB;
+const CAPACITY_PROBE_RECEIVER_IP: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 3);
 
 #[derive(Clone, Copy)]
 struct LinkProfile {
@@ -152,6 +162,113 @@ struct ScreeningObservation {
     seeds: NetemSeeds,
     participant: ScreeningParticipant,
     report: NetworkBenchmarkReport,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CapacityProbePath {
+    LineOne,
+    LineTwo,
+}
+
+impl CapacityProbePath {
+    const ALL: [Self; 2] = [Self::LineOne, Self::LineTwo];
+
+    fn description(self) -> &'static str {
+        match self {
+            Self::LineOne => "线路一",
+            Self::LineTwo => "线路二",
+        }
+    }
+
+    fn source_ip(self) -> Ipv4Addr {
+        match self {
+            Self::LineOne => Ipv4Addr::new(127, 0, 0, 1),
+            Self::LineTwo => Ipv4Addr::new(127, 0, 0, 2),
+        }
+    }
+
+    fn expected_mbps(self) -> f64 {
+        match self {
+            Self::LineOne => 8.0,
+            Self::LineTwo => 25.0,
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CapacityProbeCandidate {
+    PacketTrain,
+    ChirpCurveFit,
+}
+
+impl CapacityProbeCandidate {
+    const ALL: [Self; 2] = [Self::PacketTrain, Self::ChirpCurveFit];
+
+    fn description(self) -> &'static str {
+        match self {
+            Self::PacketTrain => "背靠背 Packet Train",
+            Self::ChirpCurveFit => "Chirp 排队曲线拟合",
+        }
+    }
+
+    fn config(self, path: CapacityProbePath) -> CapacityProbeConfig {
+        match self {
+            Self::PacketTrain => {
+                CapacityProbeConfig::packet_train(path.source_ip(), CAPACITY_PROBE_RECEIVER_IP)
+            }
+            Self::ChirpCurveFit => {
+                CapacityProbeConfig::chirp(path.source_ip(), CAPACITY_PROBE_RECEIVER_IP)
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct CapacityProbeParticipant {
+    path: CapacityProbePath,
+    candidate: CapacityProbeCandidate,
+}
+
+impl CapacityProbeParticipant {
+    const ALL: [Self; 4] = [
+        Self {
+            path: CapacityProbePath::LineOne,
+            candidate: CapacityProbeCandidate::PacketTrain,
+        },
+        Self {
+            path: CapacityProbePath::LineTwo,
+            candidate: CapacityProbeCandidate::PacketTrain,
+        },
+        Self {
+            path: CapacityProbePath::LineOne,
+            candidate: CapacityProbeCandidate::ChirpCurveFit,
+        },
+        Self {
+            path: CapacityProbePath::LineTwo,
+            candidate: CapacityProbeCandidate::ChirpCurveFit,
+        },
+    ];
+
+    fn description(self) -> String {
+        format!(
+            "{} / {}",
+            self.path.description(),
+            self.candidate.description()
+        )
+    }
+
+    fn config(self) -> CapacityProbeConfig {
+        self.candidate.config(self.path)
+    }
+}
+
+struct CapacityProbeObservation {
+    round: usize,
+    seeds: NetemSeeds,
+    participant: CapacityProbeParticipant,
+    report: CapacityProbeReport,
+    cpu_time: Duration,
+    cpu_utilization_percent: f64,
 }
 
 struct NumericSummary {
@@ -344,6 +461,90 @@ async fn scheduler_five_seed_screening_lab() -> LabResult<()> {
     Ok(())
 }
 
+#[test]
+#[ignore = "必须通过 scripts/run_netem_lab.sh probe 在隔离网络命名空间中运行"]
+fn capacity_probe_five_seed_lab() -> LabResult<()> {
+    ensure_isolated_network_namespace()?;
+
+    const RESULT_PATH: &str = "benchmark-results/2026-07-11-capacity-probe-screening.csv";
+    let profiles = AggregationScenario::Heterogeneous.profiles();
+    let one_round_probe_bytes: usize = CapacityProbeParticipant::ALL
+        .iter()
+        .map(|participant| participant.config().estimated_wire_bytes())
+        .sum();
+    let byte_budget = SCREENING_TRANSFER_SIZE / 20;
+    if one_round_probe_bytes > byte_budget {
+        return Err(lab_error(format!(
+            "容量传感器一轮预计发送 {one_round_probe_bytes} 字节，超过 2 MiB 短流的 5% 预算 {byte_budget} 字节"
+        )));
+    }
+
+    println!();
+    println!("FlowWeave / 织流：独立容量传感器五种子实验");
+    println!("目标不是调度数据，而是先证明能可靠区分 8 Mbit/s 与 25 Mbit/s。");
+    println!(
+        "同一轮比较两个候选、两条线路，共计约 {one_round_probe_bytes} 字节，占 2 MiB 短流 {:.2}%。",
+        one_round_probe_bytes as f64 / SCREENING_TRANSFER_SIZE as f64 * 100.0
+    );
+    println!("探测耗时、丢包、内核接收时间戳异常和 CPU 全部计账，没有免费预热。");
+
+    let ticks_per_second = process_clock_ticks_per_second()?;
+    let mut observations =
+        Vec::with_capacity(SEED_PAIRS.len() * CapacityProbeParticipant::ALL.len());
+    write_capacity_probe_csv(RESULT_PATH, &observations)?;
+
+    for (round_index, seeds) in SEED_PAIRS.iter().copied().enumerate() {
+        let round = round_index + 1;
+        let order = capacity_probe_order(round_index);
+        println!();
+        println!(
+            "第 {round} 轮：线路一种子 {}，线路二种子 {}；顺序 {}",
+            seeds.line_one,
+            seeds.line_two,
+            order
+                .iter()
+                .map(|participant| participant.description())
+                .collect::<Vec<_>>()
+                .join(" → ")
+        );
+
+        for participant in order {
+            apply_profiles(profiles.0, profiles.1, seeds)?;
+            let cpu_before = read_process_cpu_ticks()?;
+            let wall_started = Instant::now();
+            let report = run_local_capacity_probe(participant.config())?;
+            let wall_elapsed = wall_started.elapsed();
+            let cpu_ticks = read_process_cpu_ticks()?.saturating_sub(cpu_before);
+            let cpu_time = Duration::from_secs_f64(cpu_ticks as f64 / ticks_per_second as f64);
+            let cpu_utilization_percent = if wall_elapsed.is_zero() {
+                0.0
+            } else {
+                cpu_time.as_secs_f64() / wall_elapsed.as_secs_f64() * 100.0
+            };
+            print_capacity_probe_observation(
+                participant,
+                &report,
+                cpu_time,
+                cpu_utilization_percent,
+            );
+            observations.push(CapacityProbeObservation {
+                round,
+                seeds,
+                participant,
+                report,
+                cpu_time,
+                cpu_utilization_percent,
+            });
+            write_capacity_probe_csv(RESULT_PATH, &observations)?;
+        }
+    }
+
+    print_capacity_probe_summary(&observations, one_round_probe_bytes);
+    println!();
+    println!("原始容量探测数据已写入 {RESULT_PATH}");
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "必须通过 scripts/run_netem_lab.sh long 在隔离网络命名空间中运行"]
 async fn scheduler_long_duration_benchmark_lab() -> LabResult<()> {
@@ -417,6 +618,16 @@ fn screening_order(round_index: usize) -> Vec<ScreeningParticipant> {
     order
 }
 
+fn capacity_probe_order(round_index: usize) -> Vec<CapacityProbeParticipant> {
+    let mut order = CapacityProbeParticipant::ALL.to_vec();
+    let len = order.len();
+    order.rotate_left(round_index % len);
+    if round_index % 2 == 1 {
+        order.reverse();
+    }
+    order
+}
+
 #[test]
 fn incomplete_round_does_not_invent_single_path_baseline() {
     assert!(
@@ -479,8 +690,71 @@ fn apply_profiles(
     line_two: LinkProfile,
     seeds: NetemSeeds,
 ) -> LabResult<()> {
+    if env::var("FLOWWEAVE_LAB_MODE").as_deref() == Ok("probe") {
+        replace_probe_line_profile("1:1", "10:", "10:1", "11:", line_one, seeds.line_one)?;
+        return replace_probe_line_profile("1:2", "20:", "20:1", "21:", line_two, seeds.line_two);
+    }
+
     replace_line_profile("1:1", "10:", line_one, seeds.line_one)?;
     replace_line_profile("1:2", "20:", line_two, seeds.line_two)
+}
+
+fn replace_probe_line_profile(
+    parent: &'static str,
+    shaper_handle: &'static str,
+    netem_parent: &'static str,
+    netem_handle: &'static str,
+    profile: LinkProfile,
+    seed: u32,
+) -> LabResult<()> {
+    let rate_mbit = profile
+        .rate
+        .strip_suffix("mbit")
+        .ok_or_else(|| lab_error("容量探针限速只接受 mbit 单位"))?
+        .parse::<u64>()?;
+    let peak_rate = format!("{}kbit", rate_mbit.saturating_mul(1_000).saturating_add(1));
+    run_tc(&[
+        "qdisc",
+        "replace",
+        "dev",
+        "lo",
+        "parent",
+        parent,
+        "handle",
+        shaper_handle,
+        "tbf",
+        "rate",
+        profile.rate,
+        "burst",
+        "32kb",
+        "peakrate",
+        &peak_rate,
+        "minburst",
+        "1600",
+        "latency",
+        "100ms",
+    ])?;
+
+    let seed = seed.to_string();
+    run_tc(&[
+        "qdisc",
+        "replace",
+        "dev",
+        "lo",
+        "parent",
+        netem_parent,
+        "handle",
+        netem_handle,
+        "netem",
+        "limit",
+        "10000",
+        "delay",
+        profile.delay,
+        "loss",
+        profile.loss,
+        "seed",
+        &seed,
+    ])
 }
 
 fn replace_line_profile(
@@ -775,6 +1049,166 @@ fn print_screening_summary(observations: &[ScreeningObservation]) {
     }
 }
 
+fn print_capacity_probe_observation(
+    participant: CapacityProbeParticipant,
+    report: &CapacityProbeReport,
+    cpu_time: Duration,
+    cpu_utilization_percent: f64,
+) {
+    let estimate = report
+        .estimated_mbps
+        .map(|value| format!("{value:.2} Mbit/s"))
+        .unwrap_or_else(|| "无可用估计".to_owned());
+    let quality = if report.usable {
+        "可用".to_owned()
+    } else {
+        format!(
+            "拒绝：{}",
+            report.rejection_reason.as_deref().unwrap_or("原因未知")
+        )
+    };
+    println!(
+        "- {}：估计 {estimate}（真实 {:.0}）；{quality}；收到 {}/{}（内核时间戳 {}，缺失 {}），耗时 {:.2} ms，时间戳异常 {}，CPU {:.2} ms / {:.1}%",
+        participant.description(),
+        participant.path.expected_mbps(),
+        report.received_packets,
+        report.sent_packets,
+        report.timestamped_packets,
+        report.missing_receive_timestamps,
+        milliseconds(report.elapsed),
+        report.timestamp_anomalies,
+        milliseconds(cpu_time),
+        cpu_utilization_percent,
+    );
+    match participant.candidate {
+        CapacityProbeCandidate::PacketTrain => println!(
+            "  Packet Train 包间隔波动系数：{}",
+            optional_number(report.packet_train_gap_cv, 4)
+        ),
+        CapacityProbeCandidate::ChirpCurveFit => println!(
+            "  Chirp 排队信号 {} 微秒，拟合 RMSE {} 微秒，归一化误差 {}",
+            optional_number(report.queue_signal_us, 2),
+            optional_number(report.fit_rmse_us, 2),
+            optional_number(report.normalized_fit_error, 4),
+        ),
+    }
+}
+
+fn print_capacity_probe_summary(
+    observations: &[CapacityProbeObservation],
+    one_round_probe_bytes: usize,
+) {
+    println!();
+    println!("五种子容量传感器汇总：");
+    println!(
+        "提前锁定门槛：快慢排名 5/5 正确、容量比例误差每轮不超过 20%、一轮探测不超过 2 MiB 的 5%。"
+    );
+
+    let expected_ratio =
+        CapacityProbePath::LineTwo.expected_mbps() / CapacityProbePath::LineOne.expected_mbps();
+    for candidate in CapacityProbeCandidate::ALL {
+        let matching: Vec<_> = observations
+            .iter()
+            .filter(|observation| observation.participant.candidate == candidate)
+            .collect();
+        let usable = matching
+            .iter()
+            .filter(|observation| observation.report.usable)
+            .count();
+        let losses: usize = matching
+            .iter()
+            .map(|observation| observation.report.lost_packets)
+            .sum();
+        let timestamp_anomalies: usize = matching
+            .iter()
+            .map(|observation| observation.report.timestamp_anomalies)
+            .sum();
+        let cpu = NumericSummary::from_samples(
+            matching
+                .iter()
+                .map(|observation| observation.cpu_utilization_percent),
+        );
+
+        let mut rank_correct = 0;
+        let mut ratio_passes = 0;
+        let mut ratio_errors = Vec::new();
+        for round in 1..=SEED_PAIRS.len() {
+            let line_one =
+                capacity_estimate(observations, candidate, CapacityProbePath::LineOne, round);
+            let line_two =
+                capacity_estimate(observations, candidate, CapacityProbePath::LineTwo, round);
+            if let (Some(line_one), Some(line_two)) = (line_one, line_two) {
+                if line_two > line_one {
+                    rank_correct += 1;
+                }
+                let ratio_error = ((line_two / line_one) / expected_ratio - 1.0).abs() * 100.0;
+                if ratio_error <= 20.0 {
+                    ratio_passes += 1;
+                }
+                ratio_errors.push(ratio_error);
+            }
+        }
+        let ratio_summary = (!ratio_errors.is_empty())
+            .then(|| NumericSummary::from_samples(ratio_errors.iter().copied()));
+        let retained_probe_bytes: usize = CapacityProbePath::ALL
+            .iter()
+            .map(|path| candidate.config(*path).estimated_wire_bytes())
+            .sum();
+        let passed = usable == SEED_PAIRS.len() * CapacityProbePath::ALL.len()
+            && rank_correct == SEED_PAIRS.len()
+            && ratio_passes == SEED_PAIRS.len()
+            && one_round_probe_bytes <= SCREENING_TRANSFER_SIZE / 20;
+
+        println!();
+        println!(
+            "- {}：{}",
+            candidate.description(),
+            if passed {
+                "通过初筛"
+            } else {
+                "未通过初筛"
+            }
+        );
+        println!(
+            "  可用读数 {usable}/{}；快慢排名 {rank_correct}/5；比例误差 20% 门槛 {ratio_passes}/5",
+            SEED_PAIRS.len() * CapacityProbePath::ALL.len(),
+        );
+        if let Some(summary) = ratio_summary {
+            println!(
+                "  容量比例误差：中位 {:.2}%，最差/最高 {:.2}%，范围 {:.2}%～{:.2}%",
+                summary.median, summary.maximum, summary.minimum, summary.maximum
+            );
+        } else {
+            println!("  容量比例误差：没有成对可用读数");
+        }
+        println!(
+            "  若只保留该方法，每次测两条路约 {retained_probe_bytes} 字节，占 2 MiB 短流 {:.2}%",
+            retained_probe_bytes as f64 / SCREENING_TRANSFER_SIZE as f64 * 100.0
+        );
+        println!(
+            "  总丢包 {losses}，时间戳异常 {timestamp_anomalies}；CPU 中位 {:.1}%，最高 {:.1}%",
+            cpu.median, cpu.maximum
+        );
+    }
+}
+
+fn capacity_estimate(
+    observations: &[CapacityProbeObservation],
+    candidate: CapacityProbeCandidate,
+    path: CapacityProbePath,
+    round: usize,
+) -> Option<f64> {
+    observations
+        .iter()
+        .find(|observation| {
+            observation.round == round
+                && observation.participant.candidate == candidate
+                && observation.participant.path == path
+                && observation.report.usable
+        })
+        .and_then(|observation| observation.report.estimated_mbps)
+}
+
 fn best_single_throughput(
     observations: &[ScreeningObservation],
     scenario: AggregationScenario,
@@ -868,6 +1302,106 @@ fn write_benchmark_csv(path: &str, observations: &[ScreeningObservation]) -> Lab
     fs::create_dir_all("benchmark-results")?;
     fs::write(path, csv)?;
     Ok(())
+}
+
+fn write_capacity_probe_csv(
+    path: &str,
+    observations: &[CapacityProbeObservation],
+) -> LabResult<()> {
+    let mut csv = String::from(
+        "round,line_one_seed,line_two_seed,path,method,expected_mbps,estimated_mbps,usable,rejection_reason,sent_packets,received_packets,timestamped_packets,missing_receive_timestamps,lost_packets,payload_bytes_sent,estimated_wire_bytes_sent,elapsed_ms,timestamp_anomalies,max_consecutive_timestamp_anomalies,out_of_order_packets,fit_rmse_us,normalized_fit_error,queue_signal_us,packet_train_gap_cv,cpu_time_ms,cpu_utilization_percent\n",
+    );
+
+    for observation in observations {
+        writeln!(
+            csv,
+            "{},{},{},{},{},{:.6},{},{},{},{},{},{},{},{},{},{},{:.3},{},{},{},{},{},{},{},{:.3},{:.6}",
+            observation.round,
+            observation.seeds.line_one,
+            observation.seeds.line_two,
+            observation.participant.path.description(),
+            observation.participant.candidate.description(),
+            observation.participant.path.expected_mbps(),
+            optional_csv_number(observation.report.estimated_mbps),
+            observation.report.usable,
+            csv_field(observation.report.rejection_reason.as_deref().unwrap_or("")),
+            observation.report.sent_packets,
+            observation.report.received_packets,
+            observation.report.timestamped_packets,
+            observation.report.missing_receive_timestamps,
+            observation.report.lost_packets,
+            observation.report.payload_bytes_sent,
+            observation.report.estimated_wire_bytes_sent,
+            milliseconds(observation.report.elapsed),
+            observation.report.timestamp_anomalies,
+            observation.report.maximum_consecutive_timestamp_anomalies,
+            observation.report.out_of_order_packets,
+            optional_csv_number(observation.report.fit_rmse_us),
+            optional_csv_number(observation.report.normalized_fit_error),
+            optional_csv_number(observation.report.queue_signal_us),
+            optional_csv_number(observation.report.packet_train_gap_cv),
+            milliseconds(observation.cpu_time),
+            observation.cpu_utilization_percent,
+        )?;
+    }
+
+    fs::create_dir_all("benchmark-results")?;
+    fs::write(path, csv)?;
+    Ok(())
+}
+
+fn optional_number(value: Option<f64>, precision: usize) -> String {
+    value
+        .map(|value| format!("{value:.precision$}"))
+        .unwrap_or_else(|| "无".to_owned())
+}
+
+fn optional_csv_number(value: Option<f64>) -> String {
+    value.map(|value| format!("{value:.6}")).unwrap_or_default()
+}
+
+fn csv_field(value: &str) -> String {
+    format!("\"{}\"", value.replace('"', "\"\""))
+}
+
+fn read_process_cpu_ticks() -> LabResult<u64> {
+    let stat = fs::read_to_string("/proc/self/stat")?;
+    let fields = stat
+        .rfind(") ")
+        .map(|index| &stat[index + 2..])
+        .ok_or_else(|| lab_error("无法解析 /proc/self/stat 中的进程名称"))?;
+    let mut fields = fields.split_whitespace();
+    let user_ticks = fields
+        .nth(11)
+        .ok_or_else(|| lab_error("/proc/self/stat 缺少用户 CPU 时间"))?
+        .parse::<u64>()?;
+    let system_ticks = fields
+        .next()
+        .ok_or_else(|| lab_error("/proc/self/stat 缺少系统 CPU 时间"))?
+        .parse::<u64>()?;
+    Ok(user_ticks.saturating_add(system_ticks))
+}
+
+fn process_clock_ticks_per_second() -> LabResult<u64> {
+    static TICKS_PER_SECOND: AtomicU64 = AtomicU64::new(0);
+    let cached = TICKS_PER_SECOND.load(Ordering::Relaxed);
+    if cached != 0 {
+        return Ok(cached);
+    }
+
+    let output = Command::new("getconf").arg("CLK_TCK").output()?;
+    if !output.status.success() {
+        return Err(lab_error(format!(
+            "getconf CLK_TCK 失败：{}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    let ticks = String::from_utf8(output.stdout)?.trim().parse::<u64>()?;
+    if ticks == 0 {
+        return Err(lab_error("getconf CLK_TCK 返回了 0"));
+    }
+    TICKS_PER_SECOND.store(ticks, Ordering::Relaxed);
+    Ok(ticks)
 }
 
 fn optional_milliseconds(duration: Option<Duration>) -> String {

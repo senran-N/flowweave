@@ -21,7 +21,11 @@ use tokio::{
     time::{sleep, timeout},
 };
 
+mod capacity_probe;
 mod scheduler;
+pub use capacity_probe::{
+    CapacityProbeConfig, CapacityProbeMethod, CapacityProbeReport, run_local_capacity_probe,
+};
 pub use scheduler::MultipathScheduler;
 
 pub type LabError = Box<dyn Error + Send + Sync + 'static>;

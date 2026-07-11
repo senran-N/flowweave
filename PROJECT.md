@@ -109,6 +109,14 @@
 - 这说明完成时间公式在已知真实容量时可以成立，但容量输入不可直接从未饱和、被调度器限流的 ACK 流中得到。确定性测试把真实 8:25 速率作为已知输入，因此不能替代这一可观测性检查。
 - ACK-ECF 没有通过短筛，未运行长测，代码、开关和筛选参赛项已完整删除。下一路线必须只在路径被明确饱和或受控探测时估容量，并区分“应用受限”“调度器受限”和“线路受限”；优先调查 packet-pair / packet-train、pathChirp 与 BBR 式 delivery sampler，而不是继续平滑同一份循环反馈。
 
+随后独立实现并真实筛选 packet train 与 Chirp 排队曲线拟合容量传感器。两个候选每次测两条路各约占 2 MiB 短流的 1.87%，先后使用用户态时间戳、Linux 内核接收时间戳，以及把限速与 netem 延迟/丢包拆开的实验场。四轮诊断最终仍未过线；最后一轮原始数据保存在 `benchmark-results/2026-07-11-capacity-probe-screening.csv`：
+
+- Packet Train 只有 4/10 个读数通过自身质量门槛，快慢排名 1/5，容量比例误差门槛 1/5。
+- Chirp 有 9/10 个读数通过自身质量门槛，快慢排名 4/5，但容量比例误差门槛仅 1/5，中位比例误差 49.62%。
+- 多个严重错误的 Chirp 读数仍有很低的归一化拟合误差，证明“曲线拟合得好”不等于路径真的服从该流体队列模型；当前置信度会被模型失配欺骗。
+- 本地回环上的短探针强烈受限速器令牌初态、定时器和多级队列影响，不能认证真实 WAN 可用容量。
+- 同一路线已超过三次失败，现按规则停止。失败实现将在实验快照后完整删除，不接 NoQ；完整论文推导、四轮诊断和下一步选择见 `CAPACITY_PROBE_RESEARCH.md`。
+
 ## 这些结果说明什么
 
 - NoQ 默认行为确实能让两条 Available 路径同时发送数据。
@@ -125,9 +133,11 @@
 - Cargo.lock：由 Cargo 生成，锁定所有间接依赖的准确版本。
 - BENCHMARK.md：提前锁定怎样才算公平、稳定地优于 Hysteria 2。
 - SCHEDULER_RESEARCH.md：记录 MPQUIC/MPTCP 调度论文、关键公式，以及 ACK-ECF 为什么在“真实容量不可直接观测”这一点上失败。
+- CAPACITY_PROBE_RESEARCH.md：记录 packet train、pathChirp、Voyager、PathKatana、QUIC Receive Timestamps 与 BBR 的容量测量推导，以及独立传感器为何在真实五种子实验中失败。
 - src/main.rs：普通实验的启动入口和中文结果展示入口。
 - src/lib.rs：可复用的 MPQUIC 连接、传输校验、指标采集和断路实验逻辑；NoQ 相关操作集中在这里。
 - src/scheduler.rs：FlowWeave 对外展示的调度名称；当前只有 NoQ 默认基线，失败候选不保留。
+- src/capacity_probe.rs：容量传感器失败实验快照；仅用于保存本轮可回退证据，下一次清场提交会删除。
 - benchmark-results：真实运行产生的逐轮原始数据和说明；失败轮次不删除。
 - tests/network_lab.rs：四类坏网络场景、单路径对照和安全护栏。
 - scripts/run_netem_lab.sh：进入一次性隔离网络空间，启动 smoke、screen 或 release 长时实验。
