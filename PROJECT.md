@@ -10,7 +10,7 @@
 - B：多条线路可以共同传输，提高总速度。
 - C：丢包严重时，实时数据仍尽量保持低延迟。
 
-目前处于第二阶段 B 的候选调度筛选，不是可日常使用的代理软件，也没有宣称性能超过 Hysteria 2、VLESS 或其他现有方案。
+目前暂停第二阶段 B 的容量观测路线，转入第二阶段 A 的快速换网候选筛选；项目还不是可日常使用的代理软件，也没有宣称性能超过 Hysteria 2、VLESS 或其他现有方案。
 
 ## 当前技术选择
 
@@ -141,6 +141,7 @@
 - BENCHMARK.md：提前锁定怎样才算公平、稳定地优于 Hysteria 2。
 - SCHEDULER_RESEARCH.md：记录 MPQUIC/MPTCP 调度论文、关键公式，以及 ACK-ECF 为什么在“真实容量不可直接观测”这一点上失败。
 - CAPACITY_PROBE_RESEARCH.md：记录 packet train、pathChirp、Voyager、PathKatana、QUIC Receive Timestamps 与 BBR 的容量测量推导，以及独立传感器为何在真实五种子实验中失败。
+- FAILOVER_RESEARCH.md：锁定 PTO 对冲补发的数学模型、状态机、安全边界和五种子短筛门槛；候选尚未实现。
 - src/main.rs：普通实验的启动入口和中文结果展示入口。
 - src/lib.rs：可复用的 MPQUIC 连接、传输校验、指标采集和断路实验逻辑；NoQ 相关操作集中在这里。
 - src/scheduler.rs：FlowWeave 对外展示的调度名称；当前只有 NoQ 默认基线，失败候选不保留。
@@ -170,6 +171,7 @@
 - 不扩大 NoQ fork；当前偏离严格记录在 `third_party/README.md`，升级时可逐文件撤销重放。
 - B 的轮询、MinRTT、预计送达、交付速率加权和 ACK-ECF 都已按原始数据删除；下一候选必须先有论文依据，再经过同一五种子门槛。
 - 下一路线必须解决“容量怎样被可靠观测”，不能再把调度器自己制造的 ACK 速率当成线路上限；完整推导与失败证据见 `SCHEDULER_RESEARCH.md`。
+- A 的第一候选是 MPQUIC 草案允许的 PTO 跨路径对冲补发：先快速恢复数据，再保守判断路径是否死亡；实现必须通过 `FAILOVER_RESEARCH.md` 的误触发和额外流量门槛。
 - C 先验证关键 Datagram 双发，再决定是否引入 FEC；不能因为流吞吐量变好就忽略实时包仍大量丢失。
 
 ## 当前明确没有做
