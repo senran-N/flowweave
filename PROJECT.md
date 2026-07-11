@@ -116,6 +116,7 @@
 - Cargo.toml：项目名称和经过核实、锁定版本的依赖。
 - Cargo.lock：由 Cargo 生成，锁定所有间接依赖的准确版本。
 - BENCHMARK.md：提前锁定怎样才算公平、稳定地优于 Hysteria 2。
+- SCHEDULER_RESEARCH.md：记录 MPQUIC/MPTCP 调度论文、关键公式、失败算法的数学原因和下一候选 ACK-ECF 的设计边界。
 - src/main.rs：普通实验的启动入口和中文结果展示入口。
 - src/lib.rs：可复用的 MPQUIC 连接、传输校验、指标采集和断路实验逻辑；NoQ 相关操作集中在这里。
 - src/scheduler.rs：FlowWeave 对外展示的调度名称；当前只有 NoQ 默认基线，失败候选不保留。
@@ -144,6 +145,7 @@
 - 没有真实调度收益，不宣称带宽聚合。
 - 不扩大 NoQ fork；当前偏离严格记录在 `third_party/README.md`，升级时可逐文件撤销重放。
 - B 的轮询、MinRTT、预计送达和交付速率加权都已按原始数据删除；下一候选必须先有论文依据，再经过同一五种子门槛。
+- 下一候选工作名为 ACK-ECF：使用 ACK 确认交付率、在途字节和最小 RTT 预测到达时间，并引入有上界的等待动作；完整推导见 `SCHEDULER_RESEARCH.md`。
 - C 先验证关键 Datagram 双发，再决定是否引入 FEC；不能因为流吞吐量变好就忽略实时包仍大量丢失。
 
 ## 当前明确没有做
