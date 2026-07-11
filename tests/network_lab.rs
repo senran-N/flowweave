@@ -93,10 +93,11 @@ enum ScreeningParticipant {
 }
 
 impl ScreeningParticipant {
-    const ALL: [Self; 3] = [
+    const ALL: [Self; 4] = [
         Self::LineOne,
         Self::LineTwo,
         Self::Multipath(MultipathScheduler::NoqDefault),
+        Self::Multipath(MultipathScheduler::AckEcf),
     ];
 
     fn description(self) -> &'static str {
@@ -290,7 +291,7 @@ async fn controlled_bad_network_lab() -> LabResult<()> {
 async fn scheduler_five_seed_screening_lab() -> LabResult<()> {
     ensure_isolated_network_namespace()?;
 
-    const RESULT_PATH: &str = "benchmark-results/2026-07-11-scheduler-screening-survivors.csv";
+    const RESULT_PATH: &str = "benchmark-results/2026-07-11-ack-ecf-screening.csv";
     println!();
     println!("FlowWeave / 织流：多路径调度五种子筛选");
     println!("这是 2 MiB 候选筛选，不是 BENCHMARK.md 规定的 20 秒/64 MiB 最终验收。");
@@ -349,7 +350,7 @@ async fn scheduler_five_seed_screening_lab() -> LabResult<()> {
 async fn scheduler_long_duration_benchmark_lab() -> LabResult<()> {
     ensure_isolated_network_namespace()?;
 
-    const RESULT_PATH: &str = "benchmark-results/2026-07-11-scheduler-long-survivors.csv";
+    const RESULT_PATH: &str = "benchmark-results/2026-07-11-ack-ecf-long.csv";
     println!();
     println!("FlowWeave / 织流：B 组长时聚合复赛");
     println!(
@@ -357,7 +358,7 @@ async fn scheduler_long_duration_benchmark_lab() -> LabResult<()> {
         LONG_WARMUP_DURATION.as_secs(),
         LONG_MEASUREMENT_DURATION.as_secs(),
     );
-    println!("参赛者：两条单路、NoQ 默认；当前没有通过筛选的自定义候选。");
+    println!("参赛者：两条单路、NoQ 默认和当前唯一候选 ACK-ECF。");
 
     let mut observations = Vec::with_capacity(
         AggregationScenario::ALL.len() * SEED_PAIRS.len() * ScreeningParticipant::ALL.len(),
