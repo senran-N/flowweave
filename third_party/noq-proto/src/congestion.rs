@@ -110,7 +110,6 @@ pub trait Controller: Send + Sync + std::fmt::Debug {
             ssthresh: None,
             pacing_rate: None,
             send_quantum: None,
-            bandwidth_estimate: None,
         }
     }
 
@@ -138,34 +137,6 @@ pub struct ControllerMetrics {
     pub pacing_rate: Option<u64>,
     /// Send Quantum (bytes) used to control the size of packet bursts
     pub send_quantum: Option<u64>,
-    /// Read-only bandwidth estimate, when the controller has an explicit bandwidth model.
-    ///
-    /// Loss-based controllers which do not maintain such a model return `None`; callers must not
-    /// substitute congestion window or pacing rate for this value.
-    pub bandwidth_estimate: Option<BandwidthEstimate>,
-}
-
-/// Read-only evidence behind a congestion controller's path bandwidth estimate.
-///
-/// All rates use bytes per second. `qualified` means the controller has explicit evidence that it
-/// filled the path rather than merely observing an application-limited delivery rate.
-#[derive(Debug, Default, Copy, Clone, PartialEq, Eq)]
-#[non_exhaustive]
-pub struct BandwidthEstimate {
-    /// Controller's windowed path bandwidth estimate.
-    pub bytes_per_second: u64,
-    /// Most recent delivery-rate sample.
-    pub latest_delivery_rate: u64,
-    /// Whether the controller considers the windowed estimate qualified by a filled-pipe test.
-    pub qualified: bool,
-    /// Whether the most recent delivery-rate sample was application-limited.
-    pub latest_sample_app_limited: bool,
-    /// Whether the congestion window was fully utilized during the current packet-timed round.
-    pub congestion_window_limited: bool,
-    /// Whether the controller is currently increasing load to probe for bandwidth.
-    pub actively_probing: bool,
-    /// Current packet-timed round number, useful for detecting whether telemetry has advanced.
-    pub round: u64,
 }
 
 /// Constructs controllers on demand

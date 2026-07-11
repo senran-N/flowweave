@@ -12,14 +12,11 @@ case "$mode" in
     screen)
         test_name="scheduler_five_seed_screening_lab"
         ;;
-    bbr-sensor)
-        test_name="bbr_capacity_five_seed_lab"
-        ;;
     long)
         test_name="scheduler_long_duration_benchmark_lab"
         ;;
     *)
-        echo "用法：$0 [smoke|screen|bbr-sensor|long]" >&2
+        echo "用法：$0 [smoke|screen|long]" >&2
         exit 2
         ;;
 esac

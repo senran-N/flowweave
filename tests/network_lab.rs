@@ -2,9 +2,8 @@ use std::{env, fmt::Write as _, fs, io, process::Command, time::Duration};
 
 use flowweave_lab::{
     DatagramMeasurement, FailoverReport, LabResult, MultipathScheduler, NetworkBenchmarkConfig,
-    NetworkBenchmarkReport, PathMeasurement, PathMode, SustainedBenchmarkConfig,
-    run_bbr_capacity_benchmark, run_blackhole_failover, run_network_benchmark,
-    run_sustained_network_benchmark,
+    NetworkBenchmarkReport, PathMode, SustainedBenchmarkConfig, run_blackhole_failover,
+    run_network_benchmark, run_sustained_network_benchmark,
 };
 
 const KIB: usize = 1024;
@@ -149,13 +148,6 @@ impl ScreeningParticipant {
 
 struct ScreeningObservation {
     scenario: AggregationScenario,
-    round: usize,
-    seeds: NetemSeeds,
-    participant: ScreeningParticipant,
-    report: NetworkBenchmarkReport,
-}
-
-struct BbrCapacityObservation {
     round: usize,
     seeds: NetemSeeds,
     participant: ScreeningParticipant,
@@ -349,57 +341,6 @@ async fn scheduler_five_seed_screening_lab() -> LabResult<()> {
     write_benchmark_csv(RESULT_PATH, &observations)?;
     println!();
     println!("原始数据已写入 {RESULT_PATH}");
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "必须通过 scripts/run_netem_lab.sh bbr-sensor 在隔离网络命名空间中运行"]
-async fn bbr_capacity_five_seed_lab() -> LabResult<()> {
-    ensure_isolated_network_namespace()?;
-
-    const RESULT_PATH: &str = "benchmark-results/2026-07-12-bbr-capacity-screening.csv";
-    let (line_one, line_two) = AggregationScenario::Heterogeneous.profiles();
-    let mut observations = Vec::with_capacity(SEED_PAIRS.len() * ScreeningParticipant::ALL.len());
-    write_bbr_capacity_csv(RESULT_PATH, &observations)?;
-
-    println!();
-    println!("FlowWeave / 织流：BBR3 逐路径容量证据五种子筛选");
-    println!("仍使用正常 2 MiB 应用数据，没有额外探针，也不改变 NoQ 官方选路顺序。");
-    println!("单路用于校准 BBR3 模型；双路用于检查默认 MPQUIC 调度下两条路能否都获得合格样本。");
-    println!("合格样本必须由 BBR3 的 filled-pipe 判定确认，pacing rate 和 cwnd 不算容量。");
-
-    for (round_index, seeds) in SEED_PAIRS.iter().copied().enumerate() {
-        let round = round_index + 1;
-        let order = screening_order(round_index);
-        println!();
-        println!(
-            "第 {round} 轮：线路一种子 {}，线路二种子 {}；顺序 {}",
-            seeds.line_one,
-            seeds.line_two,
-            order
-                .iter()
-                .map(|participant| participant.description())
-                .collect::<Vec<_>>()
-                .join(" → ")
-        );
-
-        for participant in order {
-            apply_profiles(line_one, line_two, seeds)?;
-            let report = run_bbr_capacity_benchmark(participant.config()).await?;
-            print_bbr_capacity_observation(participant, &report);
-            observations.push(BbrCapacityObservation {
-                round,
-                seeds,
-                participant,
-                report,
-            });
-            write_bbr_capacity_csv(RESULT_PATH, &observations)?;
-        }
-    }
-
-    print_bbr_capacity_summary(&observations);
-    println!();
-    println!("BBR3 容量证据原始数据已写入 {RESULT_PATH}");
     Ok(())
 }
 
@@ -834,156 +775,6 @@ fn print_screening_summary(observations: &[ScreeningObservation]) {
     }
 }
 
-fn print_bbr_capacity_observation(
-    participant: ScreeningParticipant,
-    report: &NetworkBenchmarkReport,
-) {
-    println!(
-        "- {}：吞吐量 {:.2} Mbit/s；线路一 {}；线路二 {}；首次数据 {} / {} 字节",
-        participant.description(),
-        report.throughput_mbps,
-        describe_bandwidth_estimate(&report.line_one),
-        describe_bandwidth_estimate(&report.line_two),
-        report.line_one.fresh_stream_bytes_sent,
-        report.line_two.fresh_stream_bytes_sent,
-    );
-}
-
-fn describe_bandwidth_estimate(measurement: &PathMeasurement) -> String {
-    let Some(estimate) = measurement.bandwidth_estimate else {
-        return "无容量模型".to_owned();
-    };
-    format!(
-        "max_bw {:.2} Mbit/s（{}，最新 {:.2}，应用受限 {}，cwnd 已用满 {}，主动探测 {}，第 {} 轮）",
-        bytes_per_second_to_mbps(estimate.bytes_per_second),
-        if estimate.qualified {
-            "合格"
-        } else {
-            "未填满路径"
-        },
-        bytes_per_second_to_mbps(estimate.latest_delivery_rate),
-        yes_or_no(estimate.latest_sample_app_limited),
-        yes_or_no(estimate.congestion_window_limited),
-        yes_or_no(estimate.actively_probing),
-        estimate.round,
-    )
-}
-
-fn print_bbr_capacity_summary(observations: &[BbrCapacityObservation]) {
-    let mut line_one_qualified = 0;
-    let mut line_two_qualified = 0;
-    let mut single_rank_correct = 0;
-    let mut single_ratio_passes = 0;
-    let mut single_ratio_errors = Vec::new();
-    let mut multipath_both_qualified = 0;
-    let mut multipath_rank_correct = 0;
-    let mut multipath_ratio_passes = 0;
-    let mut multipath_ratio_errors = Vec::new();
-    let expected_ratio = 25.0 / 8.0;
-
-    for round in 1..=SEED_PAIRS.len() {
-        let line_one = find_bbr_observation(observations, round, ScreeningParticipant::LineOne);
-        let line_two = find_bbr_observation(observations, round, ScreeningParticipant::LineTwo);
-        let multipath = find_bbr_observation(
-            observations,
-            round,
-            ScreeningParticipant::Multipath(MultipathScheduler::NoqDefault),
-        );
-
-        let line_one_estimate =
-            line_one.and_then(|observation| qualified_bandwidth_mbps(&observation.report.line_one));
-        let line_two_estimate =
-            line_two.and_then(|observation| qualified_bandwidth_mbps(&observation.report.line_two));
-        line_one_qualified += usize::from(line_one_estimate.is_some());
-        line_two_qualified += usize::from(line_two_estimate.is_some());
-        if let (Some(slow), Some(fast)) = (line_one_estimate, line_two_estimate) {
-            single_rank_correct += usize::from(fast > slow);
-            let error = ((fast / slow) / expected_ratio - 1.0).abs() * 100.0;
-            single_ratio_passes += usize::from(error <= 20.0);
-            single_ratio_errors.push(error);
-        }
-
-        let multipath_line_one = multipath
-            .and_then(|observation| qualified_bandwidth_mbps(&observation.report.line_one));
-        let multipath_line_two = multipath
-            .and_then(|observation| qualified_bandwidth_mbps(&observation.report.line_two));
-        if let (Some(slow), Some(fast)) = (multipath_line_one, multipath_line_two) {
-            multipath_both_qualified += 1;
-            multipath_rank_correct += usize::from(fast > slow);
-            let error = ((fast / slow) / expected_ratio - 1.0).abs() * 100.0;
-            multipath_ratio_passes += usize::from(error <= 20.0);
-            multipath_ratio_errors.push(error);
-        }
-    }
-
-    let single_pass = line_one_qualified == 5
-        && line_two_qualified == 5
-        && single_rank_correct == 5
-        && single_ratio_passes == 5;
-    let multipath_pass =
-        multipath_both_qualified == 5 && multipath_rank_correct == 5 && multipath_ratio_passes == 5;
-
-    println!();
-    println!("BBR3 容量证据汇总：");
-    println!(
-        "- 单路校准：线路一合格 {line_one_qualified}/5，线路二合格 {line_two_qualified}/5，排名 {single_rank_correct}/5，比例误差门槛 {single_ratio_passes}/5，{}",
-        if single_pass { "通过" } else { "未通过" }
-    );
-    print_ratio_error_summary("  单路容量比例误差", &single_ratio_errors);
-    println!(
-        "- 同一 MPQUIC 连接：两路都合格 {multipath_both_qualified}/5，排名 {multipath_rank_correct}/5，比例误差门槛 {multipath_ratio_passes}/5，{}",
-        if multipath_pass {
-            "通过"
-        } else {
-            "未通过"
-        }
-    );
-    print_ratio_error_summary("  多路径容量比例误差", &multipath_ratio_errors);
-    println!(
-        "- 结论：{}",
-        if single_pass && multipath_pass {
-            "BBR3 样本具备进入只读调度模型实验的资格，但尚未证明调度收益"
-        } else if single_pass {
-            "BBR3 单路模型可信，但默认多路径调度没有让两条路都形成可信容量样本"
-        } else {
-            "BBR3 在当前固定短流中连单路容量校准都不稳定，不能作为调度输入"
-        }
-    );
-}
-
-fn find_bbr_observation(
-    observations: &[BbrCapacityObservation],
-    round: usize,
-    participant: ScreeningParticipant,
-) -> Option<&BbrCapacityObservation> {
-    observations
-        .iter()
-        .find(|observation| observation.round == round && observation.participant == participant)
-}
-
-fn qualified_bandwidth_mbps(measurement: &PathMeasurement) -> Option<f64> {
-    measurement
-        .bandwidth_estimate
-        .filter(|estimate| estimate.qualified)
-        .map(|estimate| bytes_per_second_to_mbps(estimate.bytes_per_second))
-}
-
-fn bytes_per_second_to_mbps(bytes_per_second: u64) -> f64 {
-    bytes_per_second as f64 * 8.0 / 1_000_000.0
-}
-
-fn print_ratio_error_summary(name: &str, errors: &[f64]) {
-    if errors.is_empty() {
-        println!("{name}：没有成对合格样本");
-        return;
-    }
-    let summary = NumericSummary::from_samples(errors.iter().copied());
-    println!(
-        "{name}：中位 {:.2}%，最高 {:.2}%，范围 {:.2}%～{:.2}%",
-        summary.median, summary.maximum, summary.minimum, summary.maximum
-    );
-}
-
 fn best_single_throughput(
     observations: &[ScreeningObservation],
     scenario: AggregationScenario,
@@ -1077,63 +868,6 @@ fn write_benchmark_csv(path: &str, observations: &[ScreeningObservation]) -> Lab
     fs::create_dir_all("benchmark-results")?;
     fs::write(path, csv)?;
     Ok(())
-}
-
-fn write_bbr_capacity_csv(path: &str, observations: &[BbrCapacityObservation]) -> LabResult<()> {
-    let mut csv = String::from(
-        "round,line_one_seed,line_two_seed,participant,throughput_mbps,line_one_fresh_bytes,line_two_fresh_bytes,line_one_max_bw_mbps,line_one_qualified,line_one_latest_delivery_mbps,line_one_latest_app_limited,line_one_cwnd_limited,line_one_actively_probing,line_one_round,line_two_max_bw_mbps,line_two_qualified,line_two_latest_delivery_mbps,line_two_latest_app_limited,line_two_cwnd_limited,line_two_actively_probing,line_two_round,cpu_utilization_percent,peak_rss_kib\n",
-    );
-
-    for observation in observations {
-        let line_one = observation.report.line_one.bandwidth_estimate;
-        let line_two = observation.report.line_two.bandwidth_estimate;
-        writeln!(
-            csv,
-            "{},{},{},{},{:.6},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{:.6},{}",
-            observation.round,
-            observation.seeds.line_one,
-            observation.seeds.line_two,
-            observation.participant.description(),
-            observation.report.throughput_mbps,
-            observation.report.line_one.fresh_stream_bytes_sent,
-            observation.report.line_two.fresh_stream_bytes_sent,
-            optional_bandwidth_mbps(line_one.map(|estimate| estimate.bytes_per_second)),
-            optional_csv_bool(line_one.map(|estimate| estimate.qualified)),
-            optional_bandwidth_mbps(line_one.map(|estimate| estimate.latest_delivery_rate)),
-            optional_csv_bool(line_one.map(|estimate| estimate.latest_sample_app_limited)),
-            optional_csv_bool(line_one.map(|estimate| estimate.congestion_window_limited)),
-            optional_csv_bool(line_one.map(|estimate| estimate.actively_probing)),
-            optional_csv_u64(line_one.map(|estimate| estimate.round)),
-            optional_bandwidth_mbps(line_two.map(|estimate| estimate.bytes_per_second)),
-            optional_csv_bool(line_two.map(|estimate| estimate.qualified)),
-            optional_bandwidth_mbps(line_two.map(|estimate| estimate.latest_delivery_rate)),
-            optional_csv_bool(line_two.map(|estimate| estimate.latest_sample_app_limited)),
-            optional_csv_bool(line_two.map(|estimate| estimate.congestion_window_limited)),
-            optional_csv_bool(line_two.map(|estimate| estimate.actively_probing)),
-            optional_csv_u64(line_two.map(|estimate| estimate.round)),
-            observation.report.cpu_utilization_percent,
-            observation.report.peak_rss_kib,
-        )?;
-    }
-
-    fs::create_dir_all("benchmark-results")?;
-    fs::write(path, csv)?;
-    Ok(())
-}
-
-fn optional_bandwidth_mbps(value: Option<u64>) -> String {
-    value
-        .map(bytes_per_second_to_mbps)
-        .map(|value| format!("{value:.6}"))
-        .unwrap_or_default()
-}
-
-fn optional_csv_bool(value: Option<bool>) -> String {
-    value.map(|value| value.to_string()).unwrap_or_default()
-}
-
-fn optional_csv_u64(value: Option<u64>) -> String {
-    value.map(|value| value.to_string()).unwrap_or_default()
 }
 
 fn optional_milliseconds(duration: Option<Duration>) -> String {

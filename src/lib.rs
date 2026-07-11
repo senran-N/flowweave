@@ -13,7 +13,6 @@ use std::{
 use noq::{
     ClientConfig, Connection, ConnectionError, Endpoint, FourTuple, Path, PathError, PathId,
     PathStats, PathStatus, ServerConfig, TransportConfig,
-    congestion::{BandwidthEstimate, Bbr3Config},
     rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer},
 };
 use tokio::{
@@ -179,12 +178,6 @@ enum BenchmarkWorkload {
     },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CongestionControlMode {
-    Cubic,
-    Bbr3,
-}
-
 #[derive(Debug, Clone, Copy, Default)]
 pub struct PathMeasurement {
     pub udp_bytes_sent: u64,
@@ -194,7 +187,6 @@ pub struct PathMeasurement {
     pub lost_packets: u64,
     pub lost_bytes: u64,
     pub final_rtt: Duration,
-    pub bandwidth_estimate: Option<BandwidthEstimate>,
 }
 
 #[derive(Debug, Clone)]
@@ -387,7 +379,7 @@ impl RunningLab {
 }
 
 pub async fn run_basic_lab() -> LabResult<BasicLabReport> {
-    let lab = start_connection(Ipv4Addr::UNSPECIFIED, None, CongestionControlMode::Cubic).await?;
+    let lab = start_connection(Ipv4Addr::UNSPECIFIED, None).await?;
 
     let report_result: LabResult<BasicLabReport> = async {
         let connection = &lab.connection;
@@ -467,24 +459,6 @@ pub async fn run_network_benchmark(
     run_network_workload(
         config.mode,
         config.scheduler,
-        CongestionControlMode::Cubic,
-        BenchmarkWorkload::Fixed {
-            transfer_size: config.transfer_size,
-            datagram_count: config.datagram_count,
-        },
-    )
-    .await
-}
-
-pub async fn run_bbr_capacity_benchmark(
-    config: NetworkBenchmarkConfig,
-) -> LabResult<NetworkBenchmarkReport> {
-    config.validate()?;
-
-    run_network_workload(
-        config.mode,
-        config.scheduler,
-        CongestionControlMode::Bbr3,
         BenchmarkWorkload::Fixed {
             transfer_size: config.transfer_size,
             datagram_count: config.datagram_count,
@@ -501,7 +475,6 @@ pub async fn run_sustained_network_benchmark(
     run_network_workload(
         config.mode,
         config.scheduler,
-        CongestionControlMode::Cubic,
         BenchmarkWorkload::Sustained {
             warmup_duration: config.warmup_duration,
             measurement_duration: config.measurement_duration,
@@ -514,7 +487,6 @@ pub async fn run_sustained_network_benchmark(
 async fn run_network_workload(
     mode: PathMode,
     scheduler: MultipathScheduler,
-    congestion_control: CongestionControlMode,
     workload: BenchmarkWorkload,
 ) -> LabResult<NetworkBenchmarkReport> {
     let datagram_count = match workload {
@@ -527,12 +499,7 @@ async fn run_network_workload(
         PathMode::LineTwoOnly => LINE_TWO_IP,
         PathMode::MultipathAvailable => Ipv4Addr::UNSPECIFIED,
     };
-    let lab = start_connection(
-        client_ip,
-        Some(NETWORK_PATH_IDLE_TIMEOUT),
-        congestion_control,
-    )
-    .await?;
+    let lab = start_connection(client_ip, Some(NETWORK_PATH_IDLE_TIMEOUT)).await?;
 
     let secondary = if mode == PathMode::MultipathAvailable {
         Some(lab.open_second_path(PathStatus::Available).await?)
@@ -626,12 +593,7 @@ pub async fn run_blackhole_failover<F>(
 where
     F: FnOnce() -> LabResult<()>,
 {
-    let lab = start_connection(
-        Ipv4Addr::UNSPECIFIED,
-        Some(NETWORK_PATH_IDLE_TIMEOUT),
-        CongestionControlMode::Cubic,
-    )
-    .await?;
+    let lab = start_connection(Ipv4Addr::UNSPECIFIED, Some(NETWORK_PATH_IDLE_TIMEOUT)).await?;
     let secondary = lab.open_second_path(PathStatus::Backup).await?;
     sleep(Duration::from_millis(250)).await;
 
@@ -690,9 +652,8 @@ where
 async fn start_connection(
     client_ip: Ipv4Addr,
     path_idle_timeout: Option<Duration>,
-    congestion_control: CongestionControlMode,
 ) -> LabResult<RunningLab> {
-    let (server_config, client_config) = make_configs(path_idle_timeout, congestion_control)?;
+    let (server_config, client_config) = make_configs(path_idle_timeout)?;
     let server_endpoint =
         Endpoint::server(server_config, SocketAddr::new(IpAddr::V4(LINE_ONE_IP), 0))?;
     let server_addr = server_endpoint.local_addr()?;
@@ -738,10 +699,7 @@ async fn start_connection(
     })
 }
 
-fn make_configs(
-    path_idle_timeout: Option<Duration>,
-    congestion_control: CongestionControlMode,
-) -> LabResult<(ServerConfig, ClientConfig)> {
+fn make_configs(path_idle_timeout: Option<Duration>) -> LabResult<(ServerConfig, ClientConfig)> {
     let generated = rcgen::generate_simple_self_signed(vec!["localhost".into()])?;
     let certificate = CertificateDer::from(generated.cert);
     let private_key = PrivatePkcs8KeyDer::from(generated.signing_key.serialize_der());
@@ -750,32 +708,25 @@ fn make_configs(
         ServerConfig::with_single_cert(vec![certificate.clone()], private_key.into())?;
     let server_transport = Arc::get_mut(&mut server_config.transport)
         .ok_or_else(|| other_error("无法配置服务端传输参数"))?;
-    configure_transport(server_transport, path_idle_timeout, congestion_control);
+    configure_transport(server_transport, path_idle_timeout);
 
     let mut roots = noq::rustls::RootCertStore::empty();
     roots.add(certificate)?;
     let mut client_config = ClientConfig::with_root_certificates(Arc::new(roots))?;
     let mut client_transport = TransportConfig::default();
-    configure_transport(&mut client_transport, path_idle_timeout, congestion_control);
+    configure_transport(&mut client_transport, path_idle_timeout);
     client_config.transport_config(Arc::new(client_transport));
 
     Ok((server_config, client_config))
 }
 
-fn configure_transport(
-    transport: &mut TransportConfig,
-    path_idle_timeout: Option<Duration>,
-    congestion_control: CongestionControlMode,
-) {
+fn configure_transport(transport: &mut TransportConfig, path_idle_timeout: Option<Duration>) {
     transport
         .max_concurrent_multipath_paths(2)
         .default_path_max_idle_timeout(path_idle_timeout)
         .default_path_keep_alive_interval(Some(Duration::from_millis(200)))
         .datagram_receive_buffer_size(Some(1024 * 1024))
         .datagram_send_buffer_size(1024 * 1024);
-    if congestion_control == CongestionControlMode::Bbr3 {
-        transport.congestion_controller_factory(Arc::new(Bbr3Config::default()));
-    }
 }
 
 async fn serve_connection(connection: Connection) -> LabResult<()> {
@@ -1135,7 +1086,6 @@ fn path_delta(before: PathStats, after: PathStats) -> PathMeasurement {
         lost_packets: after.lost_packets.saturating_sub(before.lost_packets),
         lost_bytes: after.lost_bytes.saturating_sub(before.lost_bytes),
         final_rtt: after.rtt,
-        bandwidth_estimate: after.bandwidth_estimate,
     }
 }
 

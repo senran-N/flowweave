@@ -2644,10 +2644,8 @@ impl Connection {
     pub fn path_stats(&mut self, path_id: PathId) -> Option<PathStats> {
         let path = self.paths.get(&path_id)?;
         let stats = self.path_stats.for_path(path_id);
-        let controller_metrics = path.data.congestion.metrics();
         stats.rtt = path.data.rtt.get();
-        stats.cwnd = controller_metrics.congestion_window;
-        stats.bandwidth_estimate = controller_metrics.bandwidth_estimate;
+        stats.cwnd = path.data.congestion.window();
         stats.current_mtu = path.data.mtud.current_mtu();
         Some(*stats)
     }
