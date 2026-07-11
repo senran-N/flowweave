@@ -700,7 +700,12 @@ impl Connection {
         // tail-loss probes to zero.
         // This likely doesn't do much, as the path won't even be tried for sending
         // in poll_transmit after the path is abandoned.
-        self.spaces[SpaceId::Data].for_path(path_id).loss_probes = 0;
+        let abandoned_space = self.spaces[SpaceId::Data].for_path(path_id);
+        abandoned_space.loss_probes = 0;
+        // Section 3.4.3 of QUIC-MULTIPATH requires outstanding acknowledgments for an
+        // abandoned path to be sent promptly on another path. The MaxAckDelay timer is
+        // stopped below, so convert any delayed ACK into an immediately sendable ACK now.
+        abandoned_space.pending_acks.set_immediate_ack_required();
 
         // Note: remote CIDs are NOT removed here. They are removed when the PATH_ABANDON
         // frame is actually written to a packet (in populate_packet). This allows sending
@@ -1469,9 +1474,10 @@ impl Connection {
                 } else if can_send.close && scheduling_info.may_send_close {
                     // This is the best path to send a CONNECTION_CLOSE on.
                     true
-                } else if needs_loss_probe || can_send.space_specific {
-                    // We always send a loss probe or space-specific frames if the path is
-                    // not abandoned.
+                } else if needs_loss_probe || can_send.space_specific || can_send.acks {
+                    // We always send a loss probe, path-specific frame, or ACK-only packet if
+                    // the path is not abandoned. In particular, a Backup path must be able to
+                    // return acknowledgments for data received on that same path.
                     true
                 } else {
                     // Anything else we only send if we're the best path for SpaceKind::Data
@@ -2176,6 +2182,16 @@ impl Connection {
         packet_size: usize,
         connection_close_pending: bool,
     ) -> SendableFrames {
+        let has_cross_path_ack_fallback = space_id == SpaceId::Data
+            && self.is_multipath_negotiated()
+            && self.spaces[space_id]
+                .number_spaces
+                .iter()
+                .any(|(acknowledged_path_id, pns)| {
+                    pns.pending_acks.can_send()
+                        && (self.abandoned_paths.contains(acknowledged_path_id)
+                            || !self.remote_cids.contains_key(acknowledged_path_id))
+                });
         let space = &mut self.spaces[space_id];
         let space_has_crypto = self.crypto_state.has_keys(space_id.encryption_level());
 
@@ -2189,6 +2205,7 @@ impl Connection {
         }
 
         let mut can_send = space.can_send(path_id, &self.streams);
+        can_send.acks |= has_cross_path_ack_fallback;
 
         // Check for 1RTT space.
         if space_id == SpaceId::Data {
@@ -6181,6 +6198,33 @@ impl Connection {
         let is_multipath_negotiated = self.is_multipath_negotiated();
         let space_has_keys = self.crypto_state.has_keys(space_id.encryption_level());
         let is_0rtt = space_id == SpaceId::Data && !space_has_keys;
+        let acknowledged_paths = if scheduling_info.is_abandoned {
+            Vec::new()
+        } else {
+            let mut acknowledged_paths = Vec::new();
+            if self.spaces[space_id]
+                .number_spaces
+                .get(&path_id)
+                .is_some_and(|pns| pns.pending_acks.can_send())
+            {
+                acknowledged_paths.push(path_id);
+            }
+            if is_multipath_negotiated && space_id == SpaceId::Data {
+                acknowledged_paths.extend(
+                    self.spaces[space_id]
+                        .number_spaces
+                        .iter()
+                        .filter(|(acknowledged_path_id, pns)| {
+                            **acknowledged_path_id != path_id
+                                && pns.pending_acks.can_send()
+                                && (self.abandoned_paths.contains(acknowledged_path_id)
+                                    || !self.remote_cids.contains_key(acknowledged_path_id))
+                        })
+                        .map(|(&acknowledged_path_id, _)| acknowledged_path_id),
+                );
+            }
+            acknowledged_paths
+        };
         let stats = &mut self.path_stats.for_path(path_id).frame_tx;
         let space = &mut self.spaces[space_id];
         let path = &mut self.paths.get_mut(&path_id).expect("known path").data;
@@ -6218,27 +6262,19 @@ impl Connection {
         }
 
         // ACK
-        if !scheduling_info.is_abandoned && scheduling_info.may_send_data {
-            for acknowledged_path_id in space
-                .number_spaces
-                .iter_mut()
-                .filter(|(_, pns)| pns.pending_acks.can_send())
-                .map(|(&path_id, _)| path_id)
-                .collect::<Vec<_>>()
-            {
-                Self::populate_acks(
-                    now,
-                    self.receiving_ecn,
-                    path_id,
-                    acknowledged_path_id,
-                    space_id,
-                    space,
-                    is_multipath_negotiated,
-                    builder,
-                    stats,
-                    space_has_keys,
-                );
-            }
+        for acknowledged_path_id in acknowledged_paths {
+            Self::populate_acks(
+                now,
+                self.receiving_ecn,
+                path_id,
+                acknowledged_path_id,
+                space_id,
+                space,
+                is_multipath_negotiated,
+                builder,
+                stats,
+                space_has_keys,
+            );
         }
 
         // ACK_FREQUENCY

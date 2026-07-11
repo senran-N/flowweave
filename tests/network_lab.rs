@@ -495,7 +495,8 @@ async fn failover_formal_bidirectional_lab() -> LabResult<()> {
 async fn failover_timeline_diagnostic_lab() -> LabResult<()> {
     ensure_isolated_network_namespace()?;
 
-    const RESULT_PATH: &str = "benchmark-results/2026-07-12-pto-hedge-diagnostic.csv";
+    const RESULT_PATH: &str =
+        "benchmark-results/2026-07-12-path-ack-affinity-diagnostic.csv";
     let normal_line_one = LinkProfile::new("20ms", "0.1%", "20mbit");
     let normal_line_two = LinkProfile::new("80ms", "1%", "20mbit");
     let cases = [
@@ -505,8 +506,8 @@ async fn failover_timeline_diagnostic_lab() -> LabResult<()> {
     ];
 
     println!();
-    println!("FlowWeave / 织流：A 组失败时间线诊断");
-    println!("只复跑两个正向代表种子和一个反向种子；不改变 PTO 恢复算法。");
+    println!("FlowWeave / 织流：A 组 PATH_ACK 同路优先修复诊断");
+    println!("只复跑两个正向代表种子和一个反向种子；不改变 PTO 恢复算法或超时。");
 
     let mut observations = Vec::with_capacity(cases.len());
     write_formal_failover_csv(RESULT_PATH, &observations)?;

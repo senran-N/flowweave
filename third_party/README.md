@@ -21,15 +21,16 @@ third_party/noq-proto 最初来自本机 Cargo 已校验的官方发布包。
 
 ## 当前偏离上游
 
-以下 8 个文件为 FlowWeave 当前实验快照中的可审计补丁，其他上游文件仍保持原样：
+以下 9 个文件为 FlowWeave 当前实验快照中的可审计补丁，其他上游文件仍保持原样：
 
 - `src/config/transport.rs`：增加默认关闭的 `cross_path_pto_reinjection` 通用配置，同一 NoQ 版本可公平运行官方基线和候选。
-- `src/connection/mod.rs`：在逐路径 Data PTO 后把仍在途的 STREAM 范围加入全局重传队列一次；可疑路径暂停普通数据，只有对冲后发送的探针被确认才恢复，最终路径放弃仍使用官方规则。另记录 loss/PTO 恢复尝试，并区分 PATH_ACK 所确认的路径与实际发送路径；当前只增加可观测性，不改变上游 ACK 调度。
+- `src/connection/mod.rs`：在逐路径 Data PTO 后把仍在途的 STREAM 范围加入全局重传队列一次；可疑路径暂停普通数据，只有对冲后发送的探针被确认才恢复，最终路径放弃仍使用官方规则。开放路径优先在本路径发送确认该路径的 PATH_ACK，只有被确认路径 abandoned 或没有可用远端 CID 时才跨路回退；关闭路径会立即释放已有延迟 ACK。另记录 loss/PTO 恢复尝试和 PATH_ACK 实际反馈路径，并修复首个 GSO 小分段错误限制后续分段、最终触发越界写入的问题。
 - `src/connection/paths.rs`：保存本地 PTO 恢复探针的包号边界；它不进入线协议，也不发送公开 `PATH_STATUS`。
 - `src/connection/send_buffer.rs`：区分首次与重传数据；重复、重叠和乱序 ACK 只计算新确认字节，并取消已经无用的待发重复范围。
+- `src/connection/spaces.rs`：逐路径判断本路径待发 ACK，让 Backup 路径可以发送 ACK-only 包，同时不把其他开放路径的 ACK 错当成本路径工作。
 - `src/connection/stats.rs`：分别统计每条路径首次/重传 STREAM 字节、loss/PTO 恢复尝试、对冲载荷，以及同路/跨路 PATH_ACK。
 - `src/connection/streams/send.rs`：把“流是否完成”和“本次新确认字节数”一起返回，防止两个副本的 ACK 重复扣账。
 - `src/connection/streams/state.rs`：按新确认字节更新连接账目，让重传接口报告本次真正新加入队列的载荷，并向内部诊断暴露全连接未确认 STREAM 字节快照。
-- `src/tests/multipath.rs`：验证测量、默认关闭、单路径保护、首次/重复 PTO、备用路接管、拥塞窗口、纯 FIN、两种 ACK 顺序、旧 ACK 不得错误恢复主路，并确定性复现 PATH_ACK 确认备用路却从主路发送的反馈路径行为。
+- `src/tests/multipath.rs`：验证测量、默认关闭、单路径保护、首次/重复 PTO、备用路接管、拥塞窗口、纯 FIN、两种 ACK 顺序和旧 ACK 边界，并确定性证明开放 Backup 同路返回 PATH_ACK、路径 abandoned 后从剩余路径跨路回退。
 
 轮询、最低 RTT、预计最早送达、交付速率加权和 ACK-ECF 都已经按基准结果完整删除；NoQ 当前仍保持官方调度行为，不保留失败调度开关。PTO 对冲是独立的数据恢复机制，不参与 B 组容量调度。BBR3 只读容量接口曾在实验快照 `29f0ec2` 中验证，但没有通过 2 MiB 五种子短筛，随后已完整删除。

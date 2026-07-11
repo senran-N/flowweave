@@ -652,7 +652,7 @@ fn path_acks() {
 }
 
 #[test]
-fn path_ack_stats_reveal_cross_path_feedback() -> TestResult {
+fn path_ack_prefers_same_feedback_path() -> TestResult {
     let _guard = subscribe();
     let (mut pair, backup) = pto_hedge_pair(false)?;
     let primary_before = pair.path_stats(Client, PathId::ZERO).unwrap().frame_tx;
@@ -680,10 +680,63 @@ fn path_ack_stats_reveal_cross_path_feedback() -> TestResult {
                 .saturating_sub(backup_before.path_acks_cross_path),
         );
 
-    assert!(same_path + cross_path > 0, "the backup PING must be acknowledged");
     assert!(
-        cross_path > 0,
-        "the current scheduler should expose that backup-path feedback rides the primary path"
+        same_path > 0,
+        "the backup PING must be acknowledged on its own path"
+    );
+    assert!(
+        cross_path == 0,
+        "an open backup path must not send its feedback over the primary path"
+    );
+    Ok(())
+}
+
+#[test]
+fn path_ack_falls_back_after_acknowledged_path_is_abandoned() -> TestResult {
+    let _guard = subscribe();
+    let (mut pair, backup) = pto_hedge_pair(false)?;
+    let primary_before = pair.path_stats(Client, PathId::ZERO).unwrap().frame_tx;
+    let backup_before = pair.path_stats(Client, backup).unwrap().frame_tx;
+    let server_before = pair.stats(Server).frame_rx.path_acks;
+
+    // Receive exactly one ack-eliciting packet on the backup path. It should leave a
+    // delayed PATH_ACK pending rather than immediately sending an ACK-only packet.
+    pair.ping_path(Server, backup)?;
+    pair.drive_server();
+    pair.advance_time();
+    pair.drive_client();
+
+    let primary_after_receive = pair.path_stats(Client, PathId::ZERO).unwrap().frame_tx;
+    let backup_after_receive = pair.path_stats(Client, backup).unwrap().frame_tx;
+    assert_eq!(
+        primary_after_receive.path_acks_cross_path,
+        primary_before.path_acks_cross_path
+    );
+    assert_eq!(
+        backup_after_receive.path_acks_same_path,
+        backup_before.path_acks_same_path
+    );
+
+    // Closing the acknowledged path stops its MaxAckDelay timer. The pending PATH_ACK
+    // must therefore become immediately sendable on the remaining open path.
+    pair.close_path(Client, backup, 0u8.into())?;
+    pair.drive_client();
+
+    let primary_after_close = pair.path_stats(Client, PathId::ZERO).unwrap().frame_tx;
+    let backup_after_close = pair.path_stats(Client, backup).unwrap().frame_tx;
+    assert!(
+        primary_after_close.path_acks_cross_path > primary_before.path_acks_cross_path,
+        "an abandoned path's pending acknowledgment must fall back to an open path"
+    );
+    assert_eq!(
+        backup_after_close.path_acks_same_path, backup_before.path_acks_same_path,
+        "an abandoned path must not send its own pending acknowledgment"
+    );
+
+    pair.drive_server();
+    assert!(
+        pair.stats(Server).frame_rx.path_acks > server_before,
+        "the peer must receive the fallback PATH_ACK"
     );
     Ok(())
 }
