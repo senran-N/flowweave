@@ -1,0 +1,16 @@
+round,line_one_seed,line_two_seed,participant,throughput_mbps,line_one_fresh_bytes,line_two_fresh_bytes,line_one_max_bw_mbps,line_one_qualified,line_one_latest_delivery_mbps,line_one_latest_app_limited,line_one_cwnd_limited,line_one_actively_probing,line_one_round,line_two_max_bw_mbps,line_two_qualified,line_two_latest_delivery_mbps,line_two_latest_app_limited,line_two_cwnd_limited,line_two_actively_probing,line_two_round,cpu_utilization_percent,peak_rss_kib
+1,1101,2201,仅线路一,5.798628,2097160,0,9.368496,false,6.953408,false,false,true,9,,,,,,,,53.226273,20836
+1,1101,2201,仅线路二,14.329190,0,2097160,,,,,,,,27.388248,false,22.674448,false,false,true,8,71.743247,22952
+1,1101,2201,NoQ 默认（低编号优先）,8.688263,1441674,655486,9.334632,false,7.970680,false,false,true,10,7.118704,false,0.000912,false,false,true,9,61.107575,29464
+2,1102,2202,仅线路一,5.823310,2097160,0,9.598280,false,6.340024,true,false,true,10,,,,,,,,48.593484,33568
+2,1102,2202,NoQ 默认（低编号优先）,7.166950,1663673,433487,7.632600,false,6.644832,false,false,true,9,11.658392,false,0.000872,true,false,true,9,49.126104,35464
+2,1102,2202,仅线路二,7.387417,0,2097160,,,,,,,,15.155184,false,17.265664,false,false,true,11,59.443790,38668
+3,1103,2203,NoQ 默认（低编号优先）,4.873978,2097160,0,9.915520,false,4.498392,false,false,true,11,0.130792,false,0.001360,true,false,true,9,51.130064,39048
+3,1103,2203,仅线路一,5.463970,2097160,0,10.205544,false,10.161928,false,false,true,12,,,,,,,,46.571954,40804
+3,1103,2203,仅线路二,10.321465,0,2097160,,,,,,,,23.333112,false,18.188152,false,false,true,9,69.518417,45504
+4,1104,2204,NoQ 默认（低编号优先）,5.635917,1967940,129220,8.017840,false,5.197712,false,false,true,10,5.919952,false,0.000872,false,false,true,10,44.678272,45504
+4,1104,2204,仅线路二,9.131108,0,2097160,,,,,,,,27.829608,false,21.532952,false,false,true,10,70.209082,46016
+4,1104,2204,仅线路一,5.906028,2097160,0,11.425472,false,8.982504,false,false,true,10,,,,,,,,43.651313,46016
+5,1105,2205,仅线路二,12.151123,0,2097160,,,,,,,,22.739560,false,16.606712,false,false,true,9,73.150597,41324
+5,1105,2205,NoQ 默认（低编号优先）,6.692279,1825923,271237,9.403464,false,9.430936,true,false,true,9,6.149432,false,0.000904,false,false,true,8,53.850270,45420
+5,1105,2205,仅线路一,5.686365,2097160,0,12.285424,true,8.923584,false,false,false,12,,,,,,,,43.044586,45420

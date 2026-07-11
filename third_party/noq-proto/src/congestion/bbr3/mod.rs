@@ -2,7 +2,7 @@ mod max_filter;
 
 use crate::RttEstimator;
 use crate::congestion::bbr3::max_filter::MaxFilter;
-use crate::congestion::{Controller, ControllerFactory, ControllerMetrics};
+use crate::congestion::{BandwidthEstimate, Controller, ControllerFactory, ControllerMetrics};
 use crate::{Duration, Instant};
 use rand::{RngExt, SeedableRng};
 use rand_pcg::Pcg32;
@@ -1633,11 +1633,28 @@ impl Controller for Bbr3 {
     }
 
     fn metrics(&self) -> ControllerMetrics {
+        let latest_sample = self.rs;
         ControllerMetrics {
             congestion_window: self.window(),
             ssthresh: None,
             pacing_rate: Some(self.pacing_rate.round() as u64),
             send_quantum: Some(self.send_quantum),
+            bandwidth_estimate: Some(BandwidthEstimate {
+                bytes_per_second: self.max_bw.max(0.0).round() as u64,
+                latest_delivery_rate: latest_sample
+                    .map(|sample| sample.delivery_rate.max(0.0).round() as u64)
+                    .unwrap_or(0),
+                qualified: self.full_bw_reached && self.max_bw > 0.0,
+                latest_sample_app_limited: latest_sample
+                    .map(|sample| sample.is_app_limited)
+                    .unwrap_or(true),
+                congestion_window_limited: self.is_cwnd_limited,
+                actively_probing: matches!(
+                    self.state,
+                    BbrState::Startup | BbrState::ProbeBw(ProbeBwSubstate::Up)
+                ),
+                round: self.round_count,
+            }),
         }
     }
 
@@ -1739,5 +1756,34 @@ mod test {
         bbr3.pick_probe_wait();
         assert_eq!(bbr3.rounds_since_bw_probe, 1);
         assert_eq!(bbr3.bw_probe_wait, Duration::from_millis(2570));
+    }
+
+    #[test]
+    fn bandwidth_metrics_require_filled_pipe_evidence() {
+        let mut bbr3 = Bbr3::new(Arc::new(Bbr3Config::default()), 1500);
+
+        let learning = bbr3
+            .metrics()
+            .bandwidth_estimate
+            .expect("BBR always exposes its bandwidth model");
+        assert_eq!(learning.bytes_per_second, 0);
+        assert!(!learning.qualified);
+        assert!(learning.actively_probing);
+
+        bbr3.max_bw = 3_125_000.0;
+        bbr3.full_bw_reached = true;
+        bbr3.state = BbrState::ProbeBw(ProbeBwSubstate::Up);
+        bbr3.is_cwnd_limited = true;
+        bbr3.round_count = 9;
+
+        let qualified = bbr3
+            .metrics()
+            .bandwidth_estimate
+            .expect("BBR always exposes its bandwidth model");
+        assert_eq!(qualified.bytes_per_second, 3_125_000);
+        assert!(qualified.qualified);
+        assert!(qualified.congestion_window_limited);
+        assert!(qualified.actively_probing);
+        assert_eq!(qualified.round, 9);
     }
 }
