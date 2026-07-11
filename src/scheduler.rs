@@ -10,25 +10,17 @@ pub enum MultipathScheduler {
     NoqDefault,
     /// 每次成功发送一批数据后换到下一条可用路径。
     RoundRobin,
-    /// 优先选择当前往返延迟最低的路径。
-    MinRtt,
     /// 同时考虑延迟、拥塞窗口和在途数据，选择预计最早送达的路径。
     EarliestDelivery,
 }
 
 impl MultipathScheduler {
-    pub const CANDIDATES: [Self; 4] = [
-        Self::NoqDefault,
-        Self::RoundRobin,
-        Self::MinRtt,
-        Self::EarliestDelivery,
-    ];
+    pub const CANDIDATES: [Self; 3] = [Self::NoqDefault, Self::RoundRobin, Self::EarliestDelivery];
 
     pub fn description(self) -> &'static str {
         match self {
             Self::NoqDefault => "NoQ 默认（低编号优先）",
             Self::RoundRobin => "轮询",
-            Self::MinRtt => "最低 RTT",
             Self::EarliestDelivery => "预计最早送达",
         }
     }
@@ -37,7 +29,6 @@ impl MultipathScheduler {
         match self {
             Self::NoqDefault => NoqSchedulingPolicy::Default,
             Self::RoundRobin => NoqSchedulingPolicy::RoundRobin,
-            Self::MinRtt => NoqSchedulingPolicy::MinRtt,
             Self::EarliestDelivery => NoqSchedulingPolicy::EarliestDelivery,
         }
     }

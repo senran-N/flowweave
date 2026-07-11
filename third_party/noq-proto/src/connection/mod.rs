@@ -1233,9 +1233,6 @@ impl Connection {
                     paths.rotate_left(start);
                 }
             }
-            MultipathSchedulingPolicy::MinRtt => {
-                paths.sort_by_key(|path_id| (self.path_data(*path_id).rtt.get(), *path_id));
-            }
             MultipathSchedulingPolicy::EarliestDelivery => {
                 paths.sort_by_key(|path_id| {
                     (

@@ -113,6 +113,8 @@ impl NetworkBenchmarkConfig {
 pub struct PathMeasurement {
     pub udp_bytes_sent: u64,
     pub udp_datagrams_sent: u64,
+    pub fresh_stream_bytes_sent: u64,
+    pub retransmitted_stream_bytes_sent: u64,
     pub lost_packets: u64,
     pub lost_bytes: u64,
     pub final_rtt: Duration,
@@ -152,12 +154,17 @@ pub struct NetworkBenchmarkReport {
 }
 
 impl NetworkBenchmarkReport {
-    pub fn both_paths_carried_meaningful_traffic(&self) -> bool {
+    pub fn both_paths_carried_minimum_effective_share(&self) -> bool {
         if self.mode != PathMode::MultipathAvailable {
             return false;
         }
-        let threshold = (self.transfer_size as u64 / 20).max(16 * 1024);
-        self.line_one.udp_bytes_sent >= threshold && self.line_two.udp_bytes_sent >= threshold
+        let total = self
+            .line_one
+            .fresh_stream_bytes_sent
+            .saturating_add(self.line_two.fresh_stream_bytes_sent);
+        total != 0
+            && self.line_one.fresh_stream_bytes_sent.saturating_mul(10) >= total
+            && self.line_two.fresh_stream_bytes_sent.saturating_mul(10) >= total
     }
 }
 
@@ -832,6 +839,14 @@ fn path_delta(before: PathStats, after: PathStats) -> PathMeasurement {
             .udp_tx
             .datagrams
             .saturating_sub(before.udp_tx.datagrams),
+        fresh_stream_bytes_sent: after
+            .frame_tx
+            .stream_fresh_bytes
+            .saturating_sub(before.frame_tx.stream_fresh_bytes),
+        retransmitted_stream_bytes_sent: after
+            .frame_tx
+            .stream_retransmit_bytes
+            .saturating_sub(before.frame_tx.stream_retransmit_bytes),
         lost_packets: after.lost_packets.saturating_sub(before.lost_packets),
         lost_bytes: after.lost_bytes.saturating_sub(before.lost_bytes),
         final_rtt: after.rtt,

@@ -121,30 +121,6 @@ fn path_scheduling_round_robin_alternates_data_transmits() -> TestResult {
 }
 
 #[test]
-fn path_scheduling_min_rtt_uses_smoothed_path_rtt() -> TestResult {
-    let _guard = subscribe();
-    let mut pair = pair_with_scheduling_policy(MultipathSchedulingPolicy::MinRtt);
-    let path_1 = open_available_second_path(&mut pair)?;
-    pair.conn_mut(Client).set_path_scheduler_metrics_for_test(
-        PathId::ZERO,
-        Duration::from_millis(40),
-        0,
-    )?;
-    pair.conn_mut(Client).set_path_scheduler_metrics_for_test(
-        path_1,
-        Duration::from_millis(10),
-        0,
-    )?;
-    queue_scheduler_test_data(&mut pair);
-
-    assert_eq!(
-        poll_scheduler_data_path(&mut pair, &[PathId::ZERO, path_1]),
-        path_1
-    );
-    Ok(())
-}
-
-#[test]
 fn path_scheduling_earliest_delivery_considers_in_flight_load() -> TestResult {
     let _guard = subscribe();
     let mut pair = pair_with_scheduling_policy(MultipathSchedulingPolicy::EarliestDelivery);
@@ -178,7 +154,7 @@ fn path_scheduling_earliest_delivery_considers_in_flight_load() -> TestResult {
 #[test]
 fn path_scheduling_falls_back_when_preferred_path_is_congested() -> TestResult {
     let _guard = subscribe();
-    let mut pair = pair_with_scheduling_policy(MultipathSchedulingPolicy::MinRtt);
+    let mut pair = pair_with_scheduling_policy(MultipathSchedulingPolicy::EarliestDelivery);
     let path_1 = open_available_second_path(&mut pair)?;
     let path_0_cwnd = pair.path_stats(Client, PathId::ZERO).unwrap().cwnd;
     pair.conn_mut(Client).set_path_scheduler_metrics_for_test(
@@ -225,6 +201,25 @@ fn path_scheduling_single_path_is_unchanged() {
     assert_eq!(
         poll_scheduler_data_path(&mut pair, &[PathId::ZERO]),
         PathId::ZERO
+    );
+}
+
+#[test]
+fn path_stats_count_fresh_stream_payload_separately() {
+    let _guard = subscribe();
+    let mut pair = pair_with_scheduling_policy(MultipathSchedulingPolicy::Default);
+    let before = pair.path_stats(Client, PathId::ZERO).unwrap().frame_tx;
+    queue_scheduler_test_data(&mut pair);
+    assert_eq!(
+        poll_scheduler_data_path(&mut pair, &[PathId::ZERO]),
+        PathId::ZERO
+    );
+    let after = pair.path_stats(Client, PathId::ZERO).unwrap().frame_tx;
+
+    assert!(after.stream_fresh_bytes > before.stream_fresh_bytes);
+    assert_eq!(
+        after.stream_retransmit_bytes,
+        before.stream_retransmit_bytes
     );
 }
 

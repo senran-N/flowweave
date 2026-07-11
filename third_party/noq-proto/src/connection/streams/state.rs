@@ -548,7 +548,15 @@ impl StreamsState {
             // Now that we know the `StreamId`, we can better account for how many bytes
             // are required to encode it.
             let max_buf_size = builder.frame_space_remaining() - 1 - VarInt::size(id.into());
+            let is_retransmit = stream.pending.has_retransmits();
             let (offsets, encode_length) = stream.pending.poll_transmit(max_buf_size);
+            let payload_len = offsets.end.saturating_sub(offsets.start);
+            if is_retransmit {
+                stats.stream_retransmit_bytes =
+                    stats.stream_retransmit_bytes.saturating_add(payload_len);
+            } else {
+                stats.stream_fresh_bytes = stats.stream_fresh_bytes.saturating_add(payload_len);
+            }
             let fin = offsets.end == stream.pending.offset()
                 && matches!(stream.state, SendState::DataSent { .. });
             if fin {

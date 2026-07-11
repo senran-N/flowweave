@@ -1,4 +1,4 @@
-use std::{env, fs, io, process::Command, time::Duration};
+use std::{env, fmt::Write as _, fs, io, process::Command, time::Duration};
 
 use flowweave_lab::{
     DatagramMeasurement, FailoverReport, LabResult, MultipathScheduler, NetworkBenchmarkConfig,
@@ -7,6 +7,7 @@ use flowweave_lab::{
 
 const KIB: usize = 1024;
 const MIB: usize = 1024 * KIB;
+const SCREENING_TRANSFER_SIZE: usize = 2 * MIB;
 
 #[derive(Clone, Copy)]
 struct LinkProfile {
@@ -18,6 +19,152 @@ struct LinkProfile {
 impl LinkProfile {
     const fn new(delay: &'static str, loss: &'static str, rate: &'static str) -> Self {
         Self { delay, loss, rate }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct NetemSeeds {
+    line_one: u32,
+    line_two: u32,
+}
+
+const SEED_PAIRS: [NetemSeeds; 5] = [
+    NetemSeeds {
+        line_one: 1101,
+        line_two: 2201,
+    },
+    NetemSeeds {
+        line_one: 1102,
+        line_two: 2202,
+    },
+    NetemSeeds {
+        line_one: 1103,
+        line_two: 2203,
+    },
+    NetemSeeds {
+        line_one: 1104,
+        line_two: 2204,
+    },
+    NetemSeeds {
+        line_one: 1105,
+        line_two: 2205,
+    },
+];
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AggregationScenario {
+    Balanced,
+    Heterogeneous,
+}
+
+impl AggregationScenario {
+    const ALL: [Self; 2] = [Self::Balanced, Self::Heterogeneous];
+
+    fn description(self) -> &'static str {
+        match self {
+            Self::Balanced => "平衡 15+15 Mbit/s",
+            Self::Heterogeneous => "异构 8+25 Mbit/s",
+        }
+    }
+
+    fn profiles(self) -> (LinkProfile, LinkProfile) {
+        match self {
+            Self::Balanced => (
+                LinkProfile::new("20ms", "0.1%", "15mbit"),
+                LinkProfile::new("20ms", "0.1%", "15mbit"),
+            ),
+            Self::Heterogeneous => (
+                LinkProfile::new("15ms", "0.1%", "8mbit"),
+                LinkProfile::new("50ms", "0.1%", "25mbit"),
+            ),
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ScreeningParticipant {
+    LineOne,
+    LineTwo,
+    Multipath(MultipathScheduler),
+}
+
+impl ScreeningParticipant {
+    const ALL: [Self; 5] = [
+        Self::LineOne,
+        Self::LineTwo,
+        Self::Multipath(MultipathScheduler::NoqDefault),
+        Self::Multipath(MultipathScheduler::RoundRobin),
+        Self::Multipath(MultipathScheduler::EarliestDelivery),
+    ];
+
+    fn description(self) -> &'static str {
+        match self {
+            Self::LineOne => "仅线路一",
+            Self::LineTwo => "仅线路二",
+            Self::Multipath(scheduler) => scheduler.description(),
+        }
+    }
+
+    fn config(self) -> NetworkBenchmarkConfig {
+        match self {
+            Self::LineOne => NetworkBenchmarkConfig::new(
+                PathMode::LineOneOnly,
+                MultipathScheduler::NoqDefault,
+                SCREENING_TRANSFER_SIZE,
+                0,
+            ),
+            Self::LineTwo => NetworkBenchmarkConfig::new(
+                PathMode::LineTwoOnly,
+                MultipathScheduler::NoqDefault,
+                SCREENING_TRANSFER_SIZE,
+                0,
+            ),
+            Self::Multipath(scheduler) => NetworkBenchmarkConfig::new(
+                PathMode::MultipathAvailable,
+                scheduler,
+                SCREENING_TRANSFER_SIZE,
+                0,
+            ),
+        }
+    }
+}
+
+struct ScreeningObservation {
+    scenario: AggregationScenario,
+    round: usize,
+    seeds: NetemSeeds,
+    participant: ScreeningParticipant,
+    report: NetworkBenchmarkReport,
+}
+
+struct NumericSummary {
+    median: f64,
+    p95: f64,
+    worst: f64,
+    minimum: f64,
+    maximum: f64,
+}
+
+impl NumericSummary {
+    fn from_samples(samples: impl IntoIterator<Item = f64>) -> Self {
+        let mut samples: Vec<_> = samples.into_iter().collect();
+        assert!(!samples.is_empty(), "summary requires samples");
+        samples.sort_by(f64::total_cmp);
+        let median = samples[samples.len() / 2];
+        let p95_index = ((samples.len() * 95).div_ceil(100)).saturating_sub(1);
+        let minimum = samples[0];
+        let maximum = samples[samples.len() - 1];
+        Self {
+            median,
+            p95: samples[p95_index],
+            worst: minimum,
+            minimum,
+            maximum,
+        }
+    }
+
+    fn range(&self) -> f64 {
+        self.maximum - self.minimum
     }
 }
 
@@ -43,9 +190,14 @@ async fn controlled_bad_network_lab() -> LabResult<()> {
     println!();
     println!("场景二：传输中主线路突然变为 100% 丢包");
     for scheduler in MultipathScheduler::CANDIDATES {
-        apply_profiles(normal_line_one, normal_line_two)?;
+        apply_profiles(normal_line_one, normal_line_two, SEED_PAIRS[0])?;
         let failover = run_blackhole_failover(scheduler, || {
-            replace_line_profile("1:1", "10:", LinkProfile::new("20ms", "100%", "20mbit"))
+            replace_line_profile(
+                "1:1",
+                "10:",
+                LinkProfile::new("20ms", "100%", "20mbit"),
+                SEED_PAIRS[0].line_one,
+            )
         })
         .await?;
         print_failover(&failover);
@@ -55,7 +207,7 @@ async fn controlled_bad_network_lab() -> LabResult<()> {
     println!("场景三：线路一丢包 8%，线路二丢包 2%");
     let high_loss_line_one = LinkProfile::new("20ms", "8%", "20mbit");
     let high_loss_line_two = LinkProfile::new("40ms", "2%", "20mbit");
-    apply_profiles(high_loss_line_one, high_loss_line_two)?;
+    apply_profiles(high_loss_line_one, high_loss_line_two, SEED_PAIRS[0])?;
     let loss_line_one = run_network_benchmark(NetworkBenchmarkConfig::new(
         PathMode::LineOneOnly,
         MultipathScheduler::NoqDefault,
@@ -63,7 +215,7 @@ async fn controlled_bad_network_lab() -> LabResult<()> {
         72,
     ))
     .await?;
-    apply_profiles(high_loss_line_one, high_loss_line_two)?;
+    apply_profiles(high_loss_line_one, high_loss_line_two, SEED_PAIRS[0])?;
     let loss_line_two = run_network_benchmark(NetworkBenchmarkConfig::new(
         PathMode::LineTwoOnly,
         MultipathScheduler::NoqDefault,
@@ -85,7 +237,7 @@ async fn controlled_bad_network_lab() -> LabResult<()> {
     println!("场景四：8 Mbit/s 低延迟线路 + 25 Mbit/s 高延迟线路");
     let slow_low_latency = LinkProfile::new("15ms", "0%", "8mbit");
     let fast_high_latency = LinkProfile::new("50ms", "0%", "25mbit");
-    apply_profiles(slow_low_latency, fast_high_latency)?;
+    apply_profiles(slow_low_latency, fast_high_latency, SEED_PAIRS[0])?;
     let speed_line_one = run_network_benchmark(NetworkBenchmarkConfig::new(
         PathMode::LineOneOnly,
         MultipathScheduler::NoqDefault,
@@ -93,7 +245,7 @@ async fn controlled_bad_network_lab() -> LabResult<()> {
         0,
     ))
     .await?;
-    apply_profiles(slow_low_latency, fast_high_latency)?;
+    apply_profiles(slow_low_latency, fast_high_latency, SEED_PAIRS[0])?;
     let speed_line_two = run_network_benchmark(NetworkBenchmarkConfig::new(
         PathMode::LineTwoOnly,
         MultipathScheduler::NoqDefault,
@@ -116,6 +268,74 @@ async fn controlled_bad_network_lab() -> LabResult<()> {
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "必须通过 scripts/run_netem_lab.sh screen 在隔离网络命名空间中运行"]
+async fn scheduler_five_seed_screening_lab() -> LabResult<()> {
+    ensure_isolated_network_namespace()?;
+
+    println!();
+    println!("FlowWeave / 织流：多路径调度五种子筛选");
+    println!("这是 2 MiB 候选筛选，不是 BENCHMARK.md 规定的 20 秒/64 MiB 最终验收。");
+    println!("每位参赛者每轮都重置到相同种子；轮次会旋转并反转参赛顺序。");
+
+    let mut observations = Vec::with_capacity(
+        AggregationScenario::ALL.len() * SEED_PAIRS.len() * ScreeningParticipant::ALL.len(),
+    );
+
+    for scenario in AggregationScenario::ALL {
+        let (line_one, line_two) = scenario.profiles();
+        println!();
+        println!("场景：{}", scenario.description());
+
+        for (round_index, seeds) in SEED_PAIRS.iter().copied().enumerate() {
+            let round = round_index + 1;
+            let order = screening_order(round_index);
+            println!();
+            println!(
+                "第 {round} 轮：线路一种子 {}，线路二种子 {}",
+                seeds.line_one, seeds.line_two
+            );
+            println!(
+                "参赛顺序：{}",
+                order
+                    .iter()
+                    .map(|participant| participant.description())
+                    .collect::<Vec<_>>()
+                    .join(" → ")
+            );
+
+            for participant in order {
+                apply_profiles(line_one, line_two, seeds)?;
+                let report = run_network_benchmark(participant.config()).await?;
+                print_screening_observation(participant, &report);
+                observations.push(ScreeningObservation {
+                    scenario,
+                    round,
+                    seeds,
+                    participant,
+                    report,
+                });
+            }
+        }
+    }
+
+    print_screening_summary(&observations);
+    write_screening_csv(&observations)?;
+    println!();
+    println!("原始数据已写入 benchmark-results/2026-07-11-scheduler-screening-survivors.csv");
+    Ok(())
+}
+
+fn screening_order(round_index: usize) -> Vec<ScreeningParticipant> {
+    let mut order = ScreeningParticipant::ALL.to_vec();
+    let len = order.len();
+    order.rotate_left(round_index % len);
+    if round_index % 2 == 1 {
+        order.reverse();
+    }
+    order
+}
+
 async fn benchmark_multipath_candidates(
     line_one: LinkProfile,
     line_two: LinkProfile,
@@ -124,7 +344,7 @@ async fn benchmark_multipath_candidates(
 ) -> LabResult<Vec<NetworkBenchmarkReport>> {
     let mut reports = Vec::with_capacity(MultipathScheduler::CANDIDATES.len());
     for scheduler in MultipathScheduler::CANDIDATES {
-        apply_profiles(line_one, line_two)?;
+        apply_profiles(line_one, line_two, SEED_PAIRS[0])?;
         reports.push(
             run_network_benchmark(NetworkBenchmarkConfig::new(
                 PathMode::MultipathAvailable,
@@ -165,17 +385,22 @@ fn ensure_isolated_network_namespace() -> LabResult<()> {
     Ok(())
 }
 
-fn apply_profiles(line_one: LinkProfile, line_two: LinkProfile) -> LabResult<()> {
-    replace_line_profile("1:1", "10:", line_one)?;
-    replace_line_profile("1:2", "20:", line_two)
+fn apply_profiles(
+    line_one: LinkProfile,
+    line_two: LinkProfile,
+    seeds: NetemSeeds,
+) -> LabResult<()> {
+    replace_line_profile("1:1", "10:", line_one, seeds.line_one)?;
+    replace_line_profile("1:2", "20:", line_two, seeds.line_two)
 }
 
 fn replace_line_profile(
     parent: &'static str,
     handle: &'static str,
     profile: LinkProfile,
+    seed: u32,
 ) -> LabResult<()> {
-    let seed = if parent == "1:1" { "1101" } else { "2202" };
+    let seed = seed.to_string();
     run_tc(&[
         "qdisc",
         "replace",
@@ -193,7 +418,7 @@ fn replace_line_profile(
         "loss",
         profile.loss,
         "seed",
-        seed,
+        &seed,
         "rate",
         profile.rate,
     ])
@@ -246,13 +471,17 @@ fn print_benchmark(report: &NetworkBenchmarkReport) {
     );
     print_datagrams(&report.datagrams);
     println!(
-        "  线路一：发送 {} 字节，丢失 {} 包，最终 RTT {:.2} ms",
+        "  线路一：首次流数据 {} 字节，重传流数据 {} 字节，UDP 总发送 {} 字节，丢失 {} 包，最终 RTT {:.2} ms",
+        report.line_one.fresh_stream_bytes_sent,
+        report.line_one.retransmitted_stream_bytes_sent,
         report.line_one.udp_bytes_sent,
         report.line_one.lost_packets,
         milliseconds(report.line_one.final_rtt)
     );
     println!(
-        "  线路二：发送 {} 字节，丢失 {} 包，最终 RTT {:.2} ms",
+        "  线路二：首次流数据 {} 字节，重传流数据 {} 字节，UDP 总发送 {} 字节，丢失 {} 包，最终 RTT {:.2} ms",
+        report.line_two.fresh_stream_bytes_sent,
+        report.line_two.retransmitted_stream_bytes_sent,
         report.line_two.udp_bytes_sent,
         report.line_two.lost_packets,
         milliseconds(report.line_two.final_rtt)
@@ -263,8 +492,8 @@ fn print_benchmark(report: &NetworkBenchmarkReport) {
     );
     if report.mode == PathMode::MultipathAvailable {
         println!(
-            "  两条线路都显著承载流量：{}",
-            yes_or_no(report.both_paths_carried_meaningful_traffic())
+            "  两条线路都承载至少 10% 首次应用数据：{}",
+            yes_or_no(report.both_paths_carried_minimum_effective_share())
         );
     }
 }
@@ -343,6 +572,174 @@ fn print_comparison(
         ratio * 100.0
     );
     println!("{name}判断：{conclusion}");
+}
+
+fn print_screening_observation(participant: ScreeningParticipant, report: &NetworkBenchmarkReport) {
+    println!(
+        "- {}：{:.2} Mbit/s；线路一/二首次数据 {} / {} 字节；重传 {} / {} 字节；最小有效占比 {:.1}%；线速 {:.2} 倍",
+        participant.description(),
+        report.throughput_mbps,
+        report.line_one.fresh_stream_bytes_sent,
+        report.line_two.fresh_stream_bytes_sent,
+        report.line_one.retransmitted_stream_bytes_sent,
+        report.line_two.retransmitted_stream_bytes_sent,
+        minimum_effective_share_percent(report),
+        wire_ratio(report),
+    );
+}
+
+fn print_screening_summary(observations: &[ScreeningObservation]) {
+    println!();
+    println!("五种子汇总（P95 对吞吐量是高端样本，最差值取最低吞吐量）：");
+
+    for scenario in AggregationScenario::ALL {
+        println!();
+        println!("场景：{}", scenario.description());
+
+        for participant in ScreeningParticipant::ALL {
+            let matching: Vec<_> = observations
+                .iter()
+                .filter(|observation| {
+                    observation.scenario == scenario && observation.participant == participant
+                })
+                .collect();
+            let throughput = NumericSummary::from_samples(
+                matching
+                    .iter()
+                    .map(|observation| observation.report.throughput_mbps),
+            );
+            println!(
+                "- {}吞吐量：中位 {:.2}，P95 {:.2}，最差 {:.2}，范围 {:.2}～{:.2}，波动 {:.2} Mbit/s",
+                participant.description(),
+                throughput.median,
+                throughput.p95,
+                throughput.worst,
+                throughput.minimum,
+                throughput.maximum,
+                throughput.range(),
+            );
+
+            if !matches!(participant, ScreeningParticipant::Multipath(_)) {
+                continue;
+            }
+
+            let improvements: Vec<_> = matching
+                .iter()
+                .map(|observation| {
+                    observation.report.throughput_mbps
+                        / best_single_throughput(observations, scenario, observation.round)
+                })
+                .collect();
+            let improvement =
+                NumericSummary::from_samples(improvements.iter().map(|ratio| ratio * 100.0));
+            let faster_rounds = improvements.iter().filter(|ratio| **ratio >= 1.15).count();
+            let minimum_shares: Vec<_> = matching
+                .iter()
+                .map(|observation| minimum_effective_share_percent(&observation.report))
+                .collect();
+            let share = NumericSummary::from_samples(minimum_shares.iter().copied());
+            let share_passes = minimum_shares
+                .iter()
+                .filter(|share| **share >= 10.0)
+                .count();
+            let wire = NumericSummary::from_samples(
+                matching
+                    .iter()
+                    .map(|observation| wire_ratio(&observation.report)),
+            );
+
+            println!(
+                "  相对当轮最佳单路：中位 {:.1}%，P95 {:.1}%，最差 {:.1}%，4/5 门槛命中 {faster_rounds}/5",
+                improvement.median, improvement.p95, improvement.worst,
+            );
+            println!(
+                "  每轮较少线路的首次数据占比：中位 {:.1}%，最差 {:.1}%，10% 门槛命中 {share_passes}/5",
+                share.median, share.worst,
+            );
+            println!(
+                "  线速/应用数据：中位 {:.2} 倍，P95/最差 {:.2} 倍，范围 {:.2}～{:.2}",
+                wire.median, wire.maximum, wire.minimum, wire.maximum,
+            );
+        }
+    }
+}
+
+fn best_single_throughput(
+    observations: &[ScreeningObservation],
+    scenario: AggregationScenario,
+    round: usize,
+) -> f64 {
+    observations
+        .iter()
+        .filter(|observation| observation.scenario == scenario && observation.round == round)
+        .filter(|observation| {
+            matches!(
+                observation.participant,
+                ScreeningParticipant::LineOne | ScreeningParticipant::LineTwo
+            )
+        })
+        .map(|observation| observation.report.throughput_mbps)
+        .reduce(f64::max)
+        .expect("each round must contain both single-path baselines")
+}
+
+fn minimum_effective_share_percent(report: &NetworkBenchmarkReport) -> f64 {
+    let line_one = report.line_one.fresh_stream_bytes_sent;
+    let line_two = report.line_two.fresh_stream_bytes_sent;
+    let total = line_one.saturating_add(line_two);
+    if total == 0 {
+        return 0.0;
+    }
+    line_one.min(line_two) as f64 / total as f64 * 100.0
+}
+
+fn wire_ratio(report: &NetworkBenchmarkReport) -> f64 {
+    if report.transfer_size == 0 {
+        return 0.0;
+    }
+    report.total_udp_bytes_sent as f64 / report.transfer_size as f64
+}
+
+fn write_screening_csv(observations: &[ScreeningObservation]) -> LabResult<()> {
+    let mut csv = String::from(
+        "scenario,round,line_one_seed,line_two_seed,participant,throughput_mbps,transfer_ms,line_one_fresh_bytes,line_two_fresh_bytes,line_one_retransmit_bytes,line_two_retransmit_bytes,total_udp_bytes,wire_ratio,minimum_effective_share_percent,best_single_ratio\n",
+    );
+
+    for observation in observations {
+        let best_single_ratio = match observation.participant {
+            ScreeningParticipant::Multipath(_) => {
+                observation.report.throughput_mbps
+                    / best_single_throughput(observations, observation.scenario, observation.round)
+            }
+            ScreeningParticipant::LineOne | ScreeningParticipant::LineTwo => 0.0,
+        };
+        writeln!(
+            csv,
+            "{},{},{},{},{},{:.6},{:.3},{},{},{},{},{},{:.6},{:.6},{:.6}",
+            observation.scenario.description(),
+            observation.round,
+            observation.seeds.line_one,
+            observation.seeds.line_two,
+            observation.participant.description(),
+            observation.report.throughput_mbps,
+            milliseconds(observation.report.transfer_duration),
+            observation.report.line_one.fresh_stream_bytes_sent,
+            observation.report.line_two.fresh_stream_bytes_sent,
+            observation.report.line_one.retransmitted_stream_bytes_sent,
+            observation.report.line_two.retransmitted_stream_bytes_sent,
+            observation.report.total_udp_bytes_sent,
+            wire_ratio(&observation.report),
+            minimum_effective_share_percent(&observation.report),
+            best_single_ratio,
+        )?;
+    }
+
+    fs::create_dir_all("benchmark-results")?;
+    fs::write(
+        "benchmark-results/2026-07-11-scheduler-screening-survivors.csv",
+        csv,
+    )?;
+    Ok(())
 }
 
 fn optional_milliseconds(duration: Option<Duration>) -> String {

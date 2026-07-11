@@ -346,6 +346,11 @@ impl SendBuffer {
         self.unsent != self.offset() || !self.retransmits.is_empty()
     }
 
+    /// Whether the next data selected for transmission will be a retransmission.
+    pub(super) fn has_retransmits(&self) -> bool {
+        !self.retransmits.is_empty()
+    }
+
     /// Compute the amount of data that hasn't been acknowledged
     pub(super) fn unacked(&self) -> u64 {
         self.data.len() as u64 - self.acks.iter().map(|x| x.end - x.start).sum::<u64>()
@@ -529,8 +534,10 @@ mod tests {
         assert_eq!(buf.poll_transmit(16), (16..23, true));
         // Lose the first, but not the second
         buf.retransmit(0..16);
+        assert!(buf.has_retransmits());
         // Ensure we only retransmit the lost frame, then continue sending fresh data
         assert_eq!(buf.poll_transmit(16), (0..16, false));
+        assert!(!buf.has_retransmits());
         assert_eq!(buf.poll_transmit(16), (23..MSG.len() as u64, true));
         // Lose the second frame
         buf.retransmit(16..23);

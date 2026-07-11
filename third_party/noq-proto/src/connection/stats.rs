@@ -64,6 +64,8 @@ pub struct FrameStats {
     pub streams_blocked_uni: u64,
     pub stop_sending: u64,
     pub stream: u64,
+    pub stream_fresh_bytes: u64,
+    pub stream_retransmit_bytes: u64,
     pub observed_addr: u64,
     pub path_abandon: u64,
     pub path_status_available: u64,
@@ -156,6 +158,8 @@ impl std::fmt::Debug for FrameStats {
             streams_blocked_uni,
             stop_sending,
             stream,
+            stream_fresh_bytes,
+            stream_retransmit_bytes,
             observed_addr,
             path_abandon,
             path_status_available,
@@ -201,6 +205,8 @@ impl std::fmt::Debug for FrameStats {
             .field("STREAMS_BLOCKED_UNI", streams_blocked_uni)
             .field("STOP_SENDING", stop_sending)
             .field("STREAM", stream)
+            .field("STREAM_FRESH_BYTES", stream_fresh_bytes)
+            .field("STREAM_RETRANSMIT_BYTES", stream_retransmit_bytes)
             .field("OBSERVED_ADDRESS", observed_addr)
             .field("ADD_ADDRESS", add_address)
             .field("REACH_OUT", reach_out)

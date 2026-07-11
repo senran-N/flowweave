@@ -21,12 +21,15 @@ third_party/noq-proto 最初来自本机 Cargo 已校验的官方发布包。
 
 ## 当前偏离上游
 
-以下 5 个文件为 FlowWeave 的最小多路径调度补丁，其他上游文件仍保持原样：
+以下 8 个文件为 FlowWeave 的最小多路径调度与可审计测量补丁，其他上游文件仍保持原样：
 
-- `src/config/transport.rs`：增加 `Default`、`RoundRobin`、`MinRtt`、`EarliestDelivery` 四种可配置策略；默认值保持 NoQ 原行为。
+- `src/config/transport.rs`：增加 `Default`、`RoundRobin`、`EarliestDelivery` 三种可配置策略；默认值保持 NoQ 原行为。曾实验的 `MinRtt` 因五种子筛选失败已删除。
 - `src/config/mod.rs`：公开导出调度策略类型。
 - `src/lib.rs`：从 `noq-proto` 顶层公开导出调度策略类型。
 - `src/connection/mod.rs`：先发送路径专属控制包，再按策略选择应用数据路径；首选路径受拥塞或 pacing 限制时继续尝试其他合格路径。
-- `src/tests/multipath.rs`：验证默认行为、轮询、最低 RTT、预计送达时间、拥塞回退、备用路径和单路径语义。
+- `src/connection/stats.rs`：分别统计每条路径首次发送和重传的 STREAM 数据字节。
+- `src/connection/send_buffer.rs`：让统计逻辑判断下一段数据是否来自重传队列。
+- `src/connection/streams/state.rs`：在实际编码 STREAM 帧时累计首次数据和重传数据。
+- `src/tests/multipath.rs`：验证默认行为、轮询、预计送达时间、拥塞回退、备用路径、单路径语义和首次数据统计。
 
 补丁没有修改 TLS、线路验证、拥塞控制算法、pacing 算法或 Backup/Available 的协议语义。2026-07-11 已运行 NoQ 全部 386 项单元测试和 3 项文档测试，结果全部通过。

@@ -720,8 +720,6 @@ pub enum MultipathSchedulingPolicy {
     Default,
     /// Rotate between eligible paths after each successful data transmit.
     RoundRobin,
-    /// Prefer the path with the lowest smoothed round-trip time.
-    MinRtt,
     /// Prefer the path with the earliest estimated delivery time based on RTT, congestion window,
     /// and bytes already in flight.
     EarliestDelivery,
