@@ -81,6 +81,8 @@
 - src/lib.rs：可复用的 MPQUIC 连接、传输校验、指标采集和断路实验逻辑；NoQ 相关操作集中在这里。
 - tests/network_lab.rs：四类坏网络场景、单路径对照和安全护栏。
 - scripts/run_netem_lab.sh：进入一次性隔离网络空间并启动坏网络实验。
+- third_party/README.md：记录第三方源码的版本、校验值、许可证和我们实际修改过什么。
+- third_party/noq-proto：NoQ Proto 1.0.1 官方源码快照；先保持原样，后续只做最小调度补丁。
 - .gitignore：避免把编译产生的临时文件提交进 Git。
 
 ## 架构警戒线

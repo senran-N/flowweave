@@ -9,3 +9,6 @@ publish = false
 noq = { version = "=1.0.1", default-features = false, features = ["runtime-tokio", "rustls", "ring"] }
 rcgen = { version = "=0.14.5", default-features = false, features = ["crypto", "ring"] }
 tokio = { version = "=1.47.1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+
+[patch.crates-io]
+noq-proto = { path = "third_party/noq-proto" }
