@@ -379,7 +379,7 @@ impl RunningLab {
 }
 
 pub async fn run_basic_lab() -> LabResult<BasicLabReport> {
-    let lab = start_connection(Ipv4Addr::UNSPECIFIED, None, MultipathScheduler::NoqDefault).await?;
+    let lab = start_connection(Ipv4Addr::UNSPECIFIED, None).await?;
 
     let report_result: LabResult<BasicLabReport> = async {
         let connection = &lab.connection;
@@ -499,7 +499,7 @@ async fn run_network_workload(
         PathMode::LineTwoOnly => LINE_TWO_IP,
         PathMode::MultipathAvailable => Ipv4Addr::UNSPECIFIED,
     };
-    let lab = start_connection(client_ip, Some(NETWORK_PATH_IDLE_TIMEOUT), scheduler).await?;
+    let lab = start_connection(client_ip, Some(NETWORK_PATH_IDLE_TIMEOUT)).await?;
 
     let secondary = if mode == PathMode::MultipathAvailable {
         Some(lab.open_second_path(PathStatus::Available).await?)
@@ -593,12 +593,7 @@ pub async fn run_blackhole_failover<F>(
 where
     F: FnOnce() -> LabResult<()>,
 {
-    let lab = start_connection(
-        Ipv4Addr::UNSPECIFIED,
-        Some(NETWORK_PATH_IDLE_TIMEOUT),
-        scheduler,
-    )
-    .await?;
+    let lab = start_connection(Ipv4Addr::UNSPECIFIED, Some(NETWORK_PATH_IDLE_TIMEOUT)).await?;
     let secondary = lab.open_second_path(PathStatus::Backup).await?;
     sleep(Duration::from_millis(250)).await;
 
@@ -657,9 +652,8 @@ where
 async fn start_connection(
     client_ip: Ipv4Addr,
     path_idle_timeout: Option<Duration>,
-    scheduler: MultipathScheduler,
 ) -> LabResult<RunningLab> {
-    let (server_config, client_config) = make_configs(path_idle_timeout, scheduler)?;
+    let (server_config, client_config) = make_configs(path_idle_timeout)?;
     let server_endpoint =
         Endpoint::server(server_config, SocketAddr::new(IpAddr::V4(LINE_ONE_IP), 0))?;
     let server_addr = server_endpoint.local_addr()?;
@@ -705,10 +699,7 @@ async fn start_connection(
     })
 }
 
-fn make_configs(
-    path_idle_timeout: Option<Duration>,
-    scheduler: MultipathScheduler,
-) -> LabResult<(ServerConfig, ClientConfig)> {
+fn make_configs(path_idle_timeout: Option<Duration>) -> LabResult<(ServerConfig, ClientConfig)> {
     let generated = rcgen::generate_simple_self_signed(vec!["localhost".into()])?;
     let certificate = CertificateDer::from(generated.cert);
     let private_key = PrivatePkcs8KeyDer::from(generated.signing_key.serialize_der());
@@ -717,26 +708,21 @@ fn make_configs(
         ServerConfig::with_single_cert(vec![certificate.clone()], private_key.into())?;
     let server_transport = Arc::get_mut(&mut server_config.transport)
         .ok_or_else(|| other_error("无法配置服务端传输参数"))?;
-    configure_transport(server_transport, path_idle_timeout, scheduler);
+    configure_transport(server_transport, path_idle_timeout);
 
     let mut roots = noq::rustls::RootCertStore::empty();
     roots.add(certificate)?;
     let mut client_config = ClientConfig::with_root_certificates(Arc::new(roots))?;
     let mut client_transport = TransportConfig::default();
-    configure_transport(&mut client_transport, path_idle_timeout, scheduler);
+    configure_transport(&mut client_transport, path_idle_timeout);
     client_config.transport_config(Arc::new(client_transport));
 
     Ok((server_config, client_config))
 }
 
-fn configure_transport(
-    transport: &mut TransportConfig,
-    path_idle_timeout: Option<Duration>,
-    scheduler: MultipathScheduler,
-) {
+fn configure_transport(transport: &mut TransportConfig, path_idle_timeout: Option<Duration>) {
     transport
         .max_concurrent_multipath_paths(2)
-        .multipath_scheduling_policy(scheduler.to_noq())
         .default_path_max_idle_timeout(path_idle_timeout)
         .default_path_keep_alive_interval(Some(Duration::from_millis(200)))
         .datagram_receive_buffer_size(Some(1024 * 1024))

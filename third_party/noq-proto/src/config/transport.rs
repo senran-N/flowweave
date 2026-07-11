@@ -62,7 +62,6 @@ pub struct TransportConfig {
     pub(crate) address_discovery_role: address_discovery::Role,
 
     pub(crate) max_concurrent_multipath_paths: Option<NonZeroU32>,
-    pub(crate) multipath_scheduling_policy: MultipathSchedulingPolicy,
 
     pub(crate) default_path_max_idle_timeout: Option<Duration>,
     pub(crate) default_path_keep_alive_interval: Option<Duration>,
@@ -399,16 +398,6 @@ impl TransportConfig {
         self
     }
 
-    /// Selects how application data is distributed across equally eligible multipath paths.
-    ///
-    /// Path validation, path status, congestion control, pacing, and control-frame scheduling are
-    /// unchanged. Defaults to [`MultipathSchedulingPolicy::Default`], which preserves noq's
-    /// original behavior.
-    pub fn multipath_scheduling_policy(&mut self, policy: MultipathSchedulingPolicy) -> &mut Self {
-        self.multipath_scheduling_policy = policy;
-        self
-    }
-
     /// Sets a default per-path maximum idle timeout
     ///
     /// If the path is idle for this long the path will be abandoned. Bear in mind this will
@@ -597,7 +586,6 @@ impl Default for TransportConfig {
 
             // disabled multipath by default
             max_concurrent_multipath_paths: None,
-            multipath_scheduling_policy: MultipathSchedulingPolicy::Default,
             default_path_max_idle_timeout: None,
             default_path_keep_alive_interval: None,
 
@@ -642,7 +630,6 @@ impl fmt::Debug for TransportConfig {
             enable_segmentation_offload,
             address_discovery_role,
             max_concurrent_multipath_paths,
-            multipath_scheduling_policy,
             default_path_max_idle_timeout,
             default_path_keep_alive_interval,
             max_remote_nat_traversal_addresses,
@@ -687,7 +674,6 @@ impl fmt::Debug for TransportConfig {
                 "max_concurrent_multipath_paths",
                 max_concurrent_multipath_paths,
             )
-            .field("multipath_scheduling_policy", multipath_scheduling_policy)
             .field(
                 "default_path_max_idle_timeout",
                 default_path_max_idle_timeout,
@@ -706,17 +692,6 @@ impl fmt::Debug for TransportConfig {
 
         s.finish_non_exhaustive()
     }
-}
-
-/// Policy used to select an eligible path for multipath application data.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub enum MultipathSchedulingPolicy {
-    /// Preserve noq's original deterministic lowest-Path-ID-first behavior.
-    #[default]
-    Default,
-    /// Use ACK-confirmed delivery rate, bytes in flight, and minimum RTT to minimize predicted
-    /// packet arrival time, with bounded probing and ECF-style waiting.
-    AckEcf,
 }
 
 /// Parameters for controlling the peer's acknowledgement frequency

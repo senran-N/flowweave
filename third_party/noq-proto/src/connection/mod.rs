@@ -22,7 +22,7 @@ use crate::{
     TransportError, TransportErrorCode, VarInt,
     cid_generator::ConnectionIdGenerator,
     cid_queue::CidQueue,
-    config::{MultipathSchedulingPolicy, ServerConfig, TransportConfig},
+    config::{ServerConfig, TransportConfig},
     congestion::Controller,
     connection::{
         paths::PathRetransmits,
@@ -65,9 +65,6 @@ pub use datagrams::{Datagrams, SendDatagramError};
 
 mod mtud;
 mod pacing;
-
-mod scheduler;
-use scheduler::{CompletionEstimate, should_wait_for_preferred};
 
 mod packet_builder;
 use packet_builder::{PacketBuilder, PadDatagram};
@@ -795,43 +792,6 @@ impl Connection {
             .map(|path_state| &mut path_state.data)
     }
 
-    #[cfg(test)]
-    pub(crate) fn set_path_ack_ecf_metrics_for_test(
-        &mut self,
-        path_id: PathId,
-        now: Instant,
-        rtt: Duration,
-        bytes_in_flight: u64,
-        delivery_rate: Option<u64>,
-    ) -> Result<(), ClosedPath> {
-        let path = self.path_mut(path_id).ok_or(ClosedPath { _private: () })?;
-        path.rtt = RttEstimator::new(rtt);
-        path.in_flight.bytes = bytes_in_flight;
-        path.in_flight.ack_eliciting = u64::from(bytes_in_flight != 0);
-        path.app_limited = false;
-        path.application_delivery_rate = Default::default();
-        if let Some(delivery_rate) = delivery_rate {
-            path.application_delivery_rate
-                .set_rate_for_test(now, delivery_rate);
-        }
-        Ok(())
-    }
-
-    #[cfg(test)]
-    pub(crate) fn path_ack_ecf_metrics_for_test(
-        &self,
-        path_id: PathId,
-        now: Instant,
-    ) -> Result<(Option<u64>, u64, bool), ClosedPath> {
-        let path = self.path(path_id).ok_or(ClosedPath { _private: () })?;
-        Ok((
-            path.application_delivery_rate
-                .effective_rate(now, path.rtt.get()),
-            path.application_delivery_rate.application_bytes_in_flight(),
-            path.app_limited,
-        ))
-    }
-
     /// Returns all known paths.
     ///
     /// There is no guarantee any of these paths are open or usable.
@@ -1107,48 +1067,34 @@ impl Connection {
                 && self.peer_supports_ack_frequency();
         }
 
-        let use_noq_default = self.config.multipath_scheduling_policy
-            == MultipathSchedulingPolicy::Default
-            || self.eligible_application_path_count() <= 1;
-
-        if use_noq_default {
-            let mut next_path_id = self.paths.first_entry().map(|e| *e.key());
-            while let Some(path_id) = next_path_id {
-                if !connection_close_pending
-                    && let Some(transmit) = self.poll_transmit_off_path(now, buf, path_id)
-                {
-                    return Some(transmit);
-                }
-
-                let info = self.scheduling_info(path_id);
-                let result = self.poll_transmit_on_path(
-                    now,
-                    buf,
-                    path_id,
-                    max_datagrams,
-                    &info,
-                    connection_close_pending,
-                    true,
-                );
-                if let Some(transmit) = result.transmit {
-                    return Some(transmit);
-                }
-
-                // Continue checking other paths, tail-loss probes may need to be sent
-                // in all spaces.
-                debug_assert!(
-                    buf.is_empty(),
-                    "nothing to send on path but buffer not empty"
-                );
-
-                next_path_id = self.paths.keys().find(|i| **i > path_id).copied();
+        let mut next_path_id = self.paths.first_entry().map(|e| *e.key());
+        while let Some(path_id) = next_path_id {
+            if !connection_close_pending
+                && let Some(transmit) = self.poll_transmit_off_path(now, buf, path_id)
+            {
+                return Some(transmit);
             }
-        } else {
-            match self.poll_transmit_ack_ecf(now, buf, max_datagrams, connection_close_pending) {
-                AckEcfPollResult::Transmit(transmit) => return Some(transmit),
-                AckEcfPollResult::Wait => return None,
-                AckEcfPollResult::Nothing => {}
+
+            let info = self.scheduling_info(path_id);
+            if let Some(transmit) = self.poll_transmit_on_path(
+                now,
+                buf,
+                path_id,
+                max_datagrams,
+                &info,
+                connection_close_pending,
+            ) {
+                return Some(transmit);
             }
+
+            // Continue checking other paths, tail-loss probes may need to be sent
+            // in all spaces.
+            debug_assert!(
+                buf.is_empty(),
+                "nothing to send on path but buffer not empty"
+            );
+
+            next_path_id = self.paths.keys().find(|i| **i > path_id).copied();
         }
 
         // We didn't produce any application data packet
@@ -1169,181 +1115,6 @@ impl Connection {
         }
 
         None
-    }
-
-    fn eligible_application_path_count(&self) -> usize {
-        self.paths
-            .keys()
-            .filter(|path_id| self.scheduling_info(**path_id).may_send_data)
-            .take(2)
-            .count()
-    }
-
-    /// Sends path-specific and shared control traffic in noq's original order, then applies
-    /// ACK-ECF only to STREAM and application DATAGRAM data.
-    fn poll_transmit_ack_ecf(
-        &mut self,
-        now: Instant,
-        buf: &mut Vec<u8>,
-        max_datagrams: NonZeroUsize,
-        connection_close_pending: bool,
-    ) -> AckEcfPollResult {
-        let path_ids: Vec<_> = self.paths.keys().copied().collect();
-
-        if !connection_close_pending {
-            for path_id in path_ids.iter().copied() {
-                if let Some(transmit) = self.poll_transmit_off_path(now, buf, path_id) {
-                    return AckEcfPollResult::Transmit(transmit);
-                }
-            }
-        }
-
-        for path_id in path_ids {
-            let mut info = self.scheduling_info(path_id);
-            info.may_send_application_data = false;
-            let result = self.poll_transmit_on_path(
-                now,
-                buf,
-                path_id,
-                max_datagrams,
-                &info,
-                connection_close_pending,
-                false,
-            );
-            if let Some(transmit) = result.transmit {
-                return AckEcfPollResult::Transmit(transmit);
-            }
-            debug_assert!(
-                buf.is_empty(),
-                "nothing to send on path but buffer not empty"
-            );
-        }
-
-        let candidates = self.ack_ecf_candidates(now);
-        if candidates.is_empty() {
-            let waiting_for_probe = self.paths.keys().copied().any(|path_id| {
-                let info = self.scheduling_info(path_id);
-                if !info.may_send_data {
-                    return false;
-                }
-                let path = self.path_data(path_id);
-                path.application_delivery_rate
-                    .effective_rate(now, path.rtt.get())
-                    .is_none()
-                    && path.application_delivery_rate.application_bytes_in_flight() != 0
-            });
-            return if waiting_for_probe {
-                AckEcfPollResult::Wait
-            } else {
-                AckEcfPollResult::Nothing
-            };
-        }
-
-        let mut saw_recoverable_block = false;
-        for (index, candidate) in candidates.iter().copied().enumerate() {
-            let info = self.scheduling_info(candidate.path_id);
-            let result = self.poll_transmit_on_path(
-                now,
-                buf,
-                candidate.path_id,
-                NonZeroUsize::MIN,
-                &info,
-                connection_close_pending,
-                true,
-            );
-            if let Some(transmit) = result.transmit {
-                return AckEcfPollResult::Transmit(transmit);
-            }
-            debug_assert!(
-                buf.is_empty(),
-                "nothing to send on path but buffer not empty"
-            );
-
-            match result.blocked {
-                PathBlocked::Congestion | PathBlocked::Pacing => {
-                    saw_recoverable_block = true;
-                    if let Some(preferred) = candidate.estimate {
-                        let alternate = candidates[index + 1..]
-                            .iter()
-                            .find_map(|candidate| candidate.estimate);
-                        if alternate.is_none_or(|alternate| {
-                            should_wait_for_preferred(
-                                preferred,
-                                alternate,
-                                candidate.feedback_is_recent,
-                            )
-                        }) {
-                            return AckEcfPollResult::Wait;
-                        }
-                    }
-                }
-                PathBlocked::No | PathBlocked::AntiAmplification => {}
-            }
-        }
-
-        if saw_recoverable_block {
-            AckEcfPollResult::Wait
-        } else {
-            AckEcfPollResult::Nothing
-        }
-    }
-
-    fn ack_ecf_candidates(&self, now: Instant) -> Vec<AckEcfCandidate> {
-        let mut probes = Vec::new();
-        let mut measured = Vec::new();
-
-        for path_id in self
-            .paths
-            .keys()
-            .copied()
-            .filter(|path_id| self.scheduling_info(*path_id).may_send_data)
-        {
-            let path = self.path_data(path_id);
-            let rtt = path.rtt.get();
-            let application_bytes_in_flight =
-                path.application_delivery_rate.application_bytes_in_flight();
-            let rate = path.application_delivery_rate.effective_rate(now, rtt);
-            let candidate = AckEcfCandidate {
-                path_id,
-                estimate: rate.map(|rate| {
-                    CompletionEstimate::new(
-                        path.rtt.min(),
-                        path.in_flight.bytes,
-                        path.current_mtu(),
-                        rate,
-                    )
-                }),
-                feedback_is_recent: path.application_delivery_rate.has_recent_feedback(now, rtt),
-                application_bytes_in_flight,
-                minimum_rtt: path.rtt.min(),
-            };
-
-            if path
-                .application_delivery_rate
-                .needs_probe(now, rtt, path.current_mtu())
-            {
-                probes.push(candidate);
-            } else if candidate.estimate.is_some() {
-                measured.push(candidate);
-            }
-        }
-
-        probes.sort_by_key(|candidate| {
-            (
-                candidate.application_bytes_in_flight,
-                candidate.minimum_rtt,
-                candidate.path_id,
-            )
-        });
-        measured.sort_by_key(|candidate| {
-            (
-                candidate.estimate.expect("measured candidate").nanos(),
-                candidate.minimum_rtt,
-                candidate.path_id,
-            )
-        });
-        probes.extend(measured);
-        probes
     }
 
     /// Computes the packet scheduling information for this path.
@@ -1438,7 +1209,6 @@ impl Connection {
         PathSchedulingInfo {
             is_abandoned,
             may_send_data,
-            may_send_application_data: may_send_data,
             may_send_close,
             may_self_abandon,
         }
@@ -1517,17 +1287,13 @@ impl Connection {
         max_datagrams: NonZeroUsize,
         scheduling_info: &PathSchedulingInfo,
         connection_close_pending: bool,
-        update_app_limited: bool,
-    ) -> PollTransmitOnPathResult {
+    ) -> Option<Transmit> {
         // Check if there is at least one active CID to use for sending
         let Some(remote_cid) = self.remote_cids.get(&path_id).map(CidQueue::active) else {
             if !self.abandoned_paths.contains(&path_id) {
                 debug!(%path_id, "no remote CIDs for path");
             }
-            return PollTransmitOnPathResult {
-                transmit: None,
-                blocked: PathBlocked::No,
-            };
+            return None;
         };
 
         // Whether the last packet in the datagram must be padded so the datagram takes up
@@ -1542,8 +1308,9 @@ impl Connection {
         // Handshake and Data(PathId::ZERO) spaces.
         let mut last_packet_number = None;
 
-        // If we end up not sending anything, retain why the path could not make progress.
-        let mut blocked = PathBlocked::No;
+        // If we end up not sending anything, we need to know if that was because there was
+        // nothing to send or because we were congestion blocked.
+        let mut congestion_blocked = false;
 
         // Set the segment size to this path's MTU for on-path data.
         let pmtu = self.path_data(path_id).current_mtu().into();
@@ -1565,10 +1332,10 @@ impl Connection {
                 connection_close_pending,
                 pad_datagram,
             ) {
-                PollPathSpaceStatus::NothingToSend { blocked: reason } => {
-                    if blocked == PathBlocked::No {
-                        blocked = reason;
-                    }
+                PollPathSpaceStatus::NothingToSend {
+                    congestion_blocked: cb,
+                } => {
+                    congestion_blocked |= cb;
                     // Continue checking other spaces, tail-loss probes may need to be sent
                     // in all spaces.
                 }
@@ -1595,7 +1362,7 @@ impl Connection {
             }
         }
 
-        if last_packet_number.is_some() || blocked != PathBlocked::No {
+        if last_packet_number.is_some() || congestion_blocked {
             self.qlog.emit_recovery_metrics(
                 path_id,
                 &mut self
@@ -1607,10 +1374,8 @@ impl Connection {
             );
         }
 
-        if update_app_limited {
-            self.path_data_mut(path_id).app_limited =
-                last_packet_number.is_none() && blocked == PathBlocked::No;
-        }
+        self.path_data_mut(path_id).app_limited =
+            last_packet_number.is_none() && !congestion_blocked;
 
         match last_packet_number {
             Some(last_packet_number) => {
@@ -1621,15 +1386,9 @@ impl Connection {
                     transmit.len() as u64,
                     last_packet_number,
                 );
-                PollTransmitOnPathResult {
-                    transmit: Some(self.build_transmit(path_id, transmit)),
-                    blocked: PathBlocked::No,
-                }
+                Some(self.build_transmit(path_id, transmit))
             }
-            None => PollTransmitOnPathResult {
-                transmit: None,
-                blocked,
-            },
+            None => None,
         }
     }
 
@@ -1676,13 +1435,8 @@ impl Connection {
                 // A new datagram needs to be started.
                 transmit.segment_size()
             };
-            let can_send = self.space_can_send(
-                space_id,
-                path_id,
-                max_packet_size,
-                connection_close_pending,
-                scheduling_info.may_send_application_data,
-            );
+            let can_send =
+                self.space_can_send(space_id, path_id, max_packet_size, connection_close_pending);
             let needs_loss_probe = self.spaces[space_id].for_path(path_id).loss_probes > 0;
             let space_will_send = {
                 if scheduling_info.is_abandoned {
@@ -1726,7 +1480,7 @@ impl Connection {
                             trace!(?space_id, %path_id, "nothing to send in space");
                         }
                         PollPathSpaceStatus::NothingToSend {
-                            blocked: PathBlocked::No,
+                            congestion_blocked: false,
                         }
                     }
                 };
@@ -1736,9 +1490,9 @@ impl Connection {
             // if we will need to start a new datagram. If we are coalescing into an already
             // started datagram we do not need to check congestion control again.
             if transmit.datagram_remaining_mut() == 0 {
-                let blocked =
+                let congestion_blocked =
                     self.path_congestion_check(space_id, path_id, transmit, &can_send, now);
-                if blocked != PathBlocked::No {
+                if congestion_blocked != PathBlocked::No {
                     // Previous iterations of this loop may have built packets already.
                     return match last_packet_number {
                         Some(pn) => PollPathSpaceStatus::WrotePacket {
@@ -1746,7 +1500,9 @@ impl Connection {
                             pad_datagram,
                         },
                         None => {
-                            return PollPathSpaceStatus::NothingToSend { blocked };
+                            return PollPathSpaceStatus::NothingToSend {
+                                congestion_blocked: true,
+                            };
                         }
                     };
                 }
@@ -1763,7 +1519,7 @@ impl Connection {
                         },
                         None => {
                             return PollPathSpaceStatus::NothingToSend {
-                                blocked: PathBlocked::No,
+                                congestion_blocked: false,
                             };
                         }
                     };
@@ -1829,7 +1585,7 @@ impl Connection {
                 // datagram and try and start another packet here. Then be stopped by the
                 // same confidentiality limit.
                 return PollPathSpaceStatus::NothingToSend {
-                    blocked: PathBlocked::No,
+                    congestion_blocked: false,
                 };
             };
             last_packet_number = Some(builder.packet_number);
@@ -1972,12 +1728,7 @@ impl Connection {
                     .datagram_remaining_mut()
                     .saturating_sub(builder.predict_packet_end());
                 max_packet_size > MIN_PACKET_SPACE
-                    && self.has_pending_packet(
-                        space_id,
-                        max_packet_size,
-                        connection_close_pending,
-                        scheduling_info.may_send_application_data,
-                    )
+                    && self.has_pending_packet(space_id, max_packet_size, connection_close_pending)
             } {
                 // We can append/coalesce the next packet into the current
                 // datagram. Finish the current packet without adding extra padding.
@@ -2110,7 +1861,6 @@ impl Connection {
         current_space_id: SpaceId,
         max_packet_size: usize,
         connection_close_pending: bool,
-        include_application_data: bool,
     ) -> bool {
         let mut space_id = current_space_id;
         loop {
@@ -2119,7 +1869,6 @@ impl Connection {
                 PathId::ZERO,
                 max_packet_size,
                 connection_close_pending,
-                include_application_data,
             );
             if !can_send.is_empty() {
                 return true;
@@ -2393,7 +2142,6 @@ impl Connection {
         path_id: PathId,
         packet_size: usize,
         connection_close_pending: bool,
-        include_application_data: bool,
     ) -> SendableFrames {
         let space = &mut self.spaces[space_id];
         let space_has_crypto = self.crypto_state.has_keys(space_id.encryption_level());
@@ -2419,11 +2167,7 @@ impl Connection {
             // (application datagrams).
             let frame_space_1rtt =
                 packet_size.saturating_sub(self.predict_1rtt_overhead(pn, path_id));
-            let mut one_rtt = self.can_send_1rtt(path_id, frame_space_1rtt);
-            if !include_application_data {
-                one_rtt.other = false;
-            }
-            can_send |= one_rtt;
+            can_send |= self.can_send_1rtt(path_id, frame_space_1rtt);
         }
 
         can_send.close = connection_close_pending && space_has_crypto;
@@ -3209,7 +2953,6 @@ impl Connection {
         }
 
         let mut ack_eliciting_acked = false;
-        let mut application_bytes_acked = 0_u64;
         for packet in newly_acked.elts() {
             if let Some(info) = self.spaces[space].for_path(path).take(packet) {
                 for (acked_path_id, acked_pn) in info.largest_acked.iter() {
@@ -3236,13 +2979,6 @@ impl Connection {
                 // Notify ack frequency that a packet was acked, because it might contain an ACK_FREQUENCY frame
                 self.ack_frequency.on_acked(path, packet);
 
-                if info.application_data
-                    && info.path_generation == self.path_data(path).generation()
-                {
-                    application_bytes_acked =
-                        application_bytes_acked.saturating_add(u64::from(info.size));
-                }
-
                 self.on_packet_acked(now, path, packet, info);
             }
         }
@@ -3251,17 +2987,6 @@ impl Connection {
         let path_data = self.path_data_mut(path);
         let app_limited = path_data.app_limited;
         let in_flight = path_data.in_flight.bytes;
-        if application_bytes_acked != 0 {
-            let mtu = path_data.current_mtu();
-            let rtt = path_data.rtt.get();
-            path_data.application_delivery_rate.on_ack_event(
-                now,
-                application_bytes_acked,
-                app_limited,
-                mtu,
-                rtt,
-            );
-        }
 
         path_data
             .congestion
@@ -6767,7 +6492,6 @@ impl Connection {
         let mut sent_datagrams = false;
         while !scheduling_info.is_abandoned
             && scheduling_info.may_send_data
-            && scheduling_info.may_send_application_data
             && builder.frame_space_remaining() > Datagram::SIZE_BOUND
             && space_id == SpaceId::Data
         {
@@ -6825,7 +6549,6 @@ impl Connection {
         // STREAM
         if !scheduling_info.is_abandoned
             && scheduling_info.may_send_data
-            && scheduling_info.may_send_application_data
             && space_id == SpaceId::Data
         {
             self.streams
@@ -7527,34 +7250,13 @@ pub trait NetworkChangeHint: std::fmt::Debug + 'static {
     fn is_path_recoverable(&self, path_id: PathId, network_path: FourTuple) -> bool;
 }
 
-/// Return value for [`Connection::poll_transmit_on_path`].
-struct PollTransmitOnPathResult {
-    transmit: Option<Transmit>,
-    blocked: PathBlocked,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct AckEcfCandidate {
-    path_id: PathId,
-    estimate: Option<CompletionEstimate>,
-    feedback_is_recent: bool,
-    application_bytes_in_flight: u64,
-    minimum_rtt: Duration,
-}
-
-enum AckEcfPollResult {
-    Transmit(Transmit),
-    Wait,
-    Nothing,
-}
-
 /// Return value for [`Connection::poll_transmit_path_space`].
 #[derive(Debug)]
 enum PollPathSpaceStatus {
     /// Nothing to send in the space, nothing was written into the [`TransmitBuf`].
     NothingToSend {
-        /// Why sendable data could not make progress, or [`PathBlocked::No`] if there was none.
-        blocked: PathBlocked,
+        /// If true there was data to send but congestion control did not allow so.
+        congestion_blocked: bool,
     },
     /// One or more packets have been written into the [`TransmitBuf`].
     WrotePacket {
@@ -7618,8 +7320,6 @@ struct PathSchedulingInfo {
     ///
     /// Note that once in the closed or draining states this will never be true.
     may_send_data: bool,
-    /// Whether STREAM and application DATAGRAM frames may be sent on this path.
-    may_send_application_data: bool,
     /// Whether the path may send a CONNECTION_CLOSE frame.
     ///
     /// This essentially marks this path as the best validated space ID with a fallback
@@ -7921,8 +7621,6 @@ struct SentFrames {
     stream_frames: StreamMetaVec,
     /// Whether the packet contains non-retransmittable frames (like datagrams)
     non_retransmits: bool,
-    /// Whether the packet contains STREAM or application DATAGRAM data.
-    application_data: bool,
     /// If the datagram containing these frames should be padded to the min MTU
     requires_padding: bool,
 }
@@ -7997,10 +7695,7 @@ impl SentFrames {
                 .retransmits_mut()
                 .retire_cids
                 .push((retire_cid.path_id.unwrap_or_default(), retire_cid.sequence)),
-            Datagram(_) => {
-                self.non_retransmits = true;
-                self.application_data = true;
-            }
+            Datagram(_) => self.non_retransmits = true,
             NewToken(_) => {}
             AddAddress(add_address) => {
                 self.retransmits_mut().add_address.insert(add_address);
@@ -8008,10 +7703,7 @@ impl SentFrames {
             RemoveAddress(remove_address) => {
                 self.retransmits_mut().remove_address.insert(remove_address);
             }
-            StreamMeta(stream_meta_encoder) => {
-                self.application_data = true;
-                self.stream_frames.push(stream_meta_encoder.meta);
-            }
+            StreamMeta(stream_meta_encoder) => self.stream_frames.push(stream_meta_encoder.meta),
             MaxData(_) => self.retransmits_mut().max_data = true,
             MaxStreamData(max) => {
                 self.retransmits_mut().max_stream_data.insert(max.id);

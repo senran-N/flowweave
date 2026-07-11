@@ -8,7 +8,6 @@ use super::{
     PathStats, SpaceKind,
     mtud::MtuDiscovery,
     pacing::Pacer,
-    scheduler::AckDeliveryRateEstimator,
     spaces::{PacketNumberSpace, SentPacket},
 };
 use crate::{
@@ -219,8 +218,6 @@ pub(super) struct PathData {
     ///
     /// Note that this is across all spaces on this path
     pub(super) in_flight: InFlight,
-    /// ACK-confirmed delivery state for application-bearing packets on this exact 4-tuple.
-    pub(super) application_delivery_rate: AckDeliveryRateEstimator,
     /// Queue of data that must be sent over this specific [`PathData::generation`] path.
     pub(super) pending: PathRetransmits,
     /// Observed address frame with the largest sequence number received from the peer on this path.
@@ -337,7 +334,6 @@ impl PathData {
                 ),
             first_packet_after_rtt_sample: None,
             in_flight: InFlight::new(),
-            application_delivery_rate: AckDeliveryRateEstimator::default(),
             pending: PathRetransmits::default(),
             last_observed_addr_report: None,
             status: Default::default(),
@@ -386,9 +382,6 @@ impl PathData {
             mtud: prev.mtud.clone(),
             first_packet_after_rtt_sample: prev.first_packet_after_rtt_sample,
             in_flight: InFlight::new(),
-            // A migrated path is a new 4-tuple. Reusing delivery samples from the previous
-            // generation would make the scheduler trust measurements from a different route.
-            application_delivery_rate: AckDeliveryRateEstimator::default(),
             pending: PathRetransmits::default(),
             last_observed_addr_report: None,
             status: prev.status.clone(),
@@ -422,10 +415,6 @@ impl PathData {
 
     /// Account for transmission of `packet` with number `pn` in `space`
     pub(super) fn sent(&mut self, pn: u64, packet: SentPacket, space: &mut PacketNumberSpace) {
-        if packet.application_data {
-            self.application_delivery_rate
-                .on_application_sent(u64::from(packet.size));
-        }
         self.in_flight.insert(&packet);
         if self.first_packet.is_none() {
             self.first_packet = Some(pn);
@@ -454,10 +443,6 @@ impl PathData {
     pub(super) fn remove_in_flight(&mut self, packet: &SentPacket) -> bool {
         if packet.path_generation != self.generation {
             return false;
-        }
-        if packet.application_data {
-            self.application_delivery_rate
-                .on_application_removed(u64::from(packet.size));
         }
         self.in_flight.remove(packet);
         true

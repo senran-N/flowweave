@@ -519,8 +519,6 @@ pub(super) struct SentPacket {
     pub(super) size: u16,
     /// Whether an acknowledgement is expected directly in response to this packet.
     pub(super) ack_eliciting: bool,
-    /// Whether this packet contains STREAM or application DATAGRAM data.
-    pub(super) application_data: bool,
     /// The largest packet number acknowledged by this packet
     pub(super) largest_acked: FxHashMap<PathId, u64>,
     /// Data which needs to be retransmitted in case the packet is lost.
