@@ -1792,6 +1792,21 @@ impl Connection {
                 // first datagram.
                 if transmit.num_datagrams() == 1 {
                     transmit.clip_segment_size();
+                    if transmit.segment_size() <= MIN_PACKET_SPACE {
+                        // GSO requires every non-final datagram to use the first datagram's
+                        // segment size. A tiny control packet can therefore shrink the batch
+                        // below the space needed for another complete QUIC packet. End this
+                        // transmit now; pending frames will be sent with a fresh MTU-sized
+                        // segment on the next poll instead of overflowing the packet buffer.
+                        trace!(
+                            segment_size = transmit.segment_size(),
+                            "GSO batch ended after a segment too small for another packet"
+                        );
+                        return PollPathSpaceStatus::Send {
+                            last_packet_number: last_packet_number
+                                .expect("a packet was just written"),
+                        };
+                    }
                 }
             }
         }
