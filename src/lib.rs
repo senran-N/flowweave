@@ -324,8 +324,15 @@ pub struct PathMeasurement {
     pub last_pto_recovery_stream_frames: u64,
     pub pto_hedges: u64,
     pub pto_hedge_bytes: u64,
+    pub ack_eliciting_packet_number_advance: u64,
     pub final_rtt: Duration,
+    pub final_pto: Duration,
     pub final_cwnd: u64,
+    pub final_bytes_in_flight: u64,
+    pub final_ack_eliciting_packets_in_flight: u64,
+    pub final_tracked_sent_packets: u64,
+    pub final_tracked_ack_eliciting_packets: u64,
+    pub final_loss_detection_timer_armed: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -407,31 +414,95 @@ pub struct FailoverReport {
 pub struct SustainedFailoverTimeline {
     pub primary_open_at_fault: bool,
     pub secondary_open_at_fault: bool,
+    pub primary_rtt_at_fault: Duration,
+    pub primary_pto_at_fault: Duration,
+    pub primary_cwnd_at_fault: u64,
+    pub primary_bytes_in_flight_at_fault: u64,
+    pub primary_ack_eliciting_packets_in_flight_at_fault: u64,
+    pub primary_tracked_sent_packets_at_fault: u64,
+    pub primary_tracked_ack_eliciting_packets_at_fault: u64,
+    pub primary_latest_ack_eliciting_packet_number_at_fault: u64,
+    pub primary_pto_count_at_fault: u32,
+    pub primary_loss_detection_timer_armed_at_fault: bool,
     pub first_primary_loss_timeout: Option<Duration>,
     pub first_primary_pto: Option<Duration>,
     pub first_primary_recovery_attempt: Option<Duration>,
     pub first_primary_hedge: Option<Duration>,
+    pub first_primary_ack_eliciting_send: Option<Duration>,
+    pub last_primary_ack_eliciting_send: Option<Duration>,
+    pub first_primary_udp_receive: Option<Duration>,
+    pub last_primary_udp_receive: Option<Duration>,
+    pub first_primary_loss_timer_unarmed: Option<Duration>,
+    pub first_primary_ack_eliciting_in_flight_zero: Option<Duration>,
+    pub first_primary_tracked_ack_eliciting_zero: Option<Duration>,
+    pub max_primary_bytes_in_flight: u64,
+    pub max_primary_ack_eliciting_packets_in_flight: u64,
+    pub max_primary_tracked_sent_packets: u64,
+    pub max_primary_tracked_ack_eliciting_packets: u64,
     pub first_secondary_udp_send: Option<Duration>,
     pub first_receiver_primary_cross_path_ack: Option<Duration>,
     pub first_receiver_secondary_same_path_ack: Option<Duration>,
     pub primary_closed: Option<Duration>,
     pub secondary_closed: Option<Duration>,
+    observed_primary_latest_ack_eliciting_packet_number: u64,
+    observed_primary_udp_rx_datagrams: u64,
 }
 
 impl SustainedFailoverTimeline {
-    fn new(primary_open_at_fault: bool, secondary_open_at_fault: bool) -> Self {
+    fn new(
+        primary_open_at_fault: bool,
+        secondary_open_at_fault: bool,
+        primary_at_fault: PathStats,
+    ) -> Self {
         Self {
             primary_open_at_fault,
             secondary_open_at_fault,
+            primary_rtt_at_fault: primary_at_fault.rtt,
+            primary_pto_at_fault: primary_at_fault.pto,
+            primary_cwnd_at_fault: primary_at_fault.cwnd,
+            primary_bytes_in_flight_at_fault: primary_at_fault.bytes_in_flight,
+            primary_ack_eliciting_packets_in_flight_at_fault: primary_at_fault
+                .ack_eliciting_packets_in_flight,
+            primary_tracked_sent_packets_at_fault: primary_at_fault.tracked_sent_packets,
+            primary_tracked_ack_eliciting_packets_at_fault: primary_at_fault
+                .tracked_ack_eliciting_packets,
+            primary_latest_ack_eliciting_packet_number_at_fault: primary_at_fault
+                .latest_ack_eliciting_packet_number,
+            primary_pto_count_at_fault: primary_at_fault.pto_count,
+            primary_loss_detection_timer_armed_at_fault: primary_at_fault
+                .loss_detection_timer_armed,
             first_primary_loss_timeout: None,
             first_primary_pto: None,
             first_primary_recovery_attempt: None,
             first_primary_hedge: None,
+            first_primary_ack_eliciting_send: None,
+            last_primary_ack_eliciting_send: None,
+            first_primary_udp_receive: None,
+            last_primary_udp_receive: None,
+            first_primary_loss_timer_unarmed: (!primary_at_fault.loss_detection_timer_armed)
+                .then_some(Duration::ZERO),
+            first_primary_ack_eliciting_in_flight_zero: (primary_at_fault
+                .ack_eliciting_packets_in_flight
+                == 0)
+                .then_some(Duration::ZERO),
+            first_primary_tracked_ack_eliciting_zero: (primary_at_fault
+                .tracked_ack_eliciting_packets
+                == 0)
+                .then_some(Duration::ZERO),
+            max_primary_bytes_in_flight: primary_at_fault.bytes_in_flight,
+            max_primary_ack_eliciting_packets_in_flight: primary_at_fault
+                .ack_eliciting_packets_in_flight,
+            max_primary_tracked_sent_packets: primary_at_fault.tracked_sent_packets,
+            max_primary_tracked_ack_eliciting_packets: primary_at_fault
+                .tracked_ack_eliciting_packets,
             first_secondary_udp_send: None,
             first_receiver_primary_cross_path_ack: None,
             first_receiver_secondary_same_path_ack: None,
             primary_closed: (!primary_open_at_fault).then_some(Duration::ZERO),
             secondary_closed: (!secondary_open_at_fault).then_some(Duration::ZERO),
+            observed_primary_latest_ack_eliciting_packet_number: primary_at_fault
+                .latest_ack_eliciting_packet_number,
+            observed_primary_udp_rx_datagrams: primary_at_fault.udp_rx.datagrams,
         }
     }
 }
@@ -1004,6 +1075,7 @@ where
         let mut timeline = SustainedFailoverTimeline::new(
             sender_primary.status().is_ok(),
             sender_secondary.status().is_ok(),
+            primary_at_blackhole,
         );
         observe_sustained_failover_timeline(
             &mut timeline,
@@ -1320,6 +1392,50 @@ fn observe_sustained_failover_timeline(
         primary.pto_hedges > primary_at_blackhole.pto_hedges,
         elapsed,
     );
+    if primary.latest_ack_eliciting_packet_number
+        > timeline.observed_primary_latest_ack_eliciting_packet_number
+    {
+        record_first_timeline_event(
+            &mut timeline.first_primary_ack_eliciting_send,
+            true,
+            elapsed,
+        );
+        timeline.last_primary_ack_eliciting_send = Some(elapsed);
+        timeline.observed_primary_latest_ack_eliciting_packet_number =
+            primary.latest_ack_eliciting_packet_number;
+    }
+    if primary.udp_rx.datagrams > timeline.observed_primary_udp_rx_datagrams {
+        record_first_timeline_event(&mut timeline.first_primary_udp_receive, true, elapsed);
+        timeline.last_primary_udp_receive = Some(elapsed);
+        timeline.observed_primary_udp_rx_datagrams = primary.udp_rx.datagrams;
+    }
+    record_first_timeline_event(
+        &mut timeline.first_primary_loss_timer_unarmed,
+        !primary.loss_detection_timer_armed,
+        elapsed,
+    );
+    record_first_timeline_event(
+        &mut timeline.first_primary_ack_eliciting_in_flight_zero,
+        primary.ack_eliciting_packets_in_flight == 0,
+        elapsed,
+    );
+    record_first_timeline_event(
+        &mut timeline.first_primary_tracked_ack_eliciting_zero,
+        primary.tracked_ack_eliciting_packets == 0,
+        elapsed,
+    );
+    timeline.max_primary_bytes_in_flight = timeline
+        .max_primary_bytes_in_flight
+        .max(primary.bytes_in_flight);
+    timeline.max_primary_ack_eliciting_packets_in_flight = timeline
+        .max_primary_ack_eliciting_packets_in_flight
+        .max(primary.ack_eliciting_packets_in_flight);
+    timeline.max_primary_tracked_sent_packets = timeline
+        .max_primary_tracked_sent_packets
+        .max(primary.tracked_sent_packets);
+    timeline.max_primary_tracked_ack_eliciting_packets = timeline
+        .max_primary_tracked_ack_eliciting_packets
+        .max(primary.tracked_ack_eliciting_packets);
     record_first_timeline_event(
         &mut timeline.first_secondary_udp_send,
         secondary.udp_tx.bytes > secondary_at_blackhole.udp_tx.bytes,
@@ -2252,8 +2368,17 @@ fn path_delta(before: PathStats, after: PathStats) -> PathMeasurement {
         },
         pto_hedges: after.pto_hedges.saturating_sub(before.pto_hedges),
         pto_hedge_bytes: after.pto_hedge_bytes.saturating_sub(before.pto_hedge_bytes),
+        ack_eliciting_packet_number_advance: after
+            .latest_ack_eliciting_packet_number
+            .saturating_sub(before.latest_ack_eliciting_packet_number),
         final_rtt: after.rtt,
+        final_pto: after.pto,
         final_cwnd: after.cwnd,
+        final_bytes_in_flight: after.bytes_in_flight,
+        final_ack_eliciting_packets_in_flight: after.ack_eliciting_packets_in_flight,
+        final_tracked_sent_packets: after.tracked_sent_packets,
+        final_tracked_ack_eliciting_packets: after.tracked_ack_eliciting_packets,
+        final_loss_detection_timer_armed: after.loss_detection_timer_armed,
     }
 }
 

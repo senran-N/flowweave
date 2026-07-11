@@ -219,10 +219,10 @@
 - FAILOVER_RESEARCH.md：记录 PTO 对冲的数学模型、先进论文复核、状态机、安全边界、短筛与正式持续流失败结论。
 - MATH_RESEARCH.md：记录容量不可辨认证明、编码与队列论文审计，以及 A 保留、B 改 ACK 信用、C 先批量双发的数学依据。
 - src/main.rs：普通实验的启动入口和中文结果展示入口。
-- src/lib.rs：可复用的 MPQUIC 连接、传输校验、指标采集和断路实验逻辑；NoQ 相关操作集中在这里。
+- src/lib.rs：可复用的 MPQUIC 连接、传输校验、指标采集和断路实验逻辑；A 组时间线会同时记录 RTT/PTO、在途包、包表和定时器状态，NoQ 相关操作集中在这里。
 - src/scheduler.rs：FlowWeave 对外展示的调度名称；当前只有 NoQ 默认基线，失败候选不保留。
 - benchmark-results：真实运行产生的逐轮原始数据和说明；失败轮次不删除。
-- tests/network_lab.rs：四类坏网络场景、A 组恢复短筛、B 组单路径对照和安全护栏。
+- tests/network_lab.rs：四类坏网络场景、A 组恢复短筛、正式实验、PATH_ACK 与无 PTO 独立诊断、B 组单路径对照和安全护栏。
 - scripts/run_netem_lab.sh：进入一次性隔离网络空间，启动 smoke、A 组 failover、B 组 screen 或 release 长时实验。
 - third_party/README.md：记录第三方源码的版本、校验值、许可证和我们实际修改过什么。
 - third_party/noq-proto：NoQ Proto 1.0.1 官方源码快照，加 9 个文件组成的最小测量、PTO 恢复与 PATH_ACK 反馈补丁；当前没有自定义调度补丁。
@@ -275,8 +275,9 @@ cargo test --all-targets
 ./scripts/run_netem_lab.sh failover
 ./scripts/run_netem_lab.sh formal-a
 ./scripts/run_netem_lab.sh diagnose-a
+./scripts/run_netem_lab.sh diagnose-no-pto
 ./scripts/run_netem_lab.sh screen
 ./scripts/run_netem_lab.sh long
 ~~~
 
-默认 `smoke` 坏网络实验会运行约一分钟；`failover` 运行 A 组 30 场五种子短筛；`formal-a` 使用 release 构建运行 20 场、约 11 分钟的双向持续换网正式实验；`diagnose-a` 使用三个代表场景运行约 2 分钟的 A 组事件时间线；`screen` 运行 B 组五种子短流筛选；`long` 使用 release 构建，运行约 19 分钟的正式时长 B 组复赛。看到最终 `test result: ok` 表示实验基础设施成功完成；指标不好不代表测试程序失败，它可能正是在如实揭示协议短板。
+默认 `smoke` 坏网络实验会运行约一分钟；`failover` 运行 A 组 30 场五种子短筛；`formal-a` 使用 release 构建运行 20 场、约 11 分钟的双向持续换网正式实验；`diagnose-a` 使用三个代表场景运行约 2 分钟的 A 组事件时间线；`diagnose-no-pto` 只复跑正向种子 1103，并记录故障时 RTT/PTO、在途包、包表、最后一次需确认发包和定时器状态；`screen` 运行 B 组五种子短流筛选；`long` 使用 release 构建，运行约 19 分钟的正式时长 B 组复赛。看到最终 `test result: ok` 表示实验基础设施成功完成；指标不好不代表测试程序失败，它可能正是在如实揭示协议短板。

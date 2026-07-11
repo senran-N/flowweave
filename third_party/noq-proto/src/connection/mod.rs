@@ -2692,11 +2692,45 @@ impl Connection {
 
     /// Returns path statistics
     pub fn path_stats(&mut self, path_id: PathId) -> Option<PathStats> {
-        let path = self.paths.get(&path_id)?;
+        let path = &self.paths.get(&path_id)?.data;
+        let rtt = path.rtt.get();
+        let pto = self.pto(SpaceKind::Data, path_id);
+        let cwnd = path.congestion.window();
+        let bytes_in_flight = path.in_flight.bytes;
+        let ack_eliciting_packets_in_flight = path.in_flight.ack_eliciting;
+        let pto_count = path.pto_count;
+        let current_mtu = path.mtud.current_mtu();
+        let (tracked_sent_packets, tracked_ack_eliciting_packets, latest_packet_number) = self
+            .spaces[SpaceId::Data]
+            .path_space(path_id)
+            .map(|space| {
+                (
+                    space.sent_packets.iter().count() as u64,
+                    space
+                        .sent_packets
+                        .values()
+                        .filter(|packet| packet.ack_eliciting)
+                        .count() as u64,
+                    space.largest_ack_eliciting_sent,
+                )
+            })
+            .unwrap_or_default();
+        let loss_detection_timer_armed = self
+            .timers
+            .get(Timer::PerPath(path_id, PathTimer::LossDetection))
+            .is_some();
         let stats = self.path_stats.for_path(path_id);
-        stats.rtt = path.data.rtt.get();
-        stats.cwnd = path.data.congestion.window();
-        stats.current_mtu = path.data.mtud.current_mtu();
+        stats.rtt = rtt;
+        stats.pto = pto;
+        stats.cwnd = cwnd;
+        stats.bytes_in_flight = bytes_in_flight;
+        stats.ack_eliciting_packets_in_flight = ack_eliciting_packets_in_flight;
+        stats.tracked_sent_packets = tracked_sent_packets;
+        stats.tracked_ack_eliciting_packets = tracked_ack_eliciting_packets;
+        stats.latest_ack_eliciting_packet_number = latest_packet_number;
+        stats.pto_count = pto_count;
+        stats.loss_detection_timer_armed = loss_detection_timer_armed;
+        stats.current_mtu = current_mtu;
         Some(*stats)
     }
 

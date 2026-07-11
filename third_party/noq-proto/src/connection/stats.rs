@@ -229,6 +229,8 @@ impl std::fmt::Debug for FrameStats {
 pub struct PathStats {
     /// Current best estimate of this connection's latency (round-trip-time).
     pub rtt: Duration,
+    /// Current probe timeout for application data on this path.
+    pub pto: Duration,
     /// Statistics about datagrams and bytes sent on this path.
     pub udp_tx: UdpStats,
     /// Statistics about datagrams and bytes received on this path.
@@ -239,6 +241,20 @@ pub struct PathStats {
     pub frame_rx: FrameStats,
     /// Current congestion window of the connection.
     pub cwnd: u64,
+    /// Bytes currently counted as in flight by this path's congestion controller.
+    pub bytes_in_flight: u64,
+    /// Ack-eliciting packets currently counted as in flight on this path.
+    pub ack_eliciting_packets_in_flight: u64,
+    /// Packets still retained in this path's application-data sent-packet table.
+    pub tracked_sent_packets: u64,
+    /// Ack-eliciting packets still retained in this path's application-data sent-packet table.
+    pub tracked_ack_eliciting_packets: u64,
+    /// Highest ack-eliciting application-data packet number sent on this path.
+    pub latest_ack_eliciting_packet_number: u64,
+    /// Current consecutive PTO count used for exponential backoff.
+    pub pto_count: u32,
+    /// Whether the path currently has a loss-detection or PTO timer armed.
+    pub loss_detection_timer_armed: bool,
     /// Congestion events on the connection.
     pub congestion_events: u64,
     /// Spurious congestion events on the connection.
@@ -306,14 +322,22 @@ impl std::ops::Add<PathStats> for ConnectionStats {
 
     fn add(self, rhs: PathStats) -> Self::Output {
         // Be aware that Connection::stats() relies on the fact this function ignores the
-        // rtt, cwnd and current_mtu fields.
+        // current path-state gauges.
         let PathStats {
             rtt: _,
+            pto: _,
             udp_tx,
             udp_rx,
             frame_tx,
             frame_rx,
             cwnd: _,
+            bytes_in_flight: _,
+            ack_eliciting_packets_in_flight: _,
+            tracked_sent_packets: _,
+            tracked_ack_eliciting_packets: _,
+            latest_ack_eliciting_packet_number: _,
+            pto_count: _,
+            loss_detection_timer_armed: _,
             congestion_events: _,
             spurious_congestion_events: _,
             lost_packets,
@@ -345,14 +369,22 @@ impl std::ops::Add<PathStats> for ConnectionStats {
 impl std::ops::AddAssign<PathStats> for ConnectionStats {
     fn add_assign(&mut self, rhs: PathStats) {
         // Be aware that Connection::stats() relies on the fact this function ignores the
-        // rtt, cwnd and current_mtu fields.
+        // current path-state gauges.
         let PathStats {
             rtt: _,
+            pto: _,
             udp_tx: path_udp_tx,
             udp_rx: path_udp_rx,
             frame_tx: path_frame_tx,
             frame_rx: path_frame_rx,
             cwnd: _,
+            bytes_in_flight: _,
+            ack_eliciting_packets_in_flight: _,
+            tracked_sent_packets: _,
+            tracked_ack_eliciting_packets: _,
+            latest_ack_eliciting_packet_number: _,
+            pto_count: _,
+            loss_detection_timer_armed: _,
             congestion_events: _,
             spurious_congestion_events: _,
             lost_packets: path_lost_packets,

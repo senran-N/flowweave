@@ -586,6 +586,29 @@ fn path_stats_count_fresh_stream_payload_separately() {
 }
 
 #[test]
+fn path_stats_expose_loss_detection_state() -> TestResult {
+    let _guard = subscribe();
+    let mut pair = ConnPair::builder()
+        .enable_multipath()
+        .disable_mtud_discovery()
+        .connect();
+    let before = pair.path_stats(Client, PathId::ZERO).unwrap();
+
+    pair.ping_path(Client, PathId::ZERO)?;
+    pair.drive_client();
+
+    let after = pair.path_stats(Client, PathId::ZERO).unwrap();
+    assert!(after.pto > Duration::ZERO);
+    assert!(after.latest_ack_eliciting_packet_number > before.latest_ack_eliciting_packet_number);
+    assert!(after.bytes_in_flight > 0);
+    assert!(after.ack_eliciting_packets_in_flight > 0);
+    assert!(after.tracked_sent_packets > 0);
+    assert!(after.tracked_ack_eliciting_packets > 0);
+    assert!(after.loss_detection_timer_armed);
+    Ok(())
+}
+
+#[test]
 fn non_zero_length_cids() {
     let _guard = subscribe();
     let multipath_transport_cfg = Arc::new(TransportConfig {

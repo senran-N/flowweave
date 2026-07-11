@@ -28,9 +28,9 @@ third_party/noq-proto 最初来自本机 Cargo 已校验的官方发布包。
 - `src/connection/paths.rs`：保存本地 PTO 恢复探针的包号边界；它不进入线协议，也不发送公开 `PATH_STATUS`。
 - `src/connection/send_buffer.rs`：区分首次与重传数据；重复、重叠和乱序 ACK 只计算新确认字节，并取消已经无用的待发重复范围。
 - `src/connection/spaces.rs`：逐路径判断本路径待发 ACK，让 Backup 路径可以发送 ACK-only 包，同时不把其他开放路径的 ACK 错当成本路径工作。
-- `src/connection/stats.rs`：分别统计每条路径首次/重传 STREAM 字节、loss/PTO 恢复尝试、对冲载荷，以及同路/跨路 PATH_ACK。
+- `src/connection/stats.rs`：分别统计每条路径首次/重传 STREAM 字节、loss/PTO 恢复尝试、对冲载荷和同路/跨路 PATH_ACK；另只读暴露当前 PTO、在途字节/包、应用数据包表、PTO 计数和定时器是否武装，用于解释“有丢包却没有 PTO”。
 - `src/connection/streams/send.rs`：把“流是否完成”和“本次新确认字节数”一起返回，防止两个副本的 ACK 重复扣账。
 - `src/connection/streams/state.rs`：按新确认字节更新连接账目，让重传接口报告本次真正新加入队列的载荷，并向内部诊断暴露全连接未确认 STREAM 字节快照。
-- `src/tests/multipath.rs`：验证测量、默认关闭、单路径保护、首次/重复 PTO、备用路接管、拥塞窗口、纯 FIN、两种 ACK 顺序和旧 ACK 边界，并确定性证明开放 Backup 同路返回 PATH_ACK、路径 abandoned 后从剩余路径跨路回退。
+- `src/tests/multipath.rs`：验证测量、默认关闭、单路径保护、首次/重复 PTO、备用路接管、拥塞窗口、纯 FIN、两种 ACK 顺序和旧 ACK 边界；确定性证明开放 Backup 同路返回 PATH_ACK、路径 abandoned 后跨路回退，并检查只读 PTO 状态与真实在途 PING 一致。
 
 轮询、最低 RTT、预计最早送达、交付速率加权和 ACK-ECF 都已经按基准结果完整删除；NoQ 当前仍保持官方调度行为，不保留失败调度开关。PTO 对冲是独立的数据恢复机制，不参与 B 组容量调度。BBR3 只读容量接口曾在实验快照 `29f0ec2` 中验证，但没有通过 2 MiB 五种子短筛，随后已完整删除。
