@@ -89,6 +89,7 @@ pub enum PtoRecovery {
     #[default]
     Disabled,
     CrossPathHedge,
+    CrossPathHedgeAndAbandon,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -128,11 +129,16 @@ impl PtoRecovery {
         match self {
             Self::Disabled => "NoQ 默认恢复",
             Self::CrossPathHedge => "FlowWeave PTO 跨路径对冲",
+            Self::CrossPathHedgeAndAbandon => "FlowWeave PTO + abandoned 即时对冲",
         }
     }
 
-    fn enabled(self) -> bool {
-        matches!(self, Self::CrossPathHedge)
+    fn pto_reinjection_enabled(self) -> bool {
+        matches!(self, Self::CrossPathHedge | Self::CrossPathHedgeAndAbandon)
+    }
+
+    fn abandon_reinjection_enabled(self) -> bool {
+        matches!(self, Self::CrossPathHedgeAndAbandon)
     }
 }
 
@@ -324,6 +330,10 @@ pub struct PathMeasurement {
     pub last_pto_recovery_stream_frames: u64,
     pub pto_hedges: u64,
     pub pto_hedge_bytes: u64,
+    pub path_abandon_recovery_attempts: u64,
+    pub path_abandon_recovery_empty_attempts: u64,
+    pub path_abandon_reinjections: u64,
+    pub path_abandon_reinjected_bytes: u64,
     pub ack_eliciting_packet_number_advance: u64,
     pub final_rtt: Duration,
     pub final_pto: Duration,
@@ -1583,7 +1593,8 @@ fn configure_transport(
 ) {
     transport
         .max_concurrent_multipath_paths(2)
-        .cross_path_pto_reinjection(pto_recovery.enabled())
+        .cross_path_pto_reinjection(pto_recovery.pto_reinjection_enabled())
+        .cross_path_abandon_reinjection(pto_recovery.abandon_reinjection_enabled())
         .default_path_max_idle_timeout(path_idle_timeout)
         .default_path_keep_alive_interval(Some(Duration::from_millis(200)))
         .datagram_receive_buffer_size(Some(1024 * 1024))
@@ -2368,6 +2379,18 @@ fn path_delta(before: PathStats, after: PathStats) -> PathMeasurement {
         },
         pto_hedges: after.pto_hedges.saturating_sub(before.pto_hedges),
         pto_hedge_bytes: after.pto_hedge_bytes.saturating_sub(before.pto_hedge_bytes),
+        path_abandon_recovery_attempts: after
+            .path_abandon_recovery_attempts
+            .saturating_sub(before.path_abandon_recovery_attempts),
+        path_abandon_recovery_empty_attempts: after
+            .path_abandon_recovery_empty_attempts
+            .saturating_sub(before.path_abandon_recovery_empty_attempts),
+        path_abandon_reinjections: after
+            .path_abandon_reinjections
+            .saturating_sub(before.path_abandon_reinjections),
+        path_abandon_reinjected_bytes: after
+            .path_abandon_reinjected_bytes
+            .saturating_sub(before.path_abandon_reinjected_bytes),
         ack_eliciting_packet_number_advance: after
             .latest_ack_eliciting_packet_number
             .saturating_sub(before.latest_ack_eliciting_packet_number),

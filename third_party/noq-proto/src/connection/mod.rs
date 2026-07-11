@@ -117,6 +117,12 @@ use state::State;
 pub use state::State;
 use state::StateType;
 
+#[derive(Debug, Clone, Copy)]
+enum StreamReinjectionTrigger {
+    Pto,
+    PathAbandon,
+}
+
 /// Protocol state and logic for a single QUIC connection
 ///
 /// Objects of this type receive [`ConnectionEvent`]s and emit [`EndpointEvent`]s and application
@@ -675,6 +681,10 @@ impl Connection {
     /// should have happened before calling this.
     fn abandon_path(&mut self, now: Instant, path_id: PathId, reason: PathAbandonReason) {
         trace!(%path_id, ?reason, "abandoning path");
+
+        // Retain the packet-number space for the normal 3-PTO drain period, but do not make
+        // application data wait for final path-state deletion before it can use another path.
+        self.maybe_reinject_stream_data_on_path_abandon(path_id);
 
         let pending_space = &mut self.spaces[SpaceId::Data].pending;
         // Send PATH_ABANDON
@@ -3278,12 +3288,22 @@ impl Connection {
         );
     }
 
-    /// Queue outstanding STREAM data from a PTO-stalled path for another validated path.
+    /// Queue outstanding STREAM data from one path for another validated path.
     ///
-    /// Returns whether a hedge episode was started. This is deliberately limited to one episode
-    /// per recovery period by [`PathData::pto_recovery_probe_start`].
-    fn maybe_reinject_stream_data_on_pto(&mut self, path_id: PathId, space: SpaceId) -> bool {
-        if !self.config.cross_path_pto_reinjection
+    /// Returns whether a reinjection episode was started. This is deliberately limited to one
+    /// episode per recovery period by [`PathData::pto_recovery_probe_start`]. Packet-number state
+    /// on the original path remains intact so late ACKs can still cancel duplicate ranges safely.
+    fn maybe_reinject_stream_data(
+        &mut self,
+        path_id: PathId,
+        space: SpaceId,
+        trigger: StreamReinjectionTrigger,
+    ) -> bool {
+        let enabled = match trigger {
+            StreamReinjectionTrigger::Pto => self.config.cross_path_pto_reinjection,
+            StreamReinjectionTrigger::PathAbandon => self.config.cross_path_abandon_reinjection,
+        };
+        if !enabled
             || space != SpaceId::Data
             || self.path_data(path_id).pto_recovery_probe_start.is_some()
         {
@@ -3311,16 +3331,31 @@ impl Connection {
             .flat_map(|packet| packet.stream_frames.iter().cloned())
             .collect::<Vec<_>>();
         let stream_frame_count = stream_frames.len() as u64;
-        {
-            let stats = self.path_stats.for_path(path_id);
-            stats.pto_recovery_attempts = stats.pto_recovery_attempts.saturating_add(1);
-            stats.last_pto_recovery_unacked_bytes = unacked_stream_bytes;
-            stats.last_pto_recovery_stream_frames = stream_frame_count;
+        match trigger {
+            StreamReinjectionTrigger::Pto => {
+                let stats = self.path_stats.for_path(path_id);
+                stats.pto_recovery_attempts = stats.pto_recovery_attempts.saturating_add(1);
+                stats.last_pto_recovery_unacked_bytes = unacked_stream_bytes;
+                stats.last_pto_recovery_stream_frames = stream_frame_count;
+            }
+            StreamReinjectionTrigger::PathAbandon => {
+                let stats = self.path_stats.for_path(path_id);
+                stats.path_abandon_recovery_attempts =
+                    stats.path_abandon_recovery_attempts.saturating_add(1);
+            }
         }
         if stream_frames.is_empty() {
             let stats = self.path_stats.for_path(path_id);
-            stats.pto_recovery_empty_attempts =
-                stats.pto_recovery_empty_attempts.saturating_add(1);
+            match trigger {
+                StreamReinjectionTrigger::Pto => {
+                    stats.pto_recovery_empty_attempts =
+                        stats.pto_recovery_empty_attempts.saturating_add(1);
+                }
+                StreamReinjectionTrigger::PathAbandon => {
+                    stats.path_abandon_recovery_empty_attempts =
+                        stats.path_abandon_recovery_empty_attempts.saturating_add(1);
+                }
+            }
             return false;
         }
 
@@ -3332,15 +3367,38 @@ impl Connection {
         let recovery_probe_start = self.spaces[space].for_path(path_id).next_packet_number;
         self.path_data_mut(path_id).pto_recovery_probe_start = Some(recovery_probe_start);
         let stats = self.path_stats.for_path(path_id);
-        stats.pto_hedges = stats.pto_hedges.saturating_add(1);
-        stats.pto_hedge_bytes = stats.pto_hedge_bytes.saturating_add(newly_queued_bytes);
+        match trigger {
+            StreamReinjectionTrigger::Pto => {
+                stats.pto_hedges = stats.pto_hedges.saturating_add(1);
+                stats.pto_hedge_bytes = stats.pto_hedge_bytes.saturating_add(newly_queued_bytes);
+            }
+            StreamReinjectionTrigger::PathAbandon => {
+                stats.path_abandon_reinjections = stats.path_abandon_reinjections.saturating_add(1);
+                stats.path_abandon_reinjected_bytes = stats
+                    .path_abandon_reinjected_bytes
+                    .saturating_add(newly_queued_bytes);
+            }
+        }
         trace!(
             %path_id,
+            ?trigger,
             newly_queued_bytes,
             recovery_probe_start,
-            "queued cross-path PTO reinjection"
+            "queued cross-path STREAM reinjection"
         );
         true
+    }
+
+    fn maybe_reinject_stream_data_on_pto(&mut self, path_id: PathId, space: SpaceId) -> bool {
+        self.maybe_reinject_stream_data(path_id, space, StreamReinjectionTrigger::Pto)
+    }
+
+    fn maybe_reinject_stream_data_on_path_abandon(&mut self, path_id: PathId) -> bool {
+        self.maybe_reinject_stream_data(
+            path_id,
+            SpaceId::Data,
+            StreamReinjectionTrigger::PathAbandon,
+        )
     }
 
     /// Handle a [`PathTimer::LossDetection`] timeout.

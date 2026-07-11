@@ -292,6 +292,14 @@ pub struct PathStats {
     ///
     /// Bytes already pending for ordinary retransmission and acknowledged bytes are excluded.
     pub pto_hedge_bytes: u64,
+    /// Number of path-abandon recovery attempts made while another validated path was available.
+    pub path_abandon_recovery_attempts: u64,
+    /// Path-abandon recovery attempts that found no STREAM frame left in the path's packet table.
+    pub path_abandon_recovery_empty_attempts: u64,
+    /// Number of path-abandon episodes that queued outstanding STREAM data on another path.
+    pub path_abandon_reinjections: u64,
+    /// STREAM payload bytes newly queued when a path was abandoned.
+    pub path_abandon_reinjected_bytes: u64,
     /// Largest UDP payload size the path currently supports.
     pub current_mtu: u16,
 }
@@ -353,6 +361,10 @@ impl std::ops::Add<PathStats> for ConnectionStats {
             last_pto_recovery_stream_frames: _,
             pto_hedges: _,
             pto_hedge_bytes: _,
+            path_abandon_recovery_attempts: _,
+            path_abandon_recovery_empty_attempts: _,
+            path_abandon_reinjections: _,
+            path_abandon_reinjected_bytes: _,
             current_mtu: _,
         } = rhs;
         Self {
@@ -400,6 +412,10 @@ impl std::ops::AddAssign<PathStats> for ConnectionStats {
             last_pto_recovery_stream_frames: _,
             pto_hedges: _,
             pto_hedge_bytes: _,
+            path_abandon_recovery_attempts: _,
+            path_abandon_recovery_empty_attempts: _,
+            path_abandon_reinjections: _,
+            path_abandon_reinjected_bytes: _,
             current_mtu: _,
         } = rhs;
         let Self {

@@ -47,7 +47,10 @@ fn with_port_offset(mut addr: SocketAddr, offset: u16) -> SocketAddr {
     addr
 }
 
-fn pto_hedge_pair(enabled: bool) -> TestResult<(ConnPair, PathId)> {
+fn recovery_pair(
+    pto_reinjection: bool,
+    abandon_reinjection: bool,
+) -> TestResult<(ConnPair, PathId)> {
     let first_client_addr = Pair::CLIENT_ADDR;
     let first_server_addr = Pair::SERVER_ADDR;
     let second_client_addr = with_port_offset(first_client_addr, 1);
@@ -63,11 +66,13 @@ fn pto_hedge_pair(enabled: bool) -> TestResult<(ConnPair, PathId)> {
         .with_routes(routes.into());
     builder
         .client_transport_cfg
-        .cross_path_pto_reinjection(enabled)
+        .cross_path_pto_reinjection(pto_reinjection)
+        .cross_path_abandon_reinjection(abandon_reinjection)
         .default_path_max_idle_timeout(Some(Duration::from_secs(60)));
     builder
         .server_transport_cfg
-        .cross_path_pto_reinjection(enabled)
+        .cross_path_pto_reinjection(pto_reinjection)
+        .cross_path_abandon_reinjection(abandon_reinjection)
         .default_path_max_idle_timeout(Some(Duration::from_secs(60)));
     let mut pair = builder.connect();
 
@@ -85,6 +90,14 @@ fn pto_hedge_pair(enabled: bool) -> TestResult<(ConnPair, PathId)> {
     while pair.poll(Server).is_some() {}
 
     Ok((pair, backup))
+}
+
+fn pto_hedge_pair(enabled: bool) -> TestResult<(ConnPair, PathId)> {
+    recovery_pair(enabled, false)
+}
+
+fn abandon_recovery_pair(enabled: bool) -> TestResult<(ConnPair, PathId)> {
+    recovery_pair(false, enabled)
 }
 
 fn blackhole_primary_path(pair: &mut ConnPair) -> (SocketAddr, SocketAddr) {
@@ -316,6 +329,78 @@ fn cross_path_pto_reinjection_requires_an_alternative_path() -> TestResult {
     let after = pair.path_stats(Client, PathId::ZERO).unwrap();
     assert_eq!(after.pto_hedges, 0);
     assert_eq!(after.pto_hedge_bytes, 0);
+    Ok(())
+}
+
+#[test]
+fn path_abandon_reinjection_is_disabled_by_default() -> TestResult {
+    let _guard = subscribe();
+    let (mut pair, backup) = abandon_recovery_pair(false)?;
+    let backup_before = pair.path_stats(Client, backup).unwrap();
+
+    let stream = pair.streams(Client).open(Dir::Uni).unwrap();
+    write_stream_data(&mut pair, stream, b"abandon default off");
+    pair.send_stream(Client, stream).finish()?;
+    blackhole_primary_path(&mut pair);
+    pair.drive_client();
+    pair.close_path(Client, PathId::ZERO, 0u8.into())?;
+    pair.drive_client();
+
+    let primary_after = pair.path_stats(Client, PathId::ZERO).unwrap();
+    let backup_after = pair.path_stats(Client, backup).unwrap();
+    assert_eq!(primary_after.path_abandon_recovery_attempts, 0);
+    assert_eq!(primary_after.path_abandon_reinjections, 0);
+    assert_eq!(primary_after.path_abandon_reinjected_bytes, 0);
+    assert_eq!(
+        backup_after.frame_tx.stream_retransmit_bytes,
+        backup_before.frame_tx.stream_retransmit_bytes
+    );
+    Ok(())
+}
+
+#[test]
+fn path_abandon_reinjects_stream_before_path_state_is_drained() -> TestResult {
+    let _guard = subscribe();
+    let (mut pair, backup) = abandon_recovery_pair(true)?;
+    let backup_before = pair.path_stats(Client, backup).unwrap();
+    const MESSAGE: &[u8] = b"recover before three PTO drain";
+
+    let stream = pair.streams(Client).open(Dir::Uni).unwrap();
+    write_stream_data(&mut pair, stream, MESSAGE);
+    pair.send_stream(Client, stream).finish()?;
+    blackhole_primary_path(&mut pair);
+    pair.drive_client();
+    let tracked_before_abandon = pair
+        .path_stats(Client, PathId::ZERO)
+        .unwrap()
+        .tracked_ack_eliciting_packets;
+    assert!(tracked_before_abandon > 0);
+
+    pair.close_path(Client, PathId::ZERO, 0u8.into())?;
+    pair.drive_client();
+
+    let primary_after = pair.path_stats(Client, PathId::ZERO).unwrap();
+    let backup_after = pair.path_stats(Client, backup).unwrap();
+    assert_eq!(primary_after.pto_timeouts, 0);
+    assert_eq!(primary_after.pto_hedges, 0);
+    assert_eq!(primary_after.path_abandon_recovery_attempts, 1);
+    assert_eq!(primary_after.path_abandon_recovery_empty_attempts, 0);
+    assert_eq!(primary_after.path_abandon_reinjections, 1);
+    assert_eq!(
+        primary_after.path_abandon_reinjected_bytes,
+        MESSAGE.len() as u64
+    );
+    assert_eq!(
+        primary_after.tracked_ack_eliciting_packets, tracked_before_abandon,
+        "the original packet-number state must remain available during the drain period"
+    );
+    assert!(
+        backup_after.frame_tx.stream_retransmit_bytes
+            > backup_before.frame_tx.stream_retransmit_bytes
+    );
+
+    pair.drive_server();
+    assert_eq!(read_all_stream_data(&mut pair, stream), MESSAGE);
     Ok(())
 }
 

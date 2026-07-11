@@ -64,6 +64,7 @@ pub struct TransportConfig {
     pub(crate) max_concurrent_multipath_paths: Option<NonZeroU32>,
 
     pub(crate) cross_path_pto_reinjection: bool,
+    pub(crate) cross_path_abandon_reinjection: bool,
 
     pub(crate) default_path_max_idle_timeout: Option<Duration>,
     pub(crate) default_path_keep_alive_interval: Option<Duration>,
@@ -413,6 +414,19 @@ impl TransportConfig {
         self
     }
 
+    /// Whether abandoning a multipath path may immediately queue its outstanding STREAM data for
+    /// retransmission over another validated path.
+    ///
+    /// Packet-number state for the abandoned path is still retained for the normal Multipath QUIC
+    /// drain period. This only separates application-data recovery from final path-state removal;
+    /// retransmitted data remains subject to the destination path's congestion window and pacing.
+    ///
+    /// Disabled by default.
+    pub fn cross_path_abandon_reinjection(&mut self, enabled: bool) -> &mut Self {
+        self.cross_path_abandon_reinjection = enabled;
+        self
+    }
+
     /// Sets a default per-path maximum idle timeout
     ///
     /// If the path is idle for this long the path will be abandoned. Bear in mind this will
@@ -602,6 +616,7 @@ impl Default for TransportConfig {
             // disabled multipath by default
             max_concurrent_multipath_paths: None,
             cross_path_pto_reinjection: false,
+            cross_path_abandon_reinjection: false,
             default_path_max_idle_timeout: None,
             default_path_keep_alive_interval: None,
 
@@ -647,6 +662,7 @@ impl fmt::Debug for TransportConfig {
             address_discovery_role,
             max_concurrent_multipath_paths,
             cross_path_pto_reinjection,
+            cross_path_abandon_reinjection,
             default_path_max_idle_timeout,
             default_path_keep_alive_interval,
             max_remote_nat_traversal_addresses,
@@ -692,6 +708,10 @@ impl fmt::Debug for TransportConfig {
                 max_concurrent_multipath_paths,
             )
             .field("cross_path_pto_reinjection", cross_path_pto_reinjection)
+            .field(
+                "cross_path_abandon_reinjection",
+                cross_path_abandon_reinjection,
+            )
             .field(
                 "default_path_max_idle_timeout",
                 default_path_max_idle_timeout,
