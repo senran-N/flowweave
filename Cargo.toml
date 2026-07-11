@@ -1,0 +1,11 @@
+[package]
+name = "flowweave-lab"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+publish = false
+
+[dependencies]
+noq = { version = "=1.0.1", default-features = false, features = ["runtime-tokio", "rustls", "ring"] }
+rcgen = { version = "=0.14.5", default-features = false, features = ["crypto", "ring"] }
+tokio = { version = "=1.47.1", features = ["macros", "rt-multi-thread", "sync", "time"] }
