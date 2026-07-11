@@ -66,6 +66,8 @@ pub use datagrams::{Datagrams, SendDatagramError};
 mod mtud;
 mod pacing;
 
+mod scheduler;
+
 mod packet_builder;
 use packet_builder::{PacketBuilder, PadDatagram};
 
