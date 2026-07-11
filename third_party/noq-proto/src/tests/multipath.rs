@@ -337,6 +337,11 @@ fn first_data_pto_reinjects_stream_on_backup_path() -> TestResult {
     let backup_after = pair.path_stats(Client, backup).unwrap();
     assert_eq!(primary_after.pto_hedges, 1);
     assert_eq!(primary_after.pto_hedge_bytes, MESSAGE.len() as u64);
+    assert!(primary_after.pto_timeouts > 0);
+    assert_eq!(primary_after.pto_recovery_attempts, 1);
+    assert_eq!(primary_after.pto_recovery_empty_attempts, 0);
+    assert!(primary_after.last_pto_recovery_unacked_bytes >= MESSAGE.len() as u64);
+    assert!(primary_after.last_pto_recovery_stream_frames > 0);
     assert!(
         backup_after.frame_tx.stream_retransmit_bytes
             > backup_before.frame_tx.stream_retransmit_bytes
@@ -644,6 +649,43 @@ fn path_acks() {
     let stats = pair.stats(Client);
     assert!(stats.frame_rx.path_acks > 0);
     assert!(stats.frame_tx.path_acks > 0);
+}
+
+#[test]
+fn path_ack_stats_reveal_cross_path_feedback() -> TestResult {
+    let _guard = subscribe();
+    let (mut pair, backup) = pto_hedge_pair(false)?;
+    let primary_before = pair.path_stats(Client, PathId::ZERO).unwrap().frame_tx;
+    let backup_before = pair.path_stats(Client, backup).unwrap().frame_tx;
+
+    pair.ping_path(Server, backup)?;
+    pair.drive();
+
+    let primary_after = pair.path_stats(Client, PathId::ZERO).unwrap().frame_tx;
+    let backup_after = pair.path_stats(Client, backup).unwrap().frame_tx;
+    let same_path = primary_after
+        .path_acks_same_path
+        .saturating_sub(primary_before.path_acks_same_path)
+        .saturating_add(
+            backup_after
+                .path_acks_same_path
+                .saturating_sub(backup_before.path_acks_same_path),
+        );
+    let cross_path = primary_after
+        .path_acks_cross_path
+        .saturating_sub(primary_before.path_acks_cross_path)
+        .saturating_add(
+            backup_after
+                .path_acks_cross_path
+                .saturating_sub(backup_before.path_acks_cross_path),
+        );
+
+    assert!(same_path + cross_path > 0, "the backup PING must be acknowledged");
+    assert!(
+        cross_path > 0,
+        "the current scheduler should expose that backup-path feedback rides the primary path"
+    );
+    Ok(())
 }
 
 #[test]

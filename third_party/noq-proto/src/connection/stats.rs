@@ -39,6 +39,10 @@ impl UdpStats {
 pub struct FrameStats {
     pub acks: u64,
     pub path_acks: u64,
+    /// PATH_ACK frames sent on the same path they acknowledge.
+    pub path_acks_same_path: u64,
+    /// PATH_ACK frames sent on a different path from the one they acknowledge.
+    pub path_acks_cross_path: u64,
     pub ack_frequency: u64,
     pub crypto: u64,
     pub connection_close: u64,
@@ -133,6 +137,8 @@ impl std::fmt::Debug for FrameStats {
         let Self {
             acks,
             path_acks,
+            path_acks_same_path,
+            path_acks_cross_path,
             ack_frequency,
             crypto,
             connection_close,
@@ -190,6 +196,8 @@ impl std::fmt::Debug for FrameStats {
             .field("PATHS_BLOCKED", paths_blocked)
             .field("PATH_ABANDON", path_abandon)
             .field("PATH_ACK", path_acks)
+            .field("PATH_ACK_SAME_PATH", path_acks_same_path)
+            .field("PATH_ACK_CROSS_PATH", path_acks_cross_path)
             .field("PATH_STATUS_AVAILABLE", path_status_available)
             .field("PATH_STATUS_BACKUP", path_status_backup)
             .field("PATH_CHALLENGE", path_challenge)
@@ -249,6 +257,18 @@ pub struct PathStats {
     pub lost_plpmtud_probes: u64,
     /// The number of times a black hole was detected in the path.
     pub black_holes_detected: u64,
+    /// Number of loss-detection timer expirations that ran time-threshold loss detection.
+    pub loss_detection_timeouts: u64,
+    /// Number of loss-detection timer expirations that ran PTO processing.
+    pub pto_timeouts: u64,
+    /// Number of PTO recovery attempts made while another validated path was available.
+    pub pto_recovery_attempts: u64,
+    /// PTO recovery attempts that found no STREAM frame left in the path's sent-packet table.
+    pub pto_recovery_empty_attempts: u64,
+    /// Connection-wide unacknowledged STREAM bytes observed at the latest PTO recovery attempt.
+    pub last_pto_recovery_unacked_bytes: u64,
+    /// STREAM frame entries found in the path's sent-packet table at the latest recovery attempt.
+    pub last_pto_recovery_stream_frames: u64,
     /// Number of first-PTO episodes that queued this path's STREAM data for cross-path
     /// retransmission.
     pub pto_hedges: u64,
@@ -301,6 +321,12 @@ impl std::ops::Add<PathStats> for ConnectionStats {
             sent_plpmtud_probes: _,
             lost_plpmtud_probes: _,
             black_holes_detected: _,
+            loss_detection_timeouts: _,
+            pto_timeouts: _,
+            pto_recovery_attempts: _,
+            pto_recovery_empty_attempts: _,
+            last_pto_recovery_unacked_bytes: _,
+            last_pto_recovery_stream_frames: _,
             pto_hedges: _,
             pto_hedge_bytes: _,
             current_mtu: _,
@@ -334,6 +360,12 @@ impl std::ops::AddAssign<PathStats> for ConnectionStats {
             sent_plpmtud_probes: _,
             lost_plpmtud_probes: _,
             black_holes_detected: _,
+            loss_detection_timeouts: _,
+            pto_timeouts: _,
+            pto_recovery_attempts: _,
+            pto_recovery_empty_attempts: _,
+            last_pto_recovery_unacked_bytes: _,
+            last_pto_recovery_stream_frames: _,
             pto_hedges: _,
             pto_hedge_bytes: _,
             current_mtu: _,

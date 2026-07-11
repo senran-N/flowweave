@@ -15,6 +15,9 @@ case "$mode" in
     formal-a)
         test_name="failover_formal_bidirectional_lab"
         ;;
+    diagnose-a)
+        test_name="failover_timeline_diagnostic_lab"
+        ;;
     screen)
         test_name="scheduler_five_seed_screening_lab"
         ;;
@@ -22,7 +25,7 @@ case "$mode" in
         test_name="scheduler_long_duration_benchmark_lab"
         ;;
     *)
-        echo "用法：$0 [smoke|failover|formal-a|screen|long]" >&2
+        echo "用法：$0 [smoke|failover|formal-a|diagnose-a|screen|long]" >&2
         exit 2
         ;;
 esac
@@ -52,7 +55,7 @@ tc filter add dev lo protocol ip parent 1: prio 2 u32 match ip dst 127.0.0.2/32 
 tc filter add dev lo protocol ip parent 1: prio 3 u32 match u32 0 0 flowid 1:1
 
 export FLOWWEAVE_NETEM_LAB=1
-if [[ "$FLOWWEAVE_LAB_MODE" == "long" || "$FLOWWEAVE_LAB_MODE" == "formal-a" ]]; then
+if [[ "$FLOWWEAVE_LAB_MODE" == "long" || "$FLOWWEAVE_LAB_MODE" == "formal-a" || "$FLOWWEAVE_LAB_MODE" == "diagnose-a" ]]; then
     cargo test --release --test network_lab "$FLOWWEAVE_LAB_TEST" -- --ignored --nocapture --test-threads=1
 else
     cargo test --test network_lab "$FLOWWEAVE_LAB_TEST" -- --ignored --nocapture --test-threads=1

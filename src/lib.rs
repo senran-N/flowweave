@@ -312,11 +312,20 @@ pub struct PathMeasurement {
     pub udp_datagrams_sent: u64,
     pub fresh_stream_bytes_sent: u64,
     pub retransmitted_stream_bytes_sent: u64,
+    pub path_acks_same_path: u64,
+    pub path_acks_cross_path: u64,
     pub lost_packets: u64,
     pub lost_bytes: u64,
+    pub loss_detection_timeouts: u64,
+    pub pto_timeouts: u64,
+    pub pto_recovery_attempts: u64,
+    pub pto_recovery_empty_attempts: u64,
+    pub last_pto_recovery_unacked_bytes: u64,
+    pub last_pto_recovery_stream_frames: u64,
     pub pto_hedges: u64,
     pub pto_hedge_bytes: u64,
     pub final_rtt: Duration,
+    pub final_cwnd: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -395,6 +404,39 @@ pub struct FailoverReport {
 }
 
 #[derive(Debug, Clone)]
+pub struct SustainedFailoverTimeline {
+    pub primary_open_at_fault: bool,
+    pub secondary_open_at_fault: bool,
+    pub first_primary_loss_timeout: Option<Duration>,
+    pub first_primary_pto: Option<Duration>,
+    pub first_primary_recovery_attempt: Option<Duration>,
+    pub first_primary_hedge: Option<Duration>,
+    pub first_secondary_udp_send: Option<Duration>,
+    pub first_receiver_primary_cross_path_ack: Option<Duration>,
+    pub first_receiver_secondary_same_path_ack: Option<Duration>,
+    pub primary_closed: Option<Duration>,
+    pub secondary_closed: Option<Duration>,
+}
+
+impl SustainedFailoverTimeline {
+    fn new(primary_open_at_fault: bool, secondary_open_at_fault: bool) -> Self {
+        Self {
+            primary_open_at_fault,
+            secondary_open_at_fault,
+            first_primary_loss_timeout: None,
+            first_primary_pto: None,
+            first_primary_recovery_attempt: None,
+            first_primary_hedge: None,
+            first_secondary_udp_send: None,
+            first_receiver_primary_cross_path_ack: None,
+            first_receiver_secondary_same_path_ack: None,
+            primary_closed: (!primary_open_at_fault).then_some(Duration::ZERO),
+            secondary_closed: (!secondary_open_at_fault).then_some(Duration::ZERO),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct SustainedFailoverReport {
     pub scheduler: MultipathScheduler,
     pub pto_recovery: PtoRecovery,
@@ -406,20 +448,16 @@ pub struct SustainedFailoverReport {
     pub records_received: u64,
     pub application_bytes_received: u64,
     pub failure_reason: Option<String>,
-    pub primary_fresh_bytes_before_blackhole: u64,
-    pub secondary_fresh_bytes_before_blackhole: u64,
-    pub primary_pto_hedges_before_blackhole: u64,
-    pub secondary_pto_hedges_before_blackhole: u64,
-    pub primary_pto_hedge_bytes_before_blackhole: u64,
-    pub secondary_pto_hedge_bytes_before_blackhole: u64,
-    pub primary_bytes_after_blackhole: u64,
-    pub secondary_bytes_after_blackhole: u64,
-    pub primary_lost_packets: u64,
-    pub secondary_lost_packets: u64,
-    pub primary_pto_hedges: u64,
-    pub secondary_pto_hedges: u64,
-    pub primary_pto_hedge_bytes: u64,
-    pub secondary_pto_hedge_bytes: u64,
+    pub sender_primary_before_blackhole: PathMeasurement,
+    pub sender_secondary_before_blackhole: PathMeasurement,
+    pub sender_primary_after_blackhole: PathMeasurement,
+    pub sender_secondary_after_blackhole: PathMeasurement,
+    pub receiver_primary_after_blackhole: PathMeasurement,
+    pub receiver_secondary_after_blackhole: PathMeasurement,
+    pub timeline: SustainedFailoverTimeline,
+    pub recovery_gap_started_after_fault: Option<Duration>,
+    pub recovery_gap_ended_after_fault: Option<Duration>,
+    pub recovery_gap_next_sequence: Option<u64>,
     pub primary_path_open: bool,
     pub secondary_path_open: bool,
 }
@@ -889,17 +927,29 @@ where
     .await?;
     let secondary = lab.open_second_path(PathStatus::Backup).await?;
     sleep(Duration::from_millis(250)).await;
-    let (sender_primary, sender_secondary) = match config.direction {
-        FailoverDirection::ClientToServer => (lab.primary.clone(), secondary.clone()),
-        FailoverDirection::ServerToClient => (
-            lab.server_connection
-                .path(PathId::ZERO)
-                .ok_or_else(|| other_error("服务端找不到正式反向实验的主路径"))?,
-            lab.server_connection
-                .path(secondary.id())
-                .ok_or_else(|| other_error("服务端找不到正式反向实验的备用路径"))?,
-        ),
-    };
+    let server_primary = lab
+        .server_connection
+        .path(PathId::ZERO)
+        .ok_or_else(|| other_error("服务端找不到正式实验的主路径"))?;
+    let server_secondary = lab
+        .server_connection
+        .path(secondary.id())
+        .ok_or_else(|| other_error("服务端找不到正式实验的备用路径"))?;
+    let (sender_primary, sender_secondary, receiver_primary, receiver_secondary) =
+        match config.direction {
+            FailoverDirection::ClientToServer => (
+                lab.primary.clone(),
+                secondary.clone(),
+                server_primary,
+                server_secondary,
+            ),
+            FailoverDirection::ServerToClient => (
+                server_primary,
+                server_secondary,
+                lab.primary.clone(),
+                secondary.clone(),
+            ),
+        };
 
     let operation_result: LabResult<SustainedFailoverReport> = async {
         let primary_before = sender_primary.stats();
@@ -943,18 +993,57 @@ where
 
         let primary_at_blackhole = sender_primary.stats();
         let secondary_at_blackhole = sender_secondary.stats();
+        let receiver_primary_at_blackhole = receiver_primary.stats();
+        let receiver_secondary_at_blackhole = receiver_secondary.stats();
         if let Err(error) = activate_blackhole() {
             flow_task.abort();
             let _ = flow_task.await;
             return Err(error);
         }
         let failure_started = Instant::now();
+        let mut timeline = SustainedFailoverTimeline::new(
+            sender_primary.status().is_ok(),
+            sender_secondary.status().is_ok(),
+        );
+        observe_sustained_failover_timeline(
+            &mut timeline,
+            failure_started,
+            &sender_primary,
+            &sender_secondary,
+            &receiver_primary,
+            &receiver_secondary,
+            primary_at_blackhole,
+            secondary_at_blackhole,
+            receiver_primary_at_blackhole,
+            receiver_secondary_at_blackhole,
+        );
 
         let remaining = config
             .total_duration
             .saturating_add(SUSTAINED_FAILOVER_GRACE)
             .saturating_sub(started_at.elapsed());
-        let flow_result = match timeout(remaining, &mut flow_task).await {
+        let monitored_flow = async {
+            loop {
+                tokio::select! {
+                    result = &mut flow_task => break result,
+                    () = sleep(Duration::from_millis(5)) => {
+                        observe_sustained_failover_timeline(
+                            &mut timeline,
+                            failure_started,
+                            &sender_primary,
+                            &sender_secondary,
+                            &receiver_primary,
+                            &receiver_secondary,
+                            primary_at_blackhole,
+                            secondary_at_blackhole,
+                            receiver_primary_at_blackhole,
+                            receiver_secondary_at_blackhole,
+                        );
+                    }
+                }
+            }
+        };
+        let flow_result = match timeout(remaining, monitored_flow).await {
             Ok(result) => Some(
                 result.map_err(|error| other_error(format!("持续换网任务异常退出：{error}")))?,
             ),
@@ -967,10 +1056,28 @@ where
 
         let primary_after = sender_primary.stats();
         let secondary_after = sender_secondary.stats();
+        let receiver_primary_after = receiver_primary.stats();
+        let receiver_secondary_after = receiver_secondary.stats();
+        observe_sustained_failover_timeline(
+            &mut timeline,
+            failure_started,
+            &sender_primary,
+            &sender_secondary,
+            &receiver_primary,
+            &receiver_secondary,
+            primary_at_blackhole,
+            secondary_at_blackhole,
+            receiver_primary_at_blackhole,
+            receiver_secondary_at_blackhole,
+        );
         let primary_before_delta = path_delta(primary_before, primary_at_blackhole);
         let secondary_before_delta = path_delta(secondary_before, secondary_at_blackhole);
         let primary_after_delta = path_delta(primary_at_blackhole, primary_after);
         let secondary_after_delta = path_delta(secondary_at_blackhole, secondary_after);
+        let receiver_primary_after_delta =
+            path_delta(receiver_primary_at_blackhole, receiver_primary_after);
+        let receiver_secondary_after_delta =
+            path_delta(receiver_secondary_at_blackhole, receiver_secondary_after);
 
         let (trace, flow_failure) = match flow_result {
             Some(Ok(trace)) => (Some(trace), None),
@@ -983,9 +1090,10 @@ where
                 )),
             ),
         };
-        let recovery_gap = trace
+        let recovery_gap_trace = trace
             .as_ref()
-            .and_then(|trace| recovery_gap_after_fault(&trace.received_at, failure_started));
+            .and_then(|trace| recovery_gap_trace_after_fault(&trace.received_at, failure_started));
+        let recovery_gap = recovery_gap_trace.map(|gap| gap.duration);
         let data_intact = trace.is_some();
         let recovered = data_intact && recovery_gap.is_some();
         let failure_reason = flow_failure
@@ -1002,20 +1110,16 @@ where
             records_received: trace.as_ref().map_or(0, |trace| trace.records),
             application_bytes_received: trace.as_ref().map_or(0, |trace| trace.bytes),
             failure_reason,
-            primary_fresh_bytes_before_blackhole: primary_before_delta.fresh_stream_bytes_sent,
-            secondary_fresh_bytes_before_blackhole: secondary_before_delta.fresh_stream_bytes_sent,
-            primary_pto_hedges_before_blackhole: primary_before_delta.pto_hedges,
-            secondary_pto_hedges_before_blackhole: secondary_before_delta.pto_hedges,
-            primary_pto_hedge_bytes_before_blackhole: primary_before_delta.pto_hedge_bytes,
-            secondary_pto_hedge_bytes_before_blackhole: secondary_before_delta.pto_hedge_bytes,
-            primary_bytes_after_blackhole: primary_after_delta.udp_bytes_sent,
-            secondary_bytes_after_blackhole: secondary_after_delta.udp_bytes_sent,
-            primary_lost_packets: primary_after_delta.lost_packets,
-            secondary_lost_packets: secondary_after_delta.lost_packets,
-            primary_pto_hedges: primary_after_delta.pto_hedges,
-            secondary_pto_hedges: secondary_after_delta.pto_hedges,
-            primary_pto_hedge_bytes: primary_after_delta.pto_hedge_bytes,
-            secondary_pto_hedge_bytes: secondary_after_delta.pto_hedge_bytes,
+            sender_primary_before_blackhole: primary_before_delta,
+            sender_secondary_before_blackhole: secondary_before_delta,
+            sender_primary_after_blackhole: primary_after_delta,
+            sender_secondary_after_blackhole: secondary_after_delta,
+            receiver_primary_after_blackhole: receiver_primary_after_delta,
+            receiver_secondary_after_blackhole: receiver_secondary_after_delta,
+            timeline,
+            recovery_gap_started_after_fault: recovery_gap_trace.map(|gap| gap.started_after_fault),
+            recovery_gap_ended_after_fault: recovery_gap_trace.map(|gap| gap.ended_after_fault),
+            recovery_gap_next_sequence: recovery_gap_trace.map(|gap| gap.next_sequence),
             primary_path_open: sender_primary.status().is_ok(),
             secondary_path_open: sender_secondary.status().is_ok(),
         })
@@ -1137,7 +1241,23 @@ async fn collect_sustained_server_trace(
     }
 }
 
+#[cfg(test)]
 fn recovery_gap_after_fault(received_at: &[Instant], failure_started: Instant) -> Option<Duration> {
+    recovery_gap_trace_after_fault(received_at, failure_started).map(|gap| gap.duration)
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RecoveryGapTrace {
+    duration: Duration,
+    started_after_fault: Duration,
+    ended_after_fault: Duration,
+    next_sequence: u64,
+}
+
+fn recovery_gap_trace_after_fault(
+    received_at: &[Instant],
+    failure_started: Instant,
+) -> Option<RecoveryGapTrace> {
     let has_before = received_at
         .iter()
         .any(|timestamp| *timestamp < failure_started);
@@ -1150,9 +1270,89 @@ fn recovery_gap_after_fault(received_at: &[Instant], failure_started: Instant) -
 
     received_at
         .windows(2)
-        .filter(|pair| pair[1] >= failure_started)
-        .map(|pair| pair[1].saturating_duration_since(pair[0]))
-        .max()
+        .enumerate()
+        .filter(|(_, pair)| pair[1] >= failure_started)
+        .map(|(index, pair)| RecoveryGapTrace {
+            duration: pair[1].saturating_duration_since(pair[0]),
+            started_after_fault: pair[0].saturating_duration_since(failure_started),
+            ended_after_fault: pair[1].saturating_duration_since(failure_started),
+            next_sequence: (index + 1) as u64,
+        })
+        .max_by_key(|gap| gap.duration)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn observe_sustained_failover_timeline(
+    timeline: &mut SustainedFailoverTimeline,
+    failure_started: Instant,
+    sender_primary: &Path,
+    sender_secondary: &Path,
+    receiver_primary: &Path,
+    receiver_secondary: &Path,
+    primary_at_blackhole: PathStats,
+    secondary_at_blackhole: PathStats,
+    receiver_primary_at_blackhole: PathStats,
+    receiver_secondary_at_blackhole: PathStats,
+) {
+    let elapsed = failure_started.elapsed();
+    let primary = sender_primary.stats();
+    let secondary = sender_secondary.stats();
+    let receiver_primary = receiver_primary.stats();
+    let receiver_secondary = receiver_secondary.stats();
+
+    record_first_timeline_event(
+        &mut timeline.first_primary_loss_timeout,
+        primary.loss_detection_timeouts > primary_at_blackhole.loss_detection_timeouts,
+        elapsed,
+    );
+    record_first_timeline_event(
+        &mut timeline.first_primary_pto,
+        primary.pto_timeouts > primary_at_blackhole.pto_timeouts,
+        elapsed,
+    );
+    record_first_timeline_event(
+        &mut timeline.first_primary_recovery_attempt,
+        primary.pto_recovery_attempts > primary_at_blackhole.pto_recovery_attempts,
+        elapsed,
+    );
+    record_first_timeline_event(
+        &mut timeline.first_primary_hedge,
+        primary.pto_hedges > primary_at_blackhole.pto_hedges,
+        elapsed,
+    );
+    record_first_timeline_event(
+        &mut timeline.first_secondary_udp_send,
+        secondary.udp_tx.bytes > secondary_at_blackhole.udp_tx.bytes,
+        elapsed,
+    );
+    record_first_timeline_event(
+        &mut timeline.first_receiver_primary_cross_path_ack,
+        receiver_primary.frame_tx.path_acks_cross_path
+            > receiver_primary_at_blackhole.frame_tx.path_acks_cross_path,
+        elapsed,
+    );
+    record_first_timeline_event(
+        &mut timeline.first_receiver_secondary_same_path_ack,
+        receiver_secondary.frame_tx.path_acks_same_path
+            > receiver_secondary_at_blackhole.frame_tx.path_acks_same_path,
+        elapsed,
+    );
+    record_first_timeline_event(
+        &mut timeline.primary_closed,
+        sender_primary.status().is_err(),
+        elapsed,
+    );
+    record_first_timeline_event(
+        &mut timeline.secondary_closed,
+        sender_secondary.status().is_err(),
+        elapsed,
+    );
+}
+
+fn record_first_timeline_event(slot: &mut Option<Duration>, happened: bool, elapsed: Duration) {
+    if slot.is_none() && happened {
+        *slot = Some(elapsed);
+    }
 }
 
 async fn start_connection(
@@ -2016,11 +2216,44 @@ fn path_delta(before: PathStats, after: PathStats) -> PathMeasurement {
             .frame_tx
             .stream_retransmit_bytes
             .saturating_sub(before.frame_tx.stream_retransmit_bytes),
+        path_acks_same_path: after
+            .frame_tx
+            .path_acks_same_path
+            .saturating_sub(before.frame_tx.path_acks_same_path),
+        path_acks_cross_path: after
+            .frame_tx
+            .path_acks_cross_path
+            .saturating_sub(before.frame_tx.path_acks_cross_path),
         lost_packets: after.lost_packets.saturating_sub(before.lost_packets),
         lost_bytes: after.lost_bytes.saturating_sub(before.lost_bytes),
+        loss_detection_timeouts: after
+            .loss_detection_timeouts
+            .saturating_sub(before.loss_detection_timeouts),
+        pto_timeouts: after.pto_timeouts.saturating_sub(before.pto_timeouts),
+        pto_recovery_attempts: after
+            .pto_recovery_attempts
+            .saturating_sub(before.pto_recovery_attempts),
+        pto_recovery_empty_attempts: after
+            .pto_recovery_empty_attempts
+            .saturating_sub(before.pto_recovery_empty_attempts),
+        last_pto_recovery_unacked_bytes: if after.pto_recovery_attempts
+            > before.pto_recovery_attempts
+        {
+            after.last_pto_recovery_unacked_bytes
+        } else {
+            0
+        },
+        last_pto_recovery_stream_frames: if after.pto_recovery_attempts
+            > before.pto_recovery_attempts
+        {
+            after.last_pto_recovery_stream_frames
+        } else {
+            0
+        },
         pto_hedges: after.pto_hedges.saturating_sub(before.pto_hedges),
         pto_hedge_bytes: after.pto_hedge_bytes.saturating_sub(before.pto_hedge_bytes),
         final_rtt: after.rtt,
+        final_cwnd: after.cwnd,
     }
 }
 

@@ -185,6 +185,10 @@ impl StreamsState {
         }
     }
 
+    pub(crate) fn unacked_data(&self) -> u64 {
+        self.unacked_data
+    }
+
     pub(crate) fn set_params(&mut self, params: &TransportParameters) {
         self.initial_max_stream_data_uni = params.initial_max_stream_data_uni;
         self.initial_max_stream_data_bidi_local = params.initial_max_stream_data_bidi_local;

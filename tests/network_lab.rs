@@ -491,6 +491,78 @@ async fn failover_formal_bidirectional_lab() -> LabResult<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "必须通过 scripts/run_netem_lab.sh diagnose-a 在隔离网络命名空间中运行"]
+async fn failover_timeline_diagnostic_lab() -> LabResult<()> {
+    ensure_isolated_network_namespace()?;
+
+    const RESULT_PATH: &str = "benchmark-results/2026-07-12-pto-hedge-diagnostic.csv";
+    let normal_line_one = LinkProfile::new("20ms", "0.1%", "20mbit");
+    let normal_line_two = LinkProfile::new("80ms", "1%", "20mbit");
+    let cases = [
+        (FailoverDirection::ClientToServer, 0_usize),
+        (FailoverDirection::ClientToServer, 2_usize),
+        (FailoverDirection::ServerToClient, 0_usize),
+    ];
+
+    println!();
+    println!("FlowWeave / 织流：A 组失败时间线诊断");
+    println!("只复跑两个正向代表种子和一个反向种子；不改变 PTO 恢复算法。");
+
+    let mut observations = Vec::with_capacity(cases.len());
+    write_formal_failover_csv(RESULT_PATH, &observations)?;
+    for (direction, seed_index) in cases {
+        let seeds = SEED_PAIRS[seed_index];
+        let round = seed_index + 1;
+        println!();
+        println!(
+            "诊断 {} 第 {round} 轮：线路一种子 {}，线路二种子 {}",
+            direction.description(),
+            seeds.line_one,
+            seeds.line_two,
+        );
+        apply_profiles(normal_line_one, normal_line_two, seeds)?;
+        let report = run_sustained_blackhole_failover(
+            SustainedFailoverConfig::new(
+                MultipathScheduler::NoqDefault,
+                PtoRecovery::CrossPathHedge,
+                direction,
+                FORMAL_FAILOVER_DURATION,
+                FORMAL_FAILOVER_AT,
+                FORMAL_FAILOVER_CHUNK_SIZE,
+                151_u8
+                    .wrapping_add(round as u8)
+                    .wrapping_add((direction as u8).wrapping_mul(17)),
+            ),
+            || {
+                replace_line_profile(
+                    "1:1",
+                    "10:",
+                    LinkProfile::new("20ms", "100%", "20mbit"),
+                    seeds.line_one,
+                )
+            },
+            || replace_line_profile("1:1", "10:", normal_line_one, seeds.line_one),
+        )
+        .await?;
+
+        let observation = FormalFailoverObservation {
+            direction,
+            round,
+            seeds,
+            pto_recovery: PtoRecovery::CrossPathHedge,
+            report,
+        };
+        print_formal_failover_observation(&observation);
+        observations.push(observation);
+        write_formal_failover_csv(RESULT_PATH, &observations)?;
+    }
+
+    println!();
+    println!("A 组诊断原始数据已写入 {RESULT_PATH}");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "必须通过 scripts/run_netem_lab.sh screen 在隔离网络命名空间中运行"]
 async fn scheduler_five_seed_screening_lab() -> LabResult<()> {
     ensure_isolated_network_namespace()?;
@@ -785,30 +857,27 @@ fn print_recovery_screening_summary(observations: &[RecoveryScreeningObservation
 }
 
 fn print_formal_failover_observation(observation: &FormalFailoverObservation) {
-    let total_udp = observation
-        .report
-        .primary_bytes_after_blackhole
-        .saturating_add(observation.report.secondary_bytes_after_blackhole);
-    let total_hedges = observation
-        .report
-        .primary_pto_hedges
-        .saturating_add(observation.report.secondary_pto_hedges);
-    let total_hedge_bytes = observation
-        .report
-        .primary_pto_hedge_bytes
-        .saturating_add(observation.report.secondary_pto_hedge_bytes);
-    let pre_blackhole_hedges = observation
-        .report
-        .primary_pto_hedges_before_blackhole
-        .saturating_add(observation.report.secondary_pto_hedges_before_blackhole);
-    let pre_blackhole_hedge_bytes = observation
-        .report
-        .primary_pto_hedge_bytes_before_blackhole
-        .saturating_add(
-            observation
-                .report
-                .secondary_pto_hedge_bytes_before_blackhole,
-        );
+    let before_primary = &observation.report.sender_primary_before_blackhole;
+    let before_secondary = &observation.report.sender_secondary_before_blackhole;
+    let after_primary = &observation.report.sender_primary_after_blackhole;
+    let after_secondary = &observation.report.sender_secondary_after_blackhole;
+    let receiver_primary = &observation.report.receiver_primary_after_blackhole;
+    let receiver_secondary = &observation.report.receiver_secondary_after_blackhole;
+    let total_udp = after_primary
+        .udp_bytes_sent
+        .saturating_add(after_secondary.udp_bytes_sent);
+    let total_hedges = after_primary
+        .pto_hedges
+        .saturating_add(after_secondary.pto_hedges);
+    let total_hedge_bytes = after_primary
+        .pto_hedge_bytes
+        .saturating_add(after_secondary.pto_hedge_bytes);
+    let pre_blackhole_hedges = before_primary
+        .pto_hedges
+        .saturating_add(before_secondary.pto_hedges);
+    let pre_blackhole_hedge_bytes = before_primary
+        .pto_hedge_bytes
+        .saturating_add(before_secondary.pto_hedge_bytes);
 
     println!("- {}", observation.pto_recovery.description());
     println!(
@@ -822,13 +891,54 @@ fn print_formal_failover_observation(observation: &FormalFailoverObservation) {
     );
     println!(
         "  黑洞前主路/备用路首次数据 {} / {} 字节，对冲 {} 次 / {} 字节；黑洞后 UDP {} 字节，对冲 {} 次 / {} 字节",
-        observation.report.primary_fresh_bytes_before_blackhole,
-        observation.report.secondary_fresh_bytes_before_blackhole,
+        before_primary.fresh_stream_bytes_sent,
+        before_secondary.fresh_stream_bytes_sent,
         pre_blackhole_hedges,
         pre_blackhole_hedge_bytes,
         total_udp,
         total_hedges,
         total_hedge_bytes,
+    );
+    println!(
+        "  发送端主路 loss/PTO/尝试/空尝试 {}/{}/{}/{}，最近未确认字节/包表 STREAM 帧 {}/{}；备用路 {}/{}/{}/{}",
+        after_primary.loss_detection_timeouts,
+        after_primary.pto_timeouts,
+        after_primary.pto_recovery_attempts,
+        after_primary.pto_recovery_empty_attempts,
+        after_primary.last_pto_recovery_unacked_bytes,
+        after_primary.last_pto_recovery_stream_frames,
+        after_secondary.loss_detection_timeouts,
+        after_secondary.pto_timeouts,
+        after_secondary.pto_recovery_attempts,
+        after_secondary.pto_recovery_empty_attempts,
+    );
+    println!(
+        "  接收端 PATH_ACK 同路/跨路：主路发送 {}/{}，备用路发送 {}/{}",
+        receiver_primary.path_acks_same_path,
+        receiver_primary.path_acks_cross_path,
+        receiver_secondary.path_acks_same_path,
+        receiver_secondary.path_acks_cross_path,
+    );
+    println!(
+        "  故障时主路/备用路开放 {} / {}；首个主路 loss/PTO/恢复尝试/对冲 {}/{}/{}/{}，备用路首次 UDP {}",
+        yes_or_no(observation.report.timeline.primary_open_at_fault),
+        yes_or_no(observation.report.timeline.secondary_open_at_fault),
+        optional_milliseconds(observation.report.timeline.first_primary_loss_timeout),
+        optional_milliseconds(observation.report.timeline.first_primary_pto),
+        optional_milliseconds(observation.report.timeline.first_primary_recovery_attempt),
+        optional_milliseconds(observation.report.timeline.first_primary_hedge),
+        optional_milliseconds(observation.report.timeline.first_secondary_udp_send),
+    );
+    println!(
+        "  最大断流窗口 {} → {}，恢复记录序号 {}；主路/备用路关闭时刻 {}/{}",
+        optional_milliseconds(observation.report.recovery_gap_started_after_fault),
+        optional_milliseconds(observation.report.recovery_gap_ended_after_fault),
+        observation
+            .report
+            .recovery_gap_next_sequence
+            .map_or_else(|| "无".to_owned(), |sequence| sequence.to_string()),
+        optional_milliseconds(observation.report.timeline.primary_closed),
+        optional_milliseconds(observation.report.timeline.secondary_closed),
     );
     println!(
         "  结束时主路/备用路仍开放 {} / {}{}",
@@ -866,7 +976,13 @@ fn print_formal_failover_summary(observations: &[FormalFailoverObservation]) {
             .count();
         let primary_used = candidates
             .iter()
-            .filter(|observation| observation.report.primary_fresh_bytes_before_blackhole > 0)
+            .filter(|observation| {
+                observation
+                    .report
+                    .sender_primary_before_blackhole
+                    .fresh_stream_bytes_sent
+                    > 0
+            })
             .count();
         let gaps: Vec<_> = candidates
             .iter()
@@ -921,8 +1037,9 @@ fn print_formal_failover_summary(observations: &[FormalFailoverObservation]) {
 
 fn formal_failover_udp_bytes(report: &SustainedFailoverReport) -> u64 {
     report
-        .primary_bytes_after_blackhole
-        .saturating_add(report.secondary_bytes_after_blackhole)
+        .sender_primary_after_blackhole
+        .udp_bytes_sent
+        .saturating_add(report.sender_secondary_after_blackhole.udp_bytes_sent)
 }
 
 fn matching_formal_failover_baseline(
@@ -1567,7 +1684,7 @@ fn write_formal_failover_csv(
     observations: &[FormalFailoverObservation],
 ) -> LabResult<()> {
     let mut csv = String::from(
-        "direction,round,line_one_seed,line_two_seed,recovery,recovered,data_intact,recovery_gap_ms,transfer_duration_ms,records_received,application_bytes_received,failure_reason,primary_fresh_bytes_before_blackhole,secondary_fresh_bytes_before_blackhole,primary_pto_hedges_before_blackhole,secondary_pto_hedges_before_blackhole,primary_pto_hedge_bytes_before_blackhole,secondary_pto_hedge_bytes_before_blackhole,primary_udp_bytes_after_blackhole,secondary_udp_bytes_after_blackhole,total_udp_bytes_after_blackhole,primary_lost_packets,secondary_lost_packets,pto_hedges_after_blackhole,pto_hedge_bytes_after_blackhole,primary_path_open,secondary_path_open\n",
+        "direction,round,line_one_seed,line_two_seed,recovery,recovered,data_intact,recovery_gap_ms,transfer_duration_ms,records_received,application_bytes_received,failure_reason,primary_fresh_bytes_before_blackhole,secondary_fresh_bytes_before_blackhole,primary_pto_hedges_before_blackhole,secondary_pto_hedges_before_blackhole,primary_pto_hedge_bytes_before_blackhole,secondary_pto_hedge_bytes_before_blackhole,primary_udp_bytes_after_blackhole,secondary_udp_bytes_after_blackhole,total_udp_bytes_after_blackhole,primary_lost_packets,secondary_lost_packets,pto_hedges_after_blackhole,pto_hedge_bytes_after_blackhole,primary_path_open,secondary_path_open,primary_loss_timeouts_after_blackhole,secondary_loss_timeouts_after_blackhole,primary_pto_timeouts_after_blackhole,secondary_pto_timeouts_after_blackhole,primary_pto_recovery_attempts_after_blackhole,primary_pto_recovery_empty_attempts_after_blackhole,primary_last_pto_unacked_bytes,primary_last_pto_stream_frames,secondary_pto_recovery_attempts_after_blackhole,secondary_pto_recovery_empty_attempts_after_blackhole,secondary_last_pto_unacked_bytes,secondary_last_pto_stream_frames,primary_final_cwnd,secondary_final_cwnd,receiver_primary_path_acks_same_path_after_blackhole,receiver_primary_path_acks_cross_path_after_blackhole,receiver_secondary_path_acks_same_path_after_blackhole,receiver_secondary_path_acks_cross_path_after_blackhole,primary_open_at_fault,secondary_open_at_fault,first_primary_loss_timeout_ms,first_primary_pto_ms,first_primary_recovery_attempt_ms,first_primary_hedge_ms,first_secondary_udp_send_ms,first_receiver_primary_cross_path_ack_ms,first_receiver_secondary_same_path_ack_ms,primary_closed_ms,secondary_closed_ms,recovery_gap_started_after_fault_ms,recovery_gap_ended_after_fault_ms,recovery_gap_next_sequence\n",
     );
 
     for observation in observations {
@@ -1590,17 +1707,21 @@ fn write_formal_failover_csv(
             .map(milliseconds)
             .map(|value| format!("{value:.3}"))
             .unwrap_or_default();
+        let before_primary = &observation.report.sender_primary_before_blackhole;
+        let before_secondary = &observation.report.sender_secondary_before_blackhole;
+        let after_primary = &observation.report.sender_primary_after_blackhole;
+        let after_secondary = &observation.report.sender_secondary_after_blackhole;
+        let receiver_primary = &observation.report.receiver_primary_after_blackhole;
+        let receiver_secondary = &observation.report.receiver_secondary_after_blackhole;
         let total_udp = formal_failover_udp_bytes(&observation.report);
-        let total_hedges = observation
-            .report
-            .primary_pto_hedges
-            .saturating_add(observation.report.secondary_pto_hedges);
-        let total_hedge_bytes = observation
-            .report
-            .primary_pto_hedge_bytes
-            .saturating_add(observation.report.secondary_pto_hedge_bytes);
+        let total_hedges = after_primary
+            .pto_hedges
+            .saturating_add(after_secondary.pto_hedges);
+        let total_hedge_bytes = after_primary
+            .pto_hedge_bytes
+            .saturating_add(after_secondary.pto_hedge_bytes);
 
-        writeln!(
+        write!(
             csv,
             "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
             observation.direction.description(),
@@ -1615,23 +1736,74 @@ fn write_formal_failover_csv(
             observation.report.records_received,
             observation.report.application_bytes_received,
             failure_reason,
-            observation.report.primary_fresh_bytes_before_blackhole,
-            observation.report.secondary_fresh_bytes_before_blackhole,
-            observation.report.primary_pto_hedges_before_blackhole,
-            observation.report.secondary_pto_hedges_before_blackhole,
-            observation.report.primary_pto_hedge_bytes_before_blackhole,
-            observation
-                .report
-                .secondary_pto_hedge_bytes_before_blackhole,
-            observation.report.primary_bytes_after_blackhole,
-            observation.report.secondary_bytes_after_blackhole,
+            before_primary.fresh_stream_bytes_sent,
+            before_secondary.fresh_stream_bytes_sent,
+            before_primary.pto_hedges,
+            before_secondary.pto_hedges,
+            before_primary.pto_hedge_bytes,
+            before_secondary.pto_hedge_bytes,
+            after_primary.udp_bytes_sent,
+            after_secondary.udp_bytes_sent,
             total_udp,
-            observation.report.primary_lost_packets,
-            observation.report.secondary_lost_packets,
+            after_primary.lost_packets,
+            after_secondary.lost_packets,
             total_hedges,
             total_hedge_bytes,
             observation.report.primary_path_open,
             observation.report.secondary_path_open,
+        )?;
+        write!(
+            csv,
+            ",{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+            after_primary.loss_detection_timeouts,
+            after_secondary.loss_detection_timeouts,
+            after_primary.pto_timeouts,
+            after_secondary.pto_timeouts,
+            after_primary.pto_recovery_attempts,
+            after_primary.pto_recovery_empty_attempts,
+            after_primary.last_pto_recovery_unacked_bytes,
+            after_primary.last_pto_recovery_stream_frames,
+            after_secondary.pto_recovery_attempts,
+            after_secondary.pto_recovery_empty_attempts,
+            after_secondary.last_pto_recovery_unacked_bytes,
+            after_secondary.last_pto_recovery_stream_frames,
+            after_primary.final_cwnd,
+            after_secondary.final_cwnd,
+            receiver_primary.path_acks_same_path,
+            receiver_primary.path_acks_cross_path,
+            receiver_secondary.path_acks_same_path,
+            receiver_secondary.path_acks_cross_path,
+        )?;
+        writeln!(
+            csv,
+            ",{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+            observation.report.timeline.primary_open_at_fault,
+            observation.report.timeline.secondary_open_at_fault,
+            csv_optional_milliseconds(observation.report.timeline.first_primary_loss_timeout),
+            csv_optional_milliseconds(observation.report.timeline.first_primary_pto),
+            csv_optional_milliseconds(observation.report.timeline.first_primary_recovery_attempt,),
+            csv_optional_milliseconds(observation.report.timeline.first_primary_hedge),
+            csv_optional_milliseconds(observation.report.timeline.first_secondary_udp_send),
+            csv_optional_milliseconds(
+                observation
+                    .report
+                    .timeline
+                    .first_receiver_primary_cross_path_ack,
+            ),
+            csv_optional_milliseconds(
+                observation
+                    .report
+                    .timeline
+                    .first_receiver_secondary_same_path_ack,
+            ),
+            csv_optional_milliseconds(observation.report.timeline.primary_closed),
+            csv_optional_milliseconds(observation.report.timeline.secondary_closed),
+            csv_optional_milliseconds(observation.report.recovery_gap_started_after_fault),
+            csv_optional_milliseconds(observation.report.recovery_gap_ended_after_fault),
+            observation
+                .report
+                .recovery_gap_next_sequence
+                .map_or_else(String::new, |sequence| sequence.to_string()),
         )?;
     }
 
@@ -1644,6 +1816,13 @@ fn optional_milliseconds(duration: Option<Duration>) -> String {
     duration
         .map(|value| format!("{:.2} ms", milliseconds(value)))
         .unwrap_or_else(|| "无有效样本".to_owned())
+}
+
+fn csv_optional_milliseconds(duration: Option<Duration>) -> String {
+    duration
+        .map(milliseconds)
+        .map(|value| format!("{value:.3}"))
+        .unwrap_or_default()
 }
 
 fn milliseconds(duration: Duration) -> f64 {

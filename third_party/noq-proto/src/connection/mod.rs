@@ -1624,7 +1624,7 @@ impl Connection {
                 // especially important with ack delay, since the peer might not
                 // have gotten any other ACK for the data earlier on.
                 let is_multipath_negotiated = self.is_multipath_negotiated();
-                for path_id in self.spaces[space_id]
+                for acknowledged_path_id in self.spaces[space_id]
                     .number_spaces
                     .iter()
                     .filter(|(_, pns)| !pns.pending_acks.ranges().is_empty())
@@ -1635,6 +1635,7 @@ impl Connection {
                         now,
                         self.receiving_ecn,
                         path_id,
+                        acknowledged_path_id,
                         space_id,
                         &mut self.spaces[space_id],
                         is_multipath_negotiated,
@@ -3235,6 +3236,7 @@ impl Connection {
         }
 
         let path_generation = self.path_data(path_id).generation();
+        let unacked_stream_bytes = self.streams.unacked_data();
         let stream_frames = self.spaces[space]
             .for_path(path_id)
             .sent_packets
@@ -3242,7 +3244,17 @@ impl Connection {
             .filter(|packet| packet.path_generation == path_generation)
             .flat_map(|packet| packet.stream_frames.iter().cloned())
             .collect::<Vec<_>>();
+        let stream_frame_count = stream_frames.len() as u64;
+        {
+            let stats = self.path_stats.for_path(path_id);
+            stats.pto_recovery_attempts = stats.pto_recovery_attempts.saturating_add(1);
+            stats.last_pto_recovery_unacked_bytes = unacked_stream_bytes;
+            stats.last_pto_recovery_stream_frames = stream_frame_count;
+        }
         if stream_frames.is_empty() {
+            let stats = self.path_stats.for_path(path_id);
+            stats.pto_recovery_empty_attempts =
+                stats.pto_recovery_empty_attempts.saturating_add(1);
             return false;
         }
 
@@ -3280,6 +3292,8 @@ impl Connection {
     fn on_loss_detection_timeout(&mut self, now: Instant, path_id: PathId) {
         if let Some((_, pn_space)) = self.loss_time_and_space(path_id) {
             // Time threshold loss Detection
+            let stats = self.path_stats.for_path(path_id);
+            stats.loss_detection_timeouts = stats.loss_detection_timeouts.saturating_add(1);
             self.detect_lost_packets(now, pn_space, path_id, false);
             self.set_loss_detection_timer(now, path_id);
             return;
@@ -3296,6 +3310,8 @@ impl Connection {
             %path_id,
             "PTO fired"
         );
+        let stats = self.path_stats.for_path(path_id);
+        stats.pto_timeouts = stats.pto_timeouts.saturating_add(1);
 
         let count = match self.path_data(path_id).in_flight.ack_eliciting {
             // A PTO when we're not expecting any ACKs must be due to handshake
@@ -6188,7 +6204,7 @@ impl Connection {
 
         // ACK
         if !scheduling_info.is_abandoned && scheduling_info.may_send_data {
-            for path_id in space
+            for acknowledged_path_id in space
                 .number_spaces
                 .iter_mut()
                 .filter(|(_, pns)| pns.pending_acks.can_send())
@@ -6199,6 +6215,7 @@ impl Connection {
                     now,
                     self.receiving_ecn,
                     path_id,
+                    acknowledged_path_id,
                     space_id,
                     space,
                     is_multipath_negotiated,
@@ -6641,7 +6658,8 @@ impl Connection {
     fn populate_acks<'a, 'b>(
         now: Instant,
         receiving_ecn: bool,
-        path_id: PathId,
+        sending_path_id: PathId,
+        acknowledged_path_id: PathId,
         space_id: SpaceId,
         space: &mut PacketSpace,
         is_multipath_negotiated: bool,
@@ -6653,17 +6671,17 @@ impl Connection {
         debug_assert!(space_has_keys, "tried to send ACK in 0-RTT");
 
         debug_assert!(
-            is_multipath_negotiated || path_id == PathId::ZERO,
-            "Only PathId::ZERO allowed without multipath (have {path_id:?})"
+            is_multipath_negotiated || acknowledged_path_id == PathId::ZERO,
+            "Only PathId::ZERO allowed without multipath (have {acknowledged_path_id:?})"
         );
         if is_multipath_negotiated {
             debug_assert!(
-                space_id == SpaceId::Data || path_id == PathId::ZERO,
+                space_id == SpaceId::Data || acknowledged_path_id == PathId::ZERO,
                 "path acks must be sent in 1RTT space (have {space_id:?})"
             );
         }
 
-        let pns = space.for_path(path_id);
+        let pns = space.for_path(acknowledged_path_id);
         let ranges = pns.pending_acks.ranges();
         debug_assert!(!ranges.is_empty(), "can not send empty ACK range");
         let ecn = if receiving_ecn {
@@ -6679,7 +6697,12 @@ impl Connection {
 
         if is_multipath_negotiated && space_id == SpaceId::Data {
             if !ranges.is_empty() {
-                let frame = frame::PathAck::encoder(path_id, delay, ranges, ecn);
+                if sending_path_id == acknowledged_path_id {
+                    stats.path_acks_same_path = stats.path_acks_same_path.saturating_add(1);
+                } else {
+                    stats.path_acks_cross_path = stats.path_acks_cross_path.saturating_add(1);
+                }
+                let frame = frame::PathAck::encoder(acknowledged_path_id, delay, ranges, ecn);
                 builder.write_frame(frame, stats);
             }
         } else {
