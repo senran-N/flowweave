@@ -12,14 +12,11 @@ case "$mode" in
     screen)
         test_name="scheduler_five_seed_screening_lab"
         ;;
-    probe)
-        test_name="capacity_probe_five_seed_lab"
-        ;;
     long)
         test_name="scheduler_long_duration_benchmark_lab"
         ;;
     *)
-        echo "用法：$0 [smoke|screen|probe|long]" >&2
+        echo "用法：$0 [smoke|screen|long]" >&2
         exit 2
         ;;
 esac
@@ -41,15 +38,8 @@ set -euo pipefail
 ip link set lo up
 
 tc qdisc add dev lo root handle 1: prio bands 3
-if [[ "$FLOWWEAVE_LAB_MODE" == "probe" ]]; then
-    tc qdisc add dev lo parent 1:1 handle 10: tbf rate 8mbit burst 32kb peakrate 8001kbit minburst 1600 latency 100ms
-    tc qdisc add dev lo parent 10:1 handle 11: netem delay 1ms
-    tc qdisc add dev lo parent 1:2 handle 20: tbf rate 25mbit burst 32kb peakrate 25001kbit minburst 1600 latency 100ms
-    tc qdisc add dev lo parent 20:1 handle 21: netem delay 1ms
-else
-    tc qdisc add dev lo parent 1:1 handle 10: netem delay 1ms
-    tc qdisc add dev lo parent 1:2 handle 20: netem delay 1ms
-fi
+tc qdisc add dev lo parent 1:1 handle 10: netem delay 1ms
+tc qdisc add dev lo parent 1:2 handle 20: netem delay 1ms
 
 tc filter add dev lo protocol ip parent 1: prio 1 u32 match ip src 127.0.0.2/32 flowid 1:2
 tc filter add dev lo protocol ip parent 1: prio 2 u32 match ip dst 127.0.0.2/32 flowid 1:2
