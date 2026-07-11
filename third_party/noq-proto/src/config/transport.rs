@@ -63,6 +63,8 @@ pub struct TransportConfig {
 
     pub(crate) max_concurrent_multipath_paths: Option<NonZeroU32>,
 
+    pub(crate) cross_path_pto_reinjection: bool,
+
     pub(crate) default_path_max_idle_timeout: Option<Duration>,
     pub(crate) default_path_keep_alive_interval: Option<Duration>,
 
@@ -398,6 +400,19 @@ impl TransportConfig {
         self
     }
 
+    /// Whether the first data PTO on a multipath path may queue its outstanding STREAM data for
+    /// retransmission over another validated path.
+    ///
+    /// This follows the cross-path recovery option described by Multipath QUIC section 5.7 while
+    /// leaving final path abandonment to the normal idle and validation machinery. Retransmitted
+    /// data remains subject to the destination path's congestion window and pacing.
+    ///
+    /// Disabled by default.
+    pub fn cross_path_pto_reinjection(&mut self, enabled: bool) -> &mut Self {
+        self.cross_path_pto_reinjection = enabled;
+        self
+    }
+
     /// Sets a default per-path maximum idle timeout
     ///
     /// If the path is idle for this long the path will be abandoned. Bear in mind this will
@@ -586,6 +601,7 @@ impl Default for TransportConfig {
 
             // disabled multipath by default
             max_concurrent_multipath_paths: None,
+            cross_path_pto_reinjection: false,
             default_path_max_idle_timeout: None,
             default_path_keep_alive_interval: None,
 
@@ -630,6 +646,7 @@ impl fmt::Debug for TransportConfig {
             enable_segmentation_offload,
             address_discovery_role,
             max_concurrent_multipath_paths,
+            cross_path_pto_reinjection,
             default_path_max_idle_timeout,
             default_path_keep_alive_interval,
             max_remote_nat_traversal_addresses,
@@ -674,6 +691,7 @@ impl fmt::Debug for TransportConfig {
                 "max_concurrent_multipath_paths",
                 max_concurrent_multipath_paths,
             )
+            .field("cross_path_pto_reinjection", cross_path_pto_reinjection)
             .field(
                 "default_path_max_idle_timeout",
                 default_path_max_idle_timeout,

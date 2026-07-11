@@ -240,6 +240,14 @@ pub(super) struct PathData {
     /// [`LossDetection`]: super::timer::PathTimer::LossDetection
     pub(super) pto_count: u32,
 
+    /// The first packet number that can prove this path recovered after a data PTO temporarily
+    /// removed it from normal application-data scheduling.
+    ///
+    /// This is a local scheduling hint, not a peer-visible path status. ACKs for packets sent
+    /// before this boundary are stale evidence and must not reactivate the path. Normal path-idle
+    /// handling remains responsible for eventual abandonment.
+    pub(super) pto_recovery_probe_start: Option<u64>,
+
     //
     // Per-path idle & keep alive
     //
@@ -339,6 +347,7 @@ impl PathData {
             status: Default::default(),
             first_packet: None,
             pto_count: 0,
+            pto_recovery_probe_start: None,
             idle_timeout: config.default_path_max_idle_timeout,
             keep_alive: config.default_path_keep_alive_interval,
             permit_idle_reset: true,
@@ -387,6 +396,7 @@ impl PathData {
             status: prev.status.clone(),
             first_packet: None,
             pto_count: 0,
+            pto_recovery_probe_start: None,
             idle_timeout: prev.idle_timeout,
             keep_alive: prev.keep_alive,
             permit_idle_reset: true,

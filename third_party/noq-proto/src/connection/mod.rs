@@ -1140,8 +1140,21 @@ impl Connection {
             self.remote_cids.contains_key(path_id)
                 && !self.abandoned_paths.contains(path_id)
                 && path.data.validated
+                && path.data.pto_recovery_probe_start.is_none()
                 && path.data.local_status() == PathStatus::Available
         });
+
+        // A PTO-suspected path yields normal application data to any other validated,
+        // non-suspected path. If every path is suspected, this remains false and normal status
+        // scheduling is allowed to avoid creating a self-inflicted deadlock.
+        let have_other_validated_unsuspected_space =
+            self.paths.iter().any(|(other_path_id, path)| {
+                *other_path_id != path_id
+                    && self.remote_cids.contains_key(other_path_id)
+                    && !self.abandoned_paths.contains(other_path_id)
+                    && path.data.validated
+                    && path.data.pto_recovery_probe_start.is_none()
+            });
 
         // Such a space is able to send SpaceKind::Data frames.
         let have_validated_space = self.paths.iter().any(|(path_id, path)| {
@@ -1173,6 +1186,10 @@ impl Connection {
                 //    path. Perhaps we should have a way to figure out if the
                 //    path is to a previously-validated remote address and allow
                 //    sending data to such remotes immediately.
+                false
+            } else if path_data.pto_recovery_probe_start.is_some()
+                && have_other_validated_unsuspected_space
+            {
                 false
             } else {
                 match status {
@@ -2952,8 +2969,13 @@ impl Connection {
             return Ok(());
         }
 
+        let recovery_probe_start = (space == SpaceId::Data)
+            .then(|| self.path_data(path).pto_recovery_probe_start)
+            .flatten();
+        let mut recovery_probe_acked = false;
         let mut ack_eliciting_acked = false;
         for packet in newly_acked.elts() {
+            recovery_probe_acked |= recovery_probe_start.is_some_and(|start| packet >= start);
             if let Some(info) = self.spaces[space].for_path(path).take(packet) {
                 for (acked_path_id, acked_pn) in info.largest_acked.iter() {
                     // Assume ACKs for all packets below the largest acknowledged in
@@ -3024,7 +3046,11 @@ impl Connection {
         // exponential backoff from the PTO timer and would result in too many tail-loss
         // probes being sent.
         if self.peer_completed_handshake_address_validation() {
-            self.path_data_mut(path).pto_count = 0;
+            let path_data = self.path_data_mut(path);
+            path_data.pto_count = 0;
+            if recovery_probe_acked {
+                path_data.pto_recovery_probe_start = None;
+            }
         }
 
         // Explicit congestion notification
@@ -3185,6 +3211,60 @@ impl Connection {
         );
     }
 
+    /// Queue outstanding STREAM data from a PTO-stalled path for another validated path.
+    ///
+    /// Returns whether a hedge episode was started. This is deliberately limited to one episode
+    /// per recovery period by [`PathData::pto_recovery_probe_start`].
+    fn maybe_reinject_stream_data_on_pto(&mut self, path_id: PathId, space: SpaceId) -> bool {
+        if !self.config.cross_path_pto_reinjection
+            || space != SpaceId::Data
+            || self.path_data(path_id).pto_recovery_probe_start.is_some()
+        {
+            return false;
+        }
+
+        let have_alternative = self.paths.iter().any(|(other_path_id, path)| {
+            *other_path_id != path_id
+                && self.remote_cids.contains_key(other_path_id)
+                && !self.abandoned_paths.contains(other_path_id)
+                && path.data.validated
+                && path.data.pto_recovery_probe_start.is_none()
+        });
+        if !have_alternative {
+            return false;
+        }
+
+        let path_generation = self.path_data(path_id).generation();
+        let stream_frames = self.spaces[space]
+            .for_path(path_id)
+            .sent_packets
+            .values()
+            .filter(|packet| packet.path_generation == path_generation)
+            .flat_map(|packet| packet.stream_frames.iter().cloned())
+            .collect::<Vec<_>>();
+        if stream_frames.is_empty() {
+            return false;
+        }
+
+        let mut newly_queued_bytes = 0u64;
+        for frame in stream_frames {
+            newly_queued_bytes = newly_queued_bytes.saturating_add(self.streams.retransmit(frame));
+        }
+
+        let recovery_probe_start = self.spaces[space].for_path(path_id).next_packet_number;
+        self.path_data_mut(path_id).pto_recovery_probe_start = Some(recovery_probe_start);
+        let stats = self.path_stats.for_path(path_id);
+        stats.pto_hedges = stats.pto_hedges.saturating_add(1);
+        stats.pto_hedge_bytes = stats.pto_hedge_bytes.saturating_add(newly_queued_bytes);
+        trace!(
+            %path_id,
+            newly_queued_bytes,
+            recovery_probe_start,
+            "queued cross-path PTO reinjection"
+        );
+        true
+    }
+
     /// Handle a [`PathTimer::LossDetection`] timeout.
     ///
     /// This timer expires for two reasons:
@@ -3229,6 +3309,7 @@ impl Connection {
         };
         let pns = self.spaces[space].for_path(path_id);
         pns.loss_probes = pns.loss_probes.saturating_add(count);
+        self.maybe_reinject_stream_data_on_pto(path_id, space);
         let path_data = self.path_data_mut(path_id);
         path_data.pto_count = path_data.pto_count.saturating_add(1);
         self.set_loss_detection_timer(now, path_id);

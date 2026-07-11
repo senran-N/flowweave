@@ -612,8 +612,9 @@ impl StreamsState {
             return;
         }
         let id = frame.id;
-        self.unacked_data -= frame.offsets.end - frame.offsets.start;
-        if !stream.ack(frame) {
+        let (finished, newly_acked) = stream.ack(frame);
+        self.unacked_data -= newly_acked;
+        if !finished {
             // The stream is unfinished or may still need retransmits
             return;
         }
@@ -623,16 +624,16 @@ impl StreamsState {
         self.events.push_back(StreamEvent::Finished { id });
     }
 
-    pub(crate) fn retransmit(&mut self, frame: frame::StreamMeta) {
+    pub(crate) fn retransmit(&mut self, frame: frame::StreamMeta) -> u64 {
         let Some(stream) = self.send.get_mut(&frame.id).and_then(|s| s.as_mut()) else {
             // Loss of data on a closed stream is a noop
-            return;
+            return 0;
         };
         if !stream.is_pending() {
             self.pending.push_pending(frame.id, stream.priority);
         }
         stream.fin_pending |= frame.fin;
-        stream.pending.retransmit(frame.offsets);
+        stream.pending.retransmit(frame.offsets)
     }
 
     pub(crate) fn retransmit_all_for_0rtt(&mut self) {

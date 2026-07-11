@@ -28,6 +28,8 @@ pub type LabError = Box<dyn Error + Send + Sync + 'static>;
 pub type LabResult<T> = Result<T, LabError>;
 
 const MAGIC: &[u8; 4] = b"FWL1";
+const FAILOVER_MAGIC: &[u8; 4] = b"FWP1";
+const FAILOVER_PROGRESS: &[u8; 4] = b"FWP+";
 const DATAGRAM_MAGIC: &[u8; 4] = b"FWDG";
 const DATAGRAM_PROBE_SIZE: usize = 8;
 const MAX_PAYLOAD_SIZE: usize = 2 * 1024 * 1024;
@@ -74,10 +76,33 @@ impl PathMode {
     }
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum PtoRecovery {
+    #[default]
+    Disabled,
+    CrossPathHedge,
+}
+
+impl PtoRecovery {
+    pub const CANDIDATES: [Self; 2] = [Self::Disabled, Self::CrossPathHedge];
+
+    pub fn description(self) -> &'static str {
+        match self {
+            Self::Disabled => "NoQ 默认恢复",
+            Self::CrossPathHedge => "FlowWeave PTO 跨路径对冲",
+        }
+    }
+
+    fn enabled(self) -> bool {
+        matches!(self, Self::CrossPathHedge)
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct NetworkBenchmarkConfig {
     pub mode: PathMode,
     pub scheduler: MultipathScheduler,
+    pub pto_recovery: PtoRecovery,
     pub transfer_size: usize,
     pub datagram_count: usize,
 }
@@ -92,9 +117,15 @@ impl NetworkBenchmarkConfig {
         Self {
             mode,
             scheduler,
+            pto_recovery: PtoRecovery::Disabled,
             transfer_size,
             datagram_count,
         }
+    }
+
+    pub fn with_pto_recovery(mut self, pto_recovery: PtoRecovery) -> Self {
+        self.pto_recovery = pto_recovery;
+        self
     }
 
     fn validate(self) -> LabResult<()> {
@@ -119,6 +150,7 @@ impl NetworkBenchmarkConfig {
 pub struct SustainedBenchmarkConfig {
     pub mode: PathMode,
     pub scheduler: MultipathScheduler,
+    pub pto_recovery: PtoRecovery,
     pub warmup_duration: Duration,
     pub measurement_duration: Duration,
     pub chunk_size: usize,
@@ -135,10 +167,16 @@ impl SustainedBenchmarkConfig {
         Self {
             mode,
             scheduler,
+            pto_recovery: PtoRecovery::Disabled,
             warmup_duration,
             measurement_duration,
             chunk_size,
         }
+    }
+
+    pub fn with_pto_recovery(mut self, pto_recovery: PtoRecovery) -> Self {
+        self.pto_recovery = pto_recovery;
+        self
     }
 
     fn validate(self) -> LabResult<()> {
@@ -186,6 +224,8 @@ pub struct PathMeasurement {
     pub retransmitted_stream_bytes_sent: u64,
     pub lost_packets: u64,
     pub lost_bytes: u64,
+    pub pto_hedges: u64,
+    pub pto_hedge_bytes: u64,
     pub final_rtt: Duration,
 }
 
@@ -211,6 +251,7 @@ impl DatagramMeasurement {
 pub struct NetworkBenchmarkReport {
     pub mode: PathMode,
     pub scheduler: MultipathScheduler,
+    pub pto_recovery: PtoRecovery,
     pub multipath_negotiated: bool,
     pub transfer_size: usize,
     pub transfer_duration: Duration,
@@ -223,6 +264,8 @@ pub struct NetworkBenchmarkReport {
     pub cpu_time: Duration,
     pub cpu_utilization_percent: f64,
     pub peak_rss_kib: u64,
+    pub all_configured_paths_open: bool,
+    pub any_configured_path_open: bool,
 }
 
 impl NetworkBenchmarkReport {
@@ -243,14 +286,22 @@ impl NetworkBenchmarkReport {
 #[derive(Debug, Clone)]
 pub struct FailoverReport {
     pub scheduler: MultipathScheduler,
+    pub pto_recovery: PtoRecovery,
     pub recovered: bool,
     pub recovery_time: Option<Duration>,
+    pub completion_time: Option<Duration>,
     pub failure_reason: Option<String>,
     pub configured_path_idle_timeout: Duration,
     pub primary_bytes_after_blackhole: u64,
     pub secondary_bytes_after_blackhole: u64,
     pub primary_lost_packets: u64,
     pub secondary_lost_packets: u64,
+    pub primary_pto_hedges: u64,
+    pub secondary_pto_hedges: u64,
+    pub primary_pto_hedge_bytes: u64,
+    pub secondary_pto_hedge_bytes: u64,
+    pub primary_path_open: bool,
+    pub secondary_path_open: bool,
 }
 
 struct RunningLab {
@@ -379,7 +430,7 @@ impl RunningLab {
 }
 
 pub async fn run_basic_lab() -> LabResult<BasicLabReport> {
-    let lab = start_connection(Ipv4Addr::UNSPECIFIED, None).await?;
+    let lab = start_connection(Ipv4Addr::UNSPECIFIED, None, PtoRecovery::Disabled).await?;
 
     let report_result: LabResult<BasicLabReport> = async {
         let connection = &lab.connection;
@@ -459,6 +510,7 @@ pub async fn run_network_benchmark(
     run_network_workload(
         config.mode,
         config.scheduler,
+        config.pto_recovery,
         BenchmarkWorkload::Fixed {
             transfer_size: config.transfer_size,
             datagram_count: config.datagram_count,
@@ -475,6 +527,7 @@ pub async fn run_sustained_network_benchmark(
     run_network_workload(
         config.mode,
         config.scheduler,
+        config.pto_recovery,
         BenchmarkWorkload::Sustained {
             warmup_duration: config.warmup_duration,
             measurement_duration: config.measurement_duration,
@@ -487,6 +540,7 @@ pub async fn run_sustained_network_benchmark(
 async fn run_network_workload(
     mode: PathMode,
     scheduler: MultipathScheduler,
+    pto_recovery: PtoRecovery,
     workload: BenchmarkWorkload,
 ) -> LabResult<NetworkBenchmarkReport> {
     let datagram_count = match workload {
@@ -499,7 +553,7 @@ async fn run_network_workload(
         PathMode::LineTwoOnly => LINE_TWO_IP,
         PathMode::MultipathAvailable => Ipv4Addr::UNSPECIFIED,
     };
-    let lab = start_connection(client_ip, Some(NETWORK_PATH_IDLE_TIMEOUT)).await?;
+    let lab = start_connection(client_ip, Some(NETWORK_PATH_IDLE_TIMEOUT), pto_recovery).await?;
 
     let secondary = if mode == PathMode::MultipathAvailable {
         Some(lab.open_second_path(PathStatus::Available).await?)
@@ -561,9 +615,15 @@ async fn run_network_workload(
         let application_bytes_sent = (transfer_size as u64)
             .saturating_add((datagram_count as u64).saturating_mul(DATAGRAM_PROBE_SIZE as u64));
 
+        let all_configured_paths_open = lab.primary.status().is_ok()
+            && secondary.as_ref().is_none_or(|path| path.status().is_ok());
+        let any_configured_path_open = lab.primary.status().is_ok()
+            || secondary.as_ref().is_some_and(|path| path.status().is_ok());
+
         Ok(NetworkBenchmarkReport {
             mode,
             scheduler,
+            pto_recovery,
             multipath_negotiated: lab.connection.is_multipath_enabled(),
             transfer_size,
             transfer_duration,
@@ -576,6 +636,8 @@ async fn run_network_workload(
             cpu_time: resources.cpu_time,
             cpu_utilization_percent: resources.cpu_utilization_percent,
             peak_rss_kib: resources.peak_rss_kib,
+            all_configured_paths_open,
+            any_configured_path_open,
         })
     }
     .await;
@@ -586,14 +648,22 @@ async fn run_network_workload(
     Ok(report)
 }
 
-pub async fn run_blackhole_failover<F>(
+pub async fn run_blackhole_failover<Activate, Restore>(
     scheduler: MultipathScheduler,
-    activate_blackhole: F,
+    pto_recovery: PtoRecovery,
+    activate_blackhole: Activate,
+    restore_network: Restore,
 ) -> LabResult<FailoverReport>
 where
-    F: FnOnce() -> LabResult<()>,
+    Activate: FnOnce() -> LabResult<()>,
+    Restore: FnOnce() -> LabResult<()>,
 {
-    let lab = start_connection(Ipv4Addr::UNSPECIFIED, Some(NETWORK_PATH_IDLE_TIMEOUT)).await?;
+    let lab = start_connection(
+        Ipv4Addr::UNSPECIFIED,
+        Some(NETWORK_PATH_IDLE_TIMEOUT),
+        pto_recovery,
+    )
+    .await?;
     let secondary = lab.open_second_path(PathStatus::Backup).await?;
     sleep(Duration::from_millis(250)).await;
 
@@ -607,15 +677,21 @@ where
         let failure_started = Instant::now();
         let transfer_result = timeout(
             FAILOVER_OBSERVATION_TIMEOUT,
-            transfer_and_verify(&lab.connection, 256 * 1024, 113),
+            transfer_and_verify_with_progress(&lab.connection, 256 * 1024, 113, failure_started),
         )
         .await;
 
-        let (recovered, recovery_time, failure_reason) = match transfer_result {
-            Ok(Ok(())) => (true, Some(failure_started.elapsed()), None),
-            Ok(Err(error)) => (false, None, Some(error.to_string())),
+        let (recovered, recovery_time, completion_time, failure_reason) = match transfer_result {
+            Ok(Ok(timing)) => (
+                true,
+                Some(timing.recovery_time),
+                Some(timing.completion_time),
+                None,
+            ),
+            Ok(Err(error)) => (false, None, None, Some(error.to_string())),
             Err(_) => (
                 false,
+                None,
                 None,
                 Some(format!(
                     "{} 秒观察窗口内没有恢复传输",
@@ -631,20 +707,30 @@ where
 
         Ok(FailoverReport {
             scheduler,
+            pto_recovery,
             recovered,
             recovery_time,
+            completion_time,
             failure_reason,
             configured_path_idle_timeout: NETWORK_PATH_IDLE_TIMEOUT,
             primary_bytes_after_blackhole: primary_delta.udp_bytes_sent,
             secondary_bytes_after_blackhole: secondary_delta.udp_bytes_sent,
             primary_lost_packets: primary_delta.lost_packets,
             secondary_lost_packets: secondary_delta.lost_packets,
+            primary_pto_hedges: primary_delta.pto_hedges,
+            secondary_pto_hedges: secondary_delta.pto_hedges,
+            primary_pto_hedge_bytes: primary_delta.pto_hedge_bytes,
+            secondary_pto_hedge_bytes: secondary_delta.pto_hedge_bytes,
+            primary_path_open: lab.primary.status().is_ok(),
+            secondary_path_open: secondary.status().is_ok(),
         })
     }
     .await;
 
+    let restore_result = restore_network();
     let shutdown_result = lab.shutdown().await;
     let report = operation_result?;
+    restore_result?;
     shutdown_result?;
     Ok(report)
 }
@@ -652,8 +738,9 @@ where
 async fn start_connection(
     client_ip: Ipv4Addr,
     path_idle_timeout: Option<Duration>,
+    pto_recovery: PtoRecovery,
 ) -> LabResult<RunningLab> {
-    let (server_config, client_config) = make_configs(path_idle_timeout)?;
+    let (server_config, client_config) = make_configs(path_idle_timeout, pto_recovery)?;
     let server_endpoint =
         Endpoint::server(server_config, SocketAddr::new(IpAddr::V4(LINE_ONE_IP), 0))?;
     let server_addr = server_endpoint.local_addr()?;
@@ -699,7 +786,10 @@ async fn start_connection(
     })
 }
 
-fn make_configs(path_idle_timeout: Option<Duration>) -> LabResult<(ServerConfig, ClientConfig)> {
+fn make_configs(
+    path_idle_timeout: Option<Duration>,
+    pto_recovery: PtoRecovery,
+) -> LabResult<(ServerConfig, ClientConfig)> {
     let generated = rcgen::generate_simple_self_signed(vec!["localhost".into()])?;
     let certificate = CertificateDer::from(generated.cert);
     let private_key = PrivatePkcs8KeyDer::from(generated.signing_key.serialize_der());
@@ -708,21 +798,26 @@ fn make_configs(path_idle_timeout: Option<Duration>) -> LabResult<(ServerConfig,
         ServerConfig::with_single_cert(vec![certificate.clone()], private_key.into())?;
     let server_transport = Arc::get_mut(&mut server_config.transport)
         .ok_or_else(|| other_error("无法配置服务端传输参数"))?;
-    configure_transport(server_transport, path_idle_timeout);
+    configure_transport(server_transport, path_idle_timeout, pto_recovery);
 
     let mut roots = noq::rustls::RootCertStore::empty();
     roots.add(certificate)?;
     let mut client_config = ClientConfig::with_root_certificates(Arc::new(roots))?;
     let mut client_transport = TransportConfig::default();
-    configure_transport(&mut client_transport, path_idle_timeout);
+    configure_transport(&mut client_transport, path_idle_timeout, pto_recovery);
     client_config.transport_config(Arc::new(client_transport));
 
     Ok((server_config, client_config))
 }
 
-fn configure_transport(transport: &mut TransportConfig, path_idle_timeout: Option<Duration>) {
+fn configure_transport(
+    transport: &mut TransportConfig,
+    path_idle_timeout: Option<Duration>,
+    pto_recovery: PtoRecovery,
+) {
     transport
         .max_concurrent_multipath_paths(2)
+        .cross_path_pto_reinjection(pto_recovery.enabled())
         .default_path_max_idle_timeout(path_idle_timeout)
         .default_path_keep_alive_interval(Some(Duration::from_millis(200)))
         .datagram_receive_buffer_size(Some(1024 * 1024))
@@ -770,13 +865,57 @@ async fn serve_connection(connection: Connection) -> LabResult<()> {
 }
 
 async fn handle_stream(mut send: noq::SendStream, mut receive: noq::RecvStream) -> LabResult<()> {
-    let request = receive.read_to_end(MAX_FRAME_SIZE).await?;
+    let mut header = [0_u8; 8];
+    receive.read_exact(&mut header).await?;
+
+    if &header[..4] == FAILOVER_MAGIC {
+        return handle_progress_stream(send, receive, header).await;
+    }
+
+    let remaining = receive.read_to_end(MAX_FRAME_SIZE - header.len()).await?;
+    let mut request = Vec::with_capacity(header.len() + remaining.len());
+    request.extend_from_slice(&header);
+    request.extend_from_slice(&remaining);
     let response = match parse_frame(&request) {
         Ok(payload) => make_success_response(payload),
         Err(reason) => make_error_response(reason),
     };
 
     send.write_all(&response).await?;
+    send.finish()?;
+    Ok(())
+}
+
+async fn handle_progress_stream(
+    mut send: noq::SendStream,
+    mut receive: noq::RecvStream,
+    header: [u8; 8],
+) -> LabResult<()> {
+    let declared =
+        u32::from_be_bytes(header[4..8].try_into().expect("长度字段固定为 4 字节")) as usize;
+    if declared == 0 || declared > MAX_PAYLOAD_SIZE {
+        send.write_all(&make_error_response("进度传输长度不合法"))
+            .await?;
+        send.finish()?;
+        return Ok(());
+    }
+
+    let mut first_byte = [0_u8; 1];
+    receive.read_exact(&mut first_byte).await?;
+    send.write_all(FAILOVER_PROGRESS).await?;
+
+    let remaining = receive.read_to_end(declared - 1).await?;
+    if remaining.len() != declared - 1 {
+        send.write_all(&make_error_response("进度传输提前结束"))
+            .await?;
+        send.finish()?;
+        return Ok(());
+    }
+
+    let mut payload = Vec::with_capacity(declared);
+    payload.push(first_byte[0]);
+    payload.extend_from_slice(&remaining);
+    send.write_all(&make_success_response(&payload)).await?;
     send.finish()?;
     Ok(())
 }
@@ -801,6 +940,51 @@ impl PreparedTransfer {
 async fn transfer_and_verify(connection: &Connection, size: usize, seed: u8) -> LabResult<()> {
     let transfer = PreparedTransfer::new(size, seed);
     transfer_prepared_and_verify(connection, &transfer).await
+}
+
+struct FailoverTransferTiming {
+    recovery_time: Duration,
+    completion_time: Duration,
+}
+
+async fn transfer_and_verify_with_progress(
+    connection: &Connection,
+    size: usize,
+    seed: u8,
+    failure_started: Instant,
+) -> LabResult<FailoverTransferTiming> {
+    let payload = make_payload(size, seed);
+    let expected_digest = digest(&payload);
+    let mut request = Vec::with_capacity(payload.len() + 8);
+    request.extend_from_slice(FAILOVER_MAGIC);
+    request.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+    request.extend_from_slice(&payload);
+
+    let (mut send, mut receive) = connection.open_bi().await?;
+    let sender = async {
+        send.write_all(&request).await?;
+        send.finish()?;
+        Ok::<(), LabError>(())
+    };
+    let receiver = async {
+        let mut progress = [0_u8; FAILOVER_PROGRESS.len()];
+        receive.read_exact(&mut progress).await?;
+        if &progress != FAILOVER_PROGRESS {
+            return Err(other_error("服务端没有返回有效的恢复进度标记"));
+        }
+        let recovery_time = failure_started.elapsed();
+
+        let response = receive.read_to_end(64).await?;
+        verify_success_response(&response, size, expected_digest)?;
+        Ok(FailoverTransferTiming {
+            recovery_time,
+            completion_time: failure_started.elapsed(),
+        })
+    };
+    let (sender, receiver) = tokio::join!(sender, receiver);
+
+    sender?;
+    receiver
 }
 
 async fn transfer_for_duration(
@@ -1085,6 +1269,8 @@ fn path_delta(before: PathStats, after: PathStats) -> PathMeasurement {
             .saturating_sub(before.frame_tx.stream_retransmit_bytes),
         lost_packets: after.lost_packets.saturating_sub(before.lost_packets),
         lost_bytes: after.lost_bytes.saturating_sub(before.lost_bytes),
+        pto_hedges: after.pto_hedges.saturating_sub(before.pto_hedges),
+        pto_hedge_bytes: after.pto_hedge_bytes.saturating_sub(before.pto_hedge_bytes),
         final_rtt: after.rtt,
     }
 }
@@ -1229,6 +1415,20 @@ mod tests {
         assert!(report.transfer_duration >= Duration::from_millis(100));
         assert!(report.transfer_size >= 64 * 1024);
         assert!(report.peak_rss_kib > 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn failover_progress_is_reported_before_full_integrity_check() {
+        let lab = start_connection(Ipv4Addr::UNSPECIFIED, None, PtoRecovery::Disabled)
+            .await
+            .expect("进度测量实验应建立连接");
+        let started = Instant::now();
+        let timing = transfer_and_verify_with_progress(&lab.connection, 64 * 1024, 17, started)
+            .await
+            .expect("进度传输应完整校验");
+
+        assert!(timing.recovery_time <= timing.completion_time);
+        lab.shutdown().await.expect("进度实验应正常关闭");
     }
 
     #[test]

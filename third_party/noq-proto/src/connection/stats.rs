@@ -249,6 +249,13 @@ pub struct PathStats {
     pub lost_plpmtud_probes: u64,
     /// The number of times a black hole was detected in the path.
     pub black_holes_detected: u64,
+    /// Number of first-PTO episodes that queued this path's STREAM data for cross-path
+    /// retransmission.
+    pub pto_hedges: u64,
+    /// STREAM payload bytes newly queued by cross-path PTO reinjection.
+    ///
+    /// Bytes already pending for ordinary retransmission and acknowledged bytes are excluded.
+    pub pto_hedge_bytes: u64,
     /// Largest UDP payload size the path currently supports.
     pub current_mtu: u16,
 }
@@ -294,6 +301,8 @@ impl std::ops::Add<PathStats> for ConnectionStats {
             sent_plpmtud_probes: _,
             lost_plpmtud_probes: _,
             black_holes_detected: _,
+            pto_hedges: _,
+            pto_hedge_bytes: _,
             current_mtu: _,
         } = rhs;
         Self {
@@ -325,6 +334,8 @@ impl std::ops::AddAssign<PathStats> for ConnectionStats {
             sent_plpmtud_probes: _,
             lost_plpmtud_probes: _,
             black_holes_detected: _,
+            pto_hedges: _,
+            pto_hedge_bytes: _,
             current_mtu: _,
         } = rhs;
         let Self {

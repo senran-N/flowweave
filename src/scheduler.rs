@@ -1,6 +1,7 @@
 /// FlowWeave 对外使用的多路径调度策略。
 ///
-/// 当前没有通过筛选的自定义候选，只保留 NoQ 原行为作为可复现实验基线。
+/// 当前没有通过筛选的自定义 B 组调度候选，只保留 NoQ 原行为作为可复现实验基线。
+/// A 组 PTO 恢复由独立的 `PtoRecovery` 配置控制，不混入调度枚举。
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum MultipathScheduler {
     /// 保留 NoQ 原本的低路径编号优先行为。

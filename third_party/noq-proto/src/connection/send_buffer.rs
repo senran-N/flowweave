@@ -211,12 +211,26 @@ impl SendBuffer {
     }
 
     /// Discard a range of acknowledged stream data
-    pub(super) fn ack(&mut self, mut range: Range<u64>) {
+    ///
+    /// Returns the number of bytes newly acknowledged by this call. The same STREAM range can be
+    /// acknowledged more than once when redundant copies are in flight.
+    pub(super) fn ack(&mut self, mut range: Range<u64>) -> u64 {
         // Clamp the range to data which is still tracked
         let base_offset = self.fully_acked_offset();
         range.start = base_offset.max(range.start);
         range.end = base_offset.max(range.end);
 
+        let newly_acked = (range.end - range.start).saturating_sub(
+            self.acks
+                .iter_range(range.clone())
+                .map(|acked| acked.end - acked.start)
+                .sum(),
+        );
+
+        // A redundant copy can still be queued locally when the original copy is acknowledged.
+        // Cancel the acknowledged bytes immediately, including out-of-order ACK ranges, so they
+        // are not needlessly sent before the contiguous acknowledged prefix advances.
+        self.retransmits.remove(range.clone());
         self.acks.insert(range);
 
         while self.acks.min() == Some(self.fully_acked_offset()) {
@@ -230,6 +244,8 @@ impl SendBuffer {
         // We have to do this since we have just dropped the data, and asking
         // for non-present data would be an error.
         self.retransmits.remove(0..self.fully_acked_offset());
+
+        newly_acked
     }
 
     /// Compute the next range to transmit on this stream and update state to account for that
@@ -305,16 +321,24 @@ impl SendBuffer {
     }
 
     /// Queue a range of sent but unacknowledged data to be retransmitted
-    pub(super) fn retransmit(&mut self, mut range: Range<u64>) {
+    pub(super) fn retransmit(&mut self, mut range: Range<u64>) -> u64 {
         debug_assert!(range.end <= self.unsent, "unsent data can't be lost");
+        let previously_queued = self.retransmits.elts_count();
         // don't allow retransmitting data that has already been fully acknowledged,
         // since we don't have it anymore.
-        //
-        // Note that we do allow retransmitting data that has been acknowledged
-        // for simplicity. Not doing so would require clipping the range against
-        // all acknowledged ranges.
         range.start = range.start.max(self.fully_acked_offset());
-        self.retransmits.insert(range);
+        self.retransmits.insert(range.clone());
+
+        // A packet can remain unacknowledged even though another copy of its STREAM data was
+        // already acknowledged on a different path. Never resurrect those acknowledged bytes.
+        let acked = self.acks.iter_range(range).collect::<Vec<_>>();
+        for range in acked {
+            self.retransmits.remove(range);
+        }
+
+        self.retransmits
+            .elts_count()
+            .saturating_sub(previously_queued)
     }
 
     pub(super) fn retransmit_all_for_0rtt(&mut self) {
@@ -550,8 +574,60 @@ mod tests {
         const MSG: &[u8] = b"Hello, world!";
         buf.write(MSG);
         assert_eq!(buf.poll_transmit(16), (0..8, true));
-        buf.ack(0..8);
+        assert_eq!(buf.ack(0..8), 8);
         assert_eq!(aggregate_unacked(&buf), &MSG[8..]);
+    }
+
+    #[test]
+    fn duplicate_ack_only_counts_new_bytes_once() {
+        let mut buf = SendBuffer::new();
+        const MSG: &[u8] = b"Hello, world!";
+        buf.write(MSG);
+        assert_eq!(buf.poll_transmit(64).0, 0..MSG.len() as u64);
+
+        assert_eq!(buf.ack(0..MSG.len() as u64), MSG.len() as u64);
+        assert_eq!(buf.ack(0..MSG.len() as u64), 0);
+        assert!(buf.is_fully_acked());
+    }
+
+    #[test]
+    fn overlapping_out_of_order_acks_only_count_new_bytes() {
+        let mut buf = SendBuffer::new();
+        const MSG: &[u8] = b"Hello, world!";
+        buf.write(MSG);
+        assert_eq!(buf.poll_transmit(64).0, 0..MSG.len() as u64);
+
+        assert_eq!(buf.ack(2..8), 6);
+        assert_eq!(buf.ack(5..MSG.len() as u64), 5);
+        assert_eq!(buf.ack(0..4), 2);
+        assert_eq!(buf.ack(0..MSG.len() as u64), 0);
+        assert!(buf.is_fully_acked());
+    }
+
+    #[test]
+    fn out_of_order_ack_cancels_queued_retransmit_bytes() {
+        let mut buf = SendBuffer::new();
+        const MSG: &[u8] = b"Hello, world!";
+        buf.write(MSG);
+        assert_eq!(buf.poll_transmit(64).0, 0..MSG.len() as u64);
+        buf.retransmit(0..MSG.len() as u64);
+
+        assert_eq!(buf.ack(5..MSG.len() as u64), MSG.len() as u64 - 5);
+        assert_eq!(buf.poll_transmit(64).0, 0..5);
+        assert!(!buf.has_retransmits());
+    }
+
+    #[test]
+    fn acknowledged_bytes_are_not_requeued_for_retransmit() {
+        let mut buf = SendBuffer::new();
+        const MSG: &[u8] = b"Hello, world!";
+        buf.write(MSG);
+        assert_eq!(buf.poll_transmit(64).0, 0..MSG.len() as u64);
+
+        assert_eq!(buf.ack(5..MSG.len() as u64), MSG.len() as u64 - 5);
+        buf.retransmit(0..MSG.len() as u64);
+        assert_eq!(buf.poll_transmit(64).0, 0..5);
+        assert!(!buf.has_retransmits());
     }
 
     #[test]

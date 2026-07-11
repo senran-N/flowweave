@@ -1,0 +1,11 @@
+round,line_one_seed,line_two_seed,recovery,recovered,recovery_ms,completion_ms,failure_reason,primary_path_open,secondary_path_open,failover_primary_udp_bytes,failover_secondary_udp_bytes,failover_total_udp_bytes,primary_lost_packets,secondary_lost_packets,failover_pto_hedges,failover_pto_hedge_bytes,normal_throughput_mbps,normal_total_udp_bytes,normal_all_paths_open,normal_pto_hedges,normal_pto_hedge_bytes,high_loss_throughput_mbps,high_loss_total_udp_bytes,high_loss_any_path_open,high_loss_pto_hedges,high_loss_pto_hedge_bytes
+1,1101,2201,NoQ 默认恢复,true,3588.471,4881.526,,false,true,99120,273025,372145,71,3,0,0,16.063576,2164758,true,0,0,2.725815,2267319,true,0,0
+1,1101,2201,FlowWeave PTO 跨路径对冲,true,301.142,1469.109,,true,true,81522,269628,351150,0,1,1,79536,16.016755,2320060,true,0,0,1.380264,2306812,true,1,2840
+2,1102,2202,FlowWeave PTO 跨路径对冲,true,286.926,1125.609,,true,true,81522,268138,349660,0,0,1,79536,17.665586,2163129,true,0,0,1.157468,2317071,true,0,0
+2,1102,2202,NoQ 默认恢复,true,3610.075,4045.902,,false,true,86052,268649,354701,62,0,0,0,16.957086,2148828,true,0,0,1.367754,2296715,true,0,0
+3,1103,2203,NoQ 默认恢复,true,3598.794,7334.176,,false,true,91860,272072,363932,67,3,0,0,15.832681,2150396,true,0,0,1.089874,2331471,true,0,0
+3,1103,2203,FlowWeave PTO 跨路径对冲,true,301.955,3626.801,,false,true,83109,271251,354360,68,2,1,80966,15.744886,2176325,true,0,0,1.263026,2318346,true,1,4247
+4,1104,2204,FlowWeave PTO 跨路径对冲,true,393.000,1220.459,,true,true,81522,268165,349687,0,0,1,79524,16.294545,2163342,true,0,0,10.085081,2211737,true,0,0
+4,1104,2204,NoQ 默认恢复,true,3578.410,4112.635,,false,true,88956,274540,363496,65,4,0,0,16.796034,2148833,true,0,0,10.838168,2202953,true,0,0
+5,1105,2205,NoQ 默认恢复,true,3474.062,4483.090,,false,true,86052,270174,356226,61,1,0,0,17.359173,2187875,true,0,0,1.382248,2312327,true,0,0
+5,1105,2205,FlowWeave PTO 跨路径对冲,true,289.525,1239.453,,true,true,80070,275380,355450,0,5,1,78107,16.567704,2153270,true,0,0,1.306097,2319776,true,2,8492

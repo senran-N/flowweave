@@ -9,6 +9,9 @@ case "$mode" in
     smoke)
         test_name="controlled_bad_network_lab"
         ;;
+    failover)
+        test_name="failover_five_seed_screening_lab"
+        ;;
     screen)
         test_name="scheduler_five_seed_screening_lab"
         ;;
@@ -16,7 +19,7 @@ case "$mode" in
         test_name="scheduler_long_duration_benchmark_lab"
         ;;
     *)
-        echo "用法：$0 [smoke|screen|long]" >&2
+        echo "用法：$0 [smoke|failover|screen|long]" >&2
         exit 2
         ;;
 esac

@@ -20,8 +20,8 @@ use crate::{
 };
 
 use super::util::{
-    ConnPair, ManyToManyRouting, Pair, SimpleFirewallRouting, client_config, min_opt,
-    server_config, subscribe,
+    ConnPair, Inbound, ManyToManyRouting, Pair, Routing, SimpleFirewallRouting, client_config,
+    min_opt, server_config, subscribe,
 };
 
 const MAX_PATHS: u32 = 3;
@@ -40,6 +40,525 @@ fn poll_path_stats_test_data(pair: &mut ConnPair) {
     let _transmit = pair
         .poll_transmit(Client, NonZeroUsize::MIN, &mut buf)
         .expect("queued stream data should produce a transmit");
+}
+
+fn with_port_offset(mut addr: SocketAddr, offset: u16) -> SocketAddr {
+    addr.set_port(addr.port().checked_add(offset).unwrap());
+    addr
+}
+
+fn pto_hedge_pair(enabled: bool) -> TestResult<(ConnPair, PathId)> {
+    let first_client_addr = Pair::CLIENT_ADDR;
+    let first_server_addr = Pair::SERVER_ADDR;
+    let second_client_addr = with_port_offset(first_client_addr, 1);
+    let second_server_addr = with_port_offset(first_server_addr, 1);
+    let routes = ManyToManyRouting::simple_symmetric(
+        [first_client_addr, second_client_addr],
+        [first_server_addr, second_server_addr],
+    );
+
+    let mut builder = ConnPair::builder()
+        .enable_multipath()
+        .disable_mtud_discovery()
+        .with_routes(routes.into());
+    builder
+        .client_transport_cfg
+        .cross_path_pto_reinjection(enabled)
+        .default_path_max_idle_timeout(Some(Duration::from_secs(60)));
+    builder
+        .server_transport_cfg
+        .cross_path_pto_reinjection(enabled)
+        .default_path_max_idle_timeout(Some(Duration::from_secs(60)));
+    let mut pair = builder.connect();
+
+    let backup = pair.open_path(
+        Client,
+        FourTuple {
+            local_ip: Some(second_client_addr.ip()),
+            remote: second_server_addr,
+        },
+        PathStatus::Backup,
+    )?;
+    pair.drive();
+
+    while pair.poll(Client).is_some() {}
+    while pair.poll(Server).is_some() {}
+
+    Ok((pair, backup))
+}
+
+fn blackhole_primary_path(pair: &mut ConnPair) -> (SocketAddr, SocketAddr) {
+    let Routing::ManyToMany(routes) = &mut pair.routes else {
+        panic!("PTO hedge tests require many-to-many routing");
+    };
+    let client_addr = routes.client_addr(0).unwrap();
+    let server_addr = routes.server_addr(0).unwrap();
+    routes.sim_client_migration(0, |addr| with_port_offset(addr, 100));
+    routes.sim_server_migration(0, |addr| with_port_offset(addr, 100));
+    (client_addr, server_addr)
+}
+
+fn restore_primary_path(pair: &mut ConnPair, client_addr: SocketAddr, server_addr: SocketAddr) {
+    let Routing::ManyToMany(routes) = &mut pair.routes else {
+        panic!("PTO hedge tests require many-to-many routing");
+    };
+    routes.sim_client_migration(0, |_| client_addr);
+    routes.sim_server_migration(0, |_| server_addr);
+}
+
+fn advance_client_to_next_wakeup(pair: &mut ConnPair) {
+    let next = pair
+        .client
+        .next_wakeup()
+        .expect("client should retain a loss-detection wakeup");
+    pair.time = next;
+    pair.drive_client();
+}
+
+fn advance_client_until_hedge(pair: &mut ConnPair, path: PathId) {
+    for _ in 0..32 {
+        if pair.path_stats(Client, path).unwrap().pto_hedges > 0 {
+            return;
+        }
+        advance_client_to_next_wakeup(pair);
+    }
+    panic!("PTO hedge did not fire within the deterministic step budget");
+}
+
+fn advance_client_until_probe(
+    pair: &mut ConnPair,
+    path: PathId,
+    initial_pings: u64,
+    initial_immediate_acks: u64,
+) {
+    for _ in 0..32 {
+        let frames = pair.path_stats(Client, path).unwrap().frame_tx;
+        if frames.ping > initial_pings || frames.immediate_ack > initial_immediate_acks {
+            return;
+        }
+        advance_client_to_next_wakeup(pair);
+    }
+    panic!("PTO probe did not fire within the deterministic step budget");
+}
+
+fn read_all_stream_data(pair: &mut ConnPair, stream: crate::StreamId) -> Vec<u8> {
+    assert_matches!(pair.streams(Server).accept(Dir::Uni), Some(id) if id == stream);
+    let mut recv = pair.recv_stream(Server, stream);
+    let mut chunks = recv.read(false).unwrap();
+    let mut data = Vec::new();
+    loop {
+        match chunks.next(usize::MAX) {
+            Ok(Some(chunk)) => data.extend_from_slice(&chunk.bytes),
+            Ok(None) => break,
+            Err(error) => panic!("failed to read reinjected stream: {error}"),
+        }
+    }
+    let _ = chunks.finalize();
+    data
+}
+
+fn write_stream_data(pair: &mut ConnPair, stream: crate::StreamId, data: &[u8]) {
+    assert_eq!(
+        pair.send_stream(Client, stream).write(data).unwrap(),
+        data.len()
+    );
+}
+
+const HEDGE_ACK_MESSAGE: &[u8] = b"duplicate ACK accounting";
+
+struct HedgedStreamCopies {
+    pair: ConnPair,
+    stream: crate::StreamId,
+    original: Vec<Inbound>,
+    hedge: Vec<Inbound>,
+    client_addr: SocketAddr,
+    server_addr: SocketAddr,
+}
+
+fn prepare_hedged_stream_copies() -> TestResult<HedgedStreamCopies> {
+    let (mut pair, _backup) = pto_hedge_pair(true)?;
+    let stream = pair.streams(Client).open(Dir::Uni).unwrap();
+    write_stream_data(&mut pair, stream, HEDGE_ACK_MESSAGE);
+    pair.send_stream(Client, stream).finish()?;
+
+    pair.drive_client();
+    let original = pair.server.inbound.drain(..).collect::<Vec<_>>();
+    assert!(
+        !original.is_empty(),
+        "original STREAM packet was not emitted"
+    );
+
+    let (client_addr, server_addr) = blackhole_primary_path(&mut pair);
+    advance_client_until_hedge(&mut pair, PathId::ZERO);
+    let hedge = pair.server.inbound.drain(..).collect::<Vec<_>>();
+    assert!(!hedge.is_empty(), "backup STREAM packet was not emitted");
+
+    Ok(HedgedStreamCopies {
+        pair,
+        stream,
+        original,
+        hedge,
+        client_addr,
+        server_addr,
+    })
+}
+
+fn deliver_inbound_group(pair: &mut ConnPair, packets: Vec<Inbound>) {
+    pair.server.inbound.extend(packets);
+    for _ in 0..8 {
+        pair.drive_server();
+        if !pair.client.inbound.is_empty() {
+            break;
+        }
+        let next = pair
+            .server
+            .next_wakeup()
+            .expect("server should retain an ACK wakeup");
+        pair.time = next;
+    }
+    assert!(
+        !pair.client.inbound.is_empty(),
+        "server did not acknowledge the delivered packet group"
+    );
+    pair.drive_client();
+    pair.server.inbound.clear();
+}
+
+fn count_finished_events(pair: &mut ConnPair, stream: crate::StreamId) -> usize {
+    let mut count = 0;
+    while let Some(event) = pair.poll(Client) {
+        if matches!(event, Event::Stream(StreamEvent::Finished { id }) if id == stream) {
+            count += 1;
+        }
+    }
+    count
+}
+
+fn capture_primary_path_ack(pair: &mut ConnPair) -> TestResult<Vec<Inbound>> {
+    pair.ping_path(Client, PathId::ZERO)?;
+    pair.drive_client();
+
+    for _ in 0..8 {
+        pair.drive_server();
+        if !pair.client.inbound.is_empty() {
+            break;
+        }
+        let next = pair
+            .server
+            .next_wakeup()
+            .expect("server should retain an ACK wakeup for the primary ping");
+        pair.time = next;
+    }
+
+    let ack = pair.client.inbound.drain(..).collect::<Vec<_>>();
+    assert!(
+        !ack.is_empty(),
+        "server did not acknowledge the primary ping"
+    );
+    pair.server.inbound.clear();
+    Ok(ack)
+}
+
+#[test]
+fn cross_path_pto_reinjection_is_disabled_by_default() -> TestResult {
+    let _guard = subscribe();
+    let (mut pair, backup) = pto_hedge_pair(false)?;
+    let backup_before = pair.path_stats(Client, backup).unwrap();
+
+    let stream = pair.streams(Client).open(Dir::Uni).unwrap();
+    write_stream_data(&mut pair, stream, b"default off");
+    pair.send_stream(Client, stream).finish()?;
+    blackhole_primary_path(&mut pair);
+    pair.drive_client();
+    let primary_before = pair.path_stats(Client, PathId::ZERO).unwrap();
+    advance_client_until_probe(
+        &mut pair,
+        PathId::ZERO,
+        primary_before.frame_tx.ping,
+        primary_before.frame_tx.immediate_ack,
+    );
+
+    let primary_after = pair.path_stats(Client, PathId::ZERO).unwrap();
+    let backup_after = pair.path_stats(Client, backup).unwrap();
+    assert_eq!(primary_after.pto_hedges, 0);
+    assert_eq!(primary_after.pto_hedge_bytes, 0);
+    assert_eq!(
+        backup_after.frame_tx.stream_retransmit_bytes,
+        backup_before.frame_tx.stream_retransmit_bytes
+    );
+    Ok(())
+}
+
+#[test]
+fn cross_path_pto_reinjection_requires_an_alternative_path() -> TestResult {
+    let _guard = subscribe();
+    let mut builder = ConnPair::builder()
+        .enable_multipath()
+        .disable_mtud_discovery();
+    builder
+        .client_transport_cfg
+        .cross_path_pto_reinjection(true);
+    let mut pair = builder.connect();
+
+    let stream = pair.streams(Client).open(Dir::Uni).unwrap();
+    write_stream_data(&mut pair, stream, b"only path");
+    pair.send_stream(Client, stream).finish()?;
+    pair.drive_client();
+    pair.server.inbound.clear();
+    let after_send = pair.path_stats(Client, PathId::ZERO).unwrap();
+    advance_client_until_probe(
+        &mut pair,
+        PathId::ZERO,
+        after_send.frame_tx.ping,
+        after_send.frame_tx.immediate_ack,
+    );
+
+    let after = pair.path_stats(Client, PathId::ZERO).unwrap();
+    assert_eq!(after.pto_hedges, 0);
+    assert_eq!(after.pto_hedge_bytes, 0);
+    Ok(())
+}
+
+#[test]
+fn first_data_pto_reinjects_stream_on_backup_path() -> TestResult {
+    let _guard = subscribe();
+    let (mut pair, backup) = pto_hedge_pair(true)?;
+    let backup_before = pair.path_stats(Client, backup).unwrap();
+    const MESSAGE: &[u8] = b"cross-path PTO hedge";
+
+    let stream = pair.streams(Client).open(Dir::Uni).unwrap();
+    write_stream_data(&mut pair, stream, MESSAGE);
+    pair.send_stream(Client, stream).finish()?;
+    let (client_addr, server_addr) = blackhole_primary_path(&mut pair);
+    pair.drive_client();
+    advance_client_until_hedge(&mut pair, PathId::ZERO);
+
+    let primary_after = pair.path_stats(Client, PathId::ZERO).unwrap();
+    let backup_after = pair.path_stats(Client, backup).unwrap();
+    assert_eq!(primary_after.pto_hedges, 1);
+    assert_eq!(primary_after.pto_hedge_bytes, MESSAGE.len() as u64);
+    assert!(
+        backup_after.frame_tx.stream_retransmit_bytes
+            > backup_before.frame_tx.stream_retransmit_bytes
+    );
+
+    restore_primary_path(&mut pair, client_addr, server_addr);
+    pair.drive();
+    assert_eq!(read_all_stream_data(&mut pair, stream), MESSAGE);
+    assert!(!pair.is_closed(Client));
+    assert!(!pair.is_closed(Server));
+    Ok(())
+}
+
+#[test]
+fn repeated_pto_does_not_start_another_hedge_episode() -> TestResult {
+    let _guard = subscribe();
+    let (mut pair, backup) = pto_hedge_pair(true)?;
+
+    let stream = pair.streams(Client).open(Dir::Uni).unwrap();
+    write_stream_data(&mut pair, stream, b"one hedge");
+    pair.send_stream(Client, stream).finish()?;
+    blackhole_primary_path(&mut pair);
+    pair.drive_client();
+    advance_client_until_hedge(&mut pair, PathId::ZERO);
+    pair.server.inbound.clear();
+
+    for _ in 0..6 {
+        advance_client_to_next_wakeup(&mut pair);
+        pair.server.inbound.clear();
+    }
+
+    assert_eq!(pair.path_stats(Client, PathId::ZERO).unwrap().pto_hedges, 1);
+    assert_eq!(pair.path_stats(Client, backup).unwrap().pto_hedges, 0);
+    Ok(())
+}
+
+#[test]
+fn acknowledged_primary_path_resumes_normal_data_scheduling() -> TestResult {
+    let _guard = subscribe();
+    let (mut pair, backup) = pto_hedge_pair(true)?;
+
+    let first = pair.streams(Client).open(Dir::Uni).unwrap();
+    write_stream_data(&mut pair, first, b"before recovery");
+    pair.send_stream(Client, first).finish()?;
+    let (client_addr, server_addr) = blackhole_primary_path(&mut pair);
+    pair.drive_client();
+    advance_client_until_hedge(&mut pair, PathId::ZERO);
+
+    restore_primary_path(&mut pair, client_addr, server_addr);
+    pair.ping_path(Client, PathId::ZERO)?;
+    pair.drive();
+    assert_eq!(read_all_stream_data(&mut pair, first), b"before recovery");
+
+    let primary_before = pair.path_stats(Client, PathId::ZERO).unwrap();
+    let backup_before = pair.path_stats(Client, backup).unwrap();
+    let second = pair.streams(Client).open(Dir::Uni).unwrap();
+    write_stream_data(&mut pair, second, b"after recovery");
+    pair.send_stream(Client, second).finish()?;
+    pair.drive();
+
+    let primary_after = pair.path_stats(Client, PathId::ZERO).unwrap();
+    let backup_after = pair.path_stats(Client, backup).unwrap();
+    assert!(primary_after.frame_tx.stream_fresh_bytes > primary_before.frame_tx.stream_fresh_bytes);
+    assert_eq!(
+        backup_after.frame_tx.stream_fresh_bytes,
+        backup_before.frame_tx.stream_fresh_bytes
+    );
+    assert_eq!(read_all_stream_data(&mut pair, second), b"after recovery");
+    assert_eq!(pair.stats(Client).frame_tx.path_abandon, 0);
+    Ok(())
+}
+
+#[test]
+fn stale_pre_hedge_ack_does_not_reactivate_suspected_path() -> TestResult {
+    let _guard = subscribe();
+    let (mut pair, backup) = pto_hedge_pair(true)?;
+    let stale_primary_ack = capture_primary_path_ack(&mut pair)?;
+
+    let first = pair.streams(Client).open(Dir::Uni).unwrap();
+    write_stream_data(&mut pair, first, b"trigger hedge");
+    pair.send_stream(Client, first).finish()?;
+    let (client_addr, server_addr) = blackhole_primary_path(&mut pair);
+    pair.drive_client();
+    advance_client_until_hedge(&mut pair, PathId::ZERO);
+    let hedge_packets = pair.server.inbound.drain(..).collect::<Vec<_>>();
+    assert!(!hedge_packets.is_empty());
+
+    restore_primary_path(&mut pair, client_addr, server_addr);
+    deliver_inbound_group(&mut pair, hedge_packets);
+    assert_eq!(count_finished_events(&mut pair, first), 1);
+    let _ = blackhole_primary_path(&mut pair);
+
+    pair.client.inbound.extend(stale_primary_ack);
+    pair.drive_client();
+    pair.server.inbound.clear();
+
+    let primary_before = pair.path_stats(Client, PathId::ZERO).unwrap();
+    let backup_before = pair.path_stats(Client, backup).unwrap();
+    let second = pair.streams(Client).open(Dir::Uni).unwrap();
+    write_stream_data(&mut pair, second, b"must stay on backup");
+    pair.drive_client();
+
+    let primary_after = pair.path_stats(Client, PathId::ZERO).unwrap();
+    let backup_after = pair.path_stats(Client, backup).unwrap();
+    assert_eq!(
+        primary_after.frame_tx.stream_fresh_bytes, primary_before.frame_tx.stream_fresh_bytes,
+        "an ACK for a pre-hedge packet must not reactivate the blackholed primary path"
+    );
+    assert!(
+        backup_after.frame_tx.stream_fresh_bytes > backup_before.frame_tx.stream_fresh_bytes,
+        "fresh data should remain on the backup until a post-hedge primary probe is acknowledged"
+    );
+    Ok(())
+}
+
+#[test]
+fn pto_reinjection_respects_backup_congestion_window() -> TestResult {
+    let _guard = subscribe();
+    let (mut pair, backup) = pto_hedge_pair(true)?;
+    let backup_before = pair.path_stats(Client, backup).unwrap();
+    let payload = vec![42; 1024 * 1024];
+
+    let stream = pair.streams(Client).open(Dir::Uni).unwrap();
+    assert_eq!(
+        pair.send_stream(Client, stream).write(&payload)?,
+        payload.len()
+    );
+    blackhole_primary_path(&mut pair);
+    pair.drive_client();
+    advance_client_until_hedge(&mut pair, PathId::ZERO);
+
+    let backup_after = pair.path_stats(Client, backup).unwrap();
+    let fresh =
+        backup_after.frame_tx.stream_fresh_bytes - backup_before.frame_tx.stream_fresh_bytes;
+    let retransmitted = backup_after.frame_tx.stream_retransmit_bytes
+        - backup_before.frame_tx.stream_retransmit_bytes;
+    assert!(fresh + retransmitted > 0);
+    assert!(
+        fresh + retransmitted <= backup_before.cwnd,
+        "backup sent {} STREAM bytes with a {} byte congestion window",
+        fresh + retransmitted,
+        backup_before.cwnd
+    );
+    Ok(())
+}
+
+#[test]
+fn fin_only_pto_reinjection_is_not_mistaken_for_zero_benefit() -> TestResult {
+    let _guard = subscribe();
+    let (mut pair, backup) = pto_hedge_pair(true)?;
+    let backup_before = pair.path_stats(Client, backup).unwrap();
+
+    let stream = pair.streams(Client).open(Dir::Uni).unwrap();
+    pair.send_stream(Client, stream).finish()?;
+    let (client_addr, server_addr) = blackhole_primary_path(&mut pair);
+    pair.drive_client();
+    advance_client_until_hedge(&mut pair, PathId::ZERO);
+
+    let primary_after = pair.path_stats(Client, PathId::ZERO).unwrap();
+    let backup_after = pair.path_stats(Client, backup).unwrap();
+    assert_eq!(primary_after.pto_hedges, 1);
+    assert_eq!(primary_after.pto_hedge_bytes, 0);
+    assert!(
+        backup_after.frame_tx.stream > backup_before.frame_tx.stream,
+        "the FIN-only STREAM frame must still be sent on the backup path"
+    );
+
+    restore_primary_path(&mut pair, client_addr, server_addr);
+    pair.drive();
+    assert!(read_all_stream_data(&mut pair, stream).is_empty());
+    assert_eq!(count_finished_events(&mut pair, stream), 1);
+    Ok(())
+}
+
+#[test]
+fn original_copy_ack_then_hedge_ack_only_finishes_stream_once() -> TestResult {
+    let _guard = subscribe();
+    let HedgedStreamCopies {
+        mut pair,
+        stream,
+        original,
+        hedge,
+        client_addr,
+        server_addr,
+    } = prepare_hedged_stream_copies()?;
+    restore_primary_path(&mut pair, client_addr, server_addr);
+
+    deliver_inbound_group(&mut pair, original);
+    assert_eq!(count_finished_events(&mut pair, stream), 1);
+
+    deliver_inbound_group(&mut pair, hedge);
+    assert_eq!(count_finished_events(&mut pair, stream), 0);
+    assert_eq!(pair.streams(Client).send_streams(), 0);
+    assert_eq!(read_all_stream_data(&mut pair, stream), HEDGE_ACK_MESSAGE);
+    assert!(!pair.is_closed(Client));
+    assert!(!pair.is_closed(Server));
+    Ok(())
+}
+
+#[test]
+fn hedge_ack_then_original_copy_ack_only_finishes_stream_once() -> TestResult {
+    let _guard = subscribe();
+    let HedgedStreamCopies {
+        mut pair,
+        stream,
+        original,
+        hedge,
+        client_addr,
+        server_addr,
+    } = prepare_hedged_stream_copies()?;
+    restore_primary_path(&mut pair, client_addr, server_addr);
+
+    deliver_inbound_group(&mut pair, hedge);
+    assert_eq!(count_finished_events(&mut pair, stream), 1);
+
+    deliver_inbound_group(&mut pair, original);
+    assert_eq!(count_finished_events(&mut pair, stream), 0);
+    assert_eq!(pair.streams(Client).send_streams(), 0);
+    assert_eq!(read_all_stream_data(&mut pair, stream), HEDGE_ACK_MESSAGE);
+    assert!(!pair.is_closed(Client));
+    assert!(!pair.is_closed(Server));
+    Ok(())
 }
 
 #[test]

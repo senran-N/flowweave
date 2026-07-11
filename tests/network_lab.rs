@@ -2,8 +2,8 @@ use std::{env, fmt::Write as _, fs, io, process::Command, time::Duration};
 
 use flowweave_lab::{
     DatagramMeasurement, FailoverReport, LabResult, MultipathScheduler, NetworkBenchmarkConfig,
-    NetworkBenchmarkReport, PathMode, SustainedBenchmarkConfig, run_blackhole_failover,
-    run_network_benchmark, run_sustained_network_benchmark,
+    NetworkBenchmarkReport, PathMode, PtoRecovery, SustainedBenchmarkConfig,
+    run_blackhole_failover, run_network_benchmark, run_sustained_network_benchmark,
 };
 
 const KIB: usize = 1024;
@@ -154,6 +154,15 @@ struct ScreeningObservation {
     report: NetworkBenchmarkReport,
 }
 
+struct RecoveryScreeningObservation {
+    round: usize,
+    seeds: NetemSeeds,
+    pto_recovery: PtoRecovery,
+    failover: FailoverReport,
+    normal: NetworkBenchmarkReport,
+    high_loss: NetworkBenchmarkReport,
+}
+
 struct NumericSummary {
     median: f64,
     p95: f64,
@@ -199,23 +208,28 @@ async fn controlled_bad_network_lab() -> LabResult<()> {
     let normal_line_one = LinkProfile::new("20ms", "0.1%", "20mbit");
     let normal_line_two = LinkProfile::new("80ms", "1%", "20mbit");
     let normal_multipath =
-        benchmark_multipath_candidates(normal_line_one, normal_line_two, 512 * KIB, 48).await?;
+        benchmark_recovery_candidates(normal_line_one, normal_line_two, 512 * KIB, 48).await?;
     for report in &normal_multipath {
         print_benchmark(report);
     }
 
     println!();
     println!("场景二：传输中主线路突然变为 100% 丢包");
-    for scheduler in MultipathScheduler::CANDIDATES {
+    for pto_recovery in PtoRecovery::CANDIDATES {
         apply_profiles(normal_line_one, normal_line_two, SEED_PAIRS[0])?;
-        let failover = run_blackhole_failover(scheduler, || {
-            replace_line_profile(
-                "1:1",
-                "10:",
-                LinkProfile::new("20ms", "100%", "20mbit"),
-                SEED_PAIRS[0].line_one,
-            )
-        })
+        let failover = run_blackhole_failover(
+            MultipathScheduler::NoqDefault,
+            pto_recovery,
+            || {
+                replace_line_profile(
+                    "1:1",
+                    "10:",
+                    LinkProfile::new("20ms", "100%", "20mbit"),
+                    SEED_PAIRS[0].line_one,
+                )
+            },
+            || replace_line_profile("1:1", "10:", normal_line_one, SEED_PAIRS[0].line_one),
+        )
         .await?;
         print_failover(&failover);
     }
@@ -241,7 +255,7 @@ async fn controlled_bad_network_lab() -> LabResult<()> {
     ))
     .await?;
     let loss_multipath =
-        benchmark_multipath_candidates(high_loss_line_one, high_loss_line_two, 384 * KIB, 72)
+        benchmark_recovery_candidates(high_loss_line_one, high_loss_line_two, 384 * KIB, 72)
             .await?;
     print_benchmark(&loss_line_one);
     print_benchmark(&loss_line_two);
@@ -282,6 +296,101 @@ async fn controlled_bad_network_lab() -> LabResult<()> {
     println!();
     println!("实验结论是当前调度矩阵的单轮基础测量，不是五种子最终结论，也不代表已经实现 FEC。");
     print_tc_statistics()?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "必须通过 scripts/run_netem_lab.sh failover 在隔离网络命名空间中运行"]
+async fn failover_five_seed_screening_lab() -> LabResult<()> {
+    ensure_isolated_network_namespace()?;
+
+    const RESULT_PATH: &str = "benchmark-results/2026-07-12-pto-hedge-screening.csv";
+    let normal_line_one = LinkProfile::new("20ms", "0.1%", "20mbit");
+    let normal_line_two = LinkProfile::new("80ms", "1%", "20mbit");
+    let high_loss_line_one = LinkProfile::new("20ms", "8%", "20mbit");
+    let high_loss_line_two = LinkProfile::new("40ms", "2%", "20mbit");
+
+    println!();
+    println!("FlowWeave / 织流：A 组 PTO 对冲五种子短筛");
+    println!("每轮比较同一 NoQ 版本的默认恢复与 PTO 跨路径对冲。");
+    println!("每位参赛者依次接受黑洞恢复、正常网络误触发和高丢包抗误判三道题。");
+
+    let mut observations = Vec::with_capacity(SEED_PAIRS.len() * PtoRecovery::CANDIDATES.len());
+    write_recovery_screening_csv(RESULT_PATH, &observations)?;
+
+    for (round_index, seeds) in SEED_PAIRS.iter().copied().enumerate() {
+        let round = round_index + 1;
+        let order = recovery_screening_order(round_index);
+        println!();
+        println!(
+            "第 {round} 轮：线路一种子 {}，线路二种子 {}；顺序 {}",
+            seeds.line_one,
+            seeds.line_two,
+            order
+                .iter()
+                .map(|candidate| candidate.description())
+                .collect::<Vec<_>>()
+                .join(" → "),
+        );
+
+        for pto_recovery in order {
+            apply_profiles(normal_line_one, normal_line_two, seeds)?;
+            let failover = run_blackhole_failover(
+                MultipathScheduler::NoqDefault,
+                pto_recovery,
+                || {
+                    replace_line_profile(
+                        "1:1",
+                        "10:",
+                        LinkProfile::new("20ms", "100%", "20mbit"),
+                        seeds.line_one,
+                    )
+                },
+                || replace_line_profile("1:1", "10:", normal_line_one, seeds.line_one),
+            )
+            .await?;
+
+            apply_profiles(normal_line_one, normal_line_two, seeds)?;
+            let normal = run_network_benchmark(
+                NetworkBenchmarkConfig::new(
+                    PathMode::MultipathAvailable,
+                    MultipathScheduler::NoqDefault,
+                    SCREENING_TRANSFER_SIZE,
+                    0,
+                )
+                .with_pto_recovery(pto_recovery),
+            )
+            .await?;
+
+            apply_profiles(high_loss_line_one, high_loss_line_two, seeds)?;
+            let high_loss = run_network_benchmark(
+                NetworkBenchmarkConfig::new(
+                    PathMode::MultipathAvailable,
+                    MultipathScheduler::NoqDefault,
+                    SCREENING_TRANSFER_SIZE,
+                    0,
+                )
+                .with_pto_recovery(pto_recovery),
+            )
+            .await?;
+
+            let observation = RecoveryScreeningObservation {
+                round,
+                seeds,
+                pto_recovery,
+                failover,
+                normal,
+                high_loss,
+            };
+            print_recovery_screening_observation(&observation);
+            observations.push(observation);
+            write_recovery_screening_csv(RESULT_PATH, &observations)?;
+        }
+    }
+
+    print_recovery_screening_summary(&observations);
+    println!();
+    println!("A 组短筛原始数据已写入 {RESULT_PATH}");
     Ok(())
 }
 
@@ -417,6 +526,194 @@ fn screening_order(round_index: usize) -> Vec<ScreeningParticipant> {
     order
 }
 
+fn recovery_screening_order(round_index: usize) -> Vec<PtoRecovery> {
+    let mut order = PtoRecovery::CANDIDATES.to_vec();
+    if round_index % 2 == 1 {
+        order.reverse();
+    }
+    order
+}
+
+fn print_recovery_screening_observation(observation: &RecoveryScreeningObservation) {
+    let failover_udp = observation
+        .failover
+        .primary_bytes_after_blackhole
+        .saturating_add(observation.failover.secondary_bytes_after_blackhole);
+    let failover_hedges = observation
+        .failover
+        .primary_pto_hedges
+        .saturating_add(observation.failover.secondary_pto_hedges);
+    let failover_hedge_bytes = observation
+        .failover
+        .primary_pto_hedge_bytes
+        .saturating_add(observation.failover.secondary_pto_hedge_bytes);
+
+    println!("- {}", observation.pto_recovery.description());
+    println!(
+        "  黑洞：恢复 {}，首字节 {}，整段完成 {}，UDP {} 字节，对冲 {} 次 / {} 字节，主路/备用路仍开放 {} / {}",
+        yes_or_no(observation.failover.recovered),
+        optional_milliseconds(observation.failover.recovery_time),
+        optional_milliseconds(observation.failover.completion_time),
+        failover_udp,
+        failover_hedges,
+        failover_hedge_bytes,
+        yes_or_no(observation.failover.primary_path_open),
+        yes_or_no(observation.failover.secondary_path_open),
+    );
+    println!(
+        "  正常：{:.2} Mbit/s，UDP {} 字节，对冲 {} 次 / {} 字节，两路仍开放 {}",
+        observation.normal.throughput_mbps,
+        observation.normal.total_udp_bytes_sent,
+        total_pto_hedges(&observation.normal),
+        total_pto_hedge_bytes(&observation.normal),
+        yes_or_no(observation.normal.all_configured_paths_open),
+    );
+    println!(
+        "  高丢包：{:.2} Mbit/s，UDP {} 字节，对冲 {} 次 / {} 字节，至少一路仍开放 {}",
+        observation.high_loss.throughput_mbps,
+        observation.high_loss.total_udp_bytes_sent,
+        total_pto_hedges(&observation.high_loss),
+        total_pto_hedge_bytes(&observation.high_loss),
+        yes_or_no(observation.high_loss.any_configured_path_open),
+    );
+}
+
+fn print_recovery_screening_summary(observations: &[RecoveryScreeningObservation]) {
+    let candidates: Vec<_> = observations
+        .iter()
+        .filter(|observation| observation.pto_recovery == PtoRecovery::CrossPathHedge)
+        .collect();
+    let recovered = candidates
+        .iter()
+        .filter(|observation| observation.failover.recovered)
+        .count();
+    let recovery_times: Vec<_> = candidates
+        .iter()
+        .filter_map(|observation| observation.failover.recovery_time)
+        .map(|duration| duration.as_secs_f64() * 1_000.0)
+        .collect();
+    let recovery_p95 = if recovery_times.is_empty() {
+        None
+    } else {
+        Some(NumericSummary::from_samples(recovery_times).p95)
+    };
+
+    let normal_throughput = NumericSummary::from_samples(candidates.iter().map(|candidate| {
+        candidate.normal.throughput_mbps
+            / matching_recovery_baseline(observations, candidate.round)
+                .normal
+                .throughput_mbps
+            * 100.0
+    }));
+    let normal_udp = NumericSummary::from_samples(candidates.iter().map(|candidate| {
+        candidate.normal.total_udp_bytes_sent as f64
+            / matching_recovery_baseline(observations, candidate.round)
+                .normal
+                .total_udp_bytes_sent as f64
+            * 100.0
+    }));
+    let high_loss_udp = NumericSummary::from_samples(candidates.iter().map(|candidate| {
+        candidate.high_loss.total_udp_bytes_sent as f64
+            / matching_recovery_baseline(observations, candidate.round)
+                .high_loss
+                .total_udp_bytes_sent as f64
+            * 100.0
+    }));
+    let normal_paths_open = candidates
+        .iter()
+        .filter(|candidate| candidate.normal.all_configured_paths_open)
+        .count();
+    let high_loss_paths_usable = candidates
+        .iter()
+        .filter(|candidate| candidate.high_loss.any_configured_path_open)
+        .count();
+    let hedge_episodes: u64 = candidates
+        .iter()
+        .map(|candidate| {
+            candidate
+                .failover
+                .primary_pto_hedges
+                .saturating_add(candidate.failover.secondary_pto_hedges)
+                .saturating_add(total_pto_hedges(&candidate.normal))
+                .saturating_add(total_pto_hedges(&candidate.high_loss))
+        })
+        .sum();
+    let hedge_bytes: u64 = candidates
+        .iter()
+        .map(|candidate| {
+            candidate
+                .failover
+                .primary_pto_hedge_bytes
+                .saturating_add(candidate.failover.secondary_pto_hedge_bytes)
+                .saturating_add(total_pto_hedge_bytes(&candidate.normal))
+                .saturating_add(total_pto_hedge_bytes(&candidate.high_loss))
+        })
+        .sum();
+
+    let blackhole_pass = recovered == SEED_PAIRS.len()
+        && recovery_p95.is_some_and(|milliseconds| milliseconds < 1_000.0);
+    let normal_pass = normal_paths_open == SEED_PAIRS.len()
+        && normal_throughput.median >= 95.0
+        && normal_udp.median <= 105.0;
+    let high_loss_pass =
+        high_loss_paths_usable == SEED_PAIRS.len() && high_loss_udp.median <= 125.0;
+
+    println!();
+    println!("A 组五种子汇总：");
+    println!(
+        "- 黑洞恢复：{recovered}/{}，P95 {}，门槛 {}",
+        SEED_PAIRS.len(),
+        recovery_p95
+            .map(|value| format!("{value:.2} ms"))
+            .unwrap_or_else(|| "无有效样本".to_owned()),
+        yes_or_no(blackhole_pass),
+    );
+    println!(
+        "- 正常网络：吞吐相对基线中位 {:.2}%，UDP 相对基线中位 {:.2}%，两路仍开放 {normal_paths_open}/{}，门槛 {}",
+        normal_throughput.median,
+        normal_udp.median,
+        SEED_PAIRS.len(),
+        yes_or_no(normal_pass),
+    );
+    println!(
+        "- 高丢包：UDP 相对基线中位 {:.2}%，至少一路仍开放 {high_loss_paths_usable}/{}，门槛 {}",
+        high_loss_udp.median,
+        SEED_PAIRS.len(),
+        yes_or_no(high_loss_pass),
+    );
+    println!("- 候选共触发 {hedge_episodes} 次对冲，入队 STREAM 载荷 {hedge_bytes} 字节。");
+    println!(
+        "- PTO 对冲是否同时通过三组短筛：{}",
+        yes_or_no(blackhole_pass && normal_pass && high_loss_pass),
+    );
+}
+
+fn matching_recovery_baseline(
+    observations: &[RecoveryScreeningObservation],
+    round: usize,
+) -> &RecoveryScreeningObservation {
+    observations
+        .iter()
+        .find(|observation| {
+            observation.round == round && observation.pto_recovery == PtoRecovery::Disabled
+        })
+        .expect("each completed recovery round must contain the NoQ baseline")
+}
+
+fn total_pto_hedges(report: &NetworkBenchmarkReport) -> u64 {
+    report
+        .line_one
+        .pto_hedges
+        .saturating_add(report.line_two.pto_hedges)
+}
+
+fn total_pto_hedge_bytes(report: &NetworkBenchmarkReport) -> u64 {
+    report
+        .line_one
+        .pto_hedge_bytes
+        .saturating_add(report.line_two.pto_hedge_bytes)
+}
+
 #[test]
 fn incomplete_round_does_not_invent_single_path_baseline() {
     assert!(
@@ -441,6 +738,31 @@ async fn benchmark_multipath_candidates(
                 transfer_size,
                 datagram_count,
             ))
+            .await?,
+        );
+    }
+    Ok(reports)
+}
+
+async fn benchmark_recovery_candidates(
+    line_one: LinkProfile,
+    line_two: LinkProfile,
+    transfer_size: usize,
+    datagram_count: usize,
+) -> LabResult<Vec<NetworkBenchmarkReport>> {
+    let mut reports = Vec::with_capacity(PtoRecovery::CANDIDATES.len());
+    for pto_recovery in PtoRecovery::CANDIDATES {
+        apply_profiles(line_one, line_two, SEED_PAIRS[0])?;
+        reports.push(
+            run_network_benchmark(
+                NetworkBenchmarkConfig::new(
+                    PathMode::MultipathAvailable,
+                    MultipathScheduler::NoqDefault,
+                    transfer_size,
+                    datagram_count,
+                )
+                .with_pto_recovery(pto_recovery),
+            )
             .await?,
         );
     }
@@ -552,6 +874,7 @@ fn print_benchmark(report: &NetworkBenchmarkReport) {
             "单路径，不参与调度比较"
         }
     );
+    println!("  PTO 恢复：{}", report.pto_recovery.description());
     println!(
         "  流传输：{} 字节，耗时 {:.2} ms，吞吐量 {:.2} Mbit/s",
         report.transfer_size,
@@ -560,19 +883,23 @@ fn print_benchmark(report: &NetworkBenchmarkReport) {
     );
     print_datagrams(&report.datagrams);
     println!(
-        "  线路一：首次流数据 {} 字节，重传流数据 {} 字节，UDP 总发送 {} 字节，丢失 {} 包，最终 RTT {:.2} ms",
+        "  线路一：首次流数据 {} 字节，重传流数据 {} 字节，UDP 总发送 {} 字节，丢失 {} 包，对冲 {} 次 / {} 字节，最终 RTT {:.2} ms",
         report.line_one.fresh_stream_bytes_sent,
         report.line_one.retransmitted_stream_bytes_sent,
         report.line_one.udp_bytes_sent,
         report.line_one.lost_packets,
+        report.line_one.pto_hedges,
+        report.line_one.pto_hedge_bytes,
         milliseconds(report.line_one.final_rtt)
     );
     println!(
-        "  线路二：首次流数据 {} 字节，重传流数据 {} 字节，UDP 总发送 {} 字节，丢失 {} 包，最终 RTT {:.2} ms",
+        "  线路二：首次流数据 {} 字节，重传流数据 {} 字节，UDP 总发送 {} 字节，丢失 {} 包，对冲 {} 次 / {} 字节，最终 RTT {:.2} ms",
         report.line_two.fresh_stream_bytes_sent,
         report.line_two.retransmitted_stream_bytes_sent,
         report.line_two.udp_bytes_sent,
         report.line_two.lost_packets,
+        report.line_two.pto_hedges,
+        report.line_two.pto_hedge_bytes,
         milliseconds(report.line_two.final_rtt)
     );
     println!(
@@ -586,6 +913,11 @@ fn print_benchmark(report: &NetworkBenchmarkReport) {
         report.peak_rss_kib as f64 / 1024.0,
     );
     if report.mode == PathMode::MultipathAvailable {
+        println!(
+            "  实验结束时至少一条 / 全部已配置路径仍开放：{} / {}",
+            yes_or_no(report.any_configured_path_open),
+            yes_or_no(report.all_configured_paths_open)
+        );
         println!(
             "  两条线路都承载至少 10% 首次应用数据：{}",
             yes_or_no(report.both_paths_carried_minimum_effective_share())
@@ -616,17 +948,27 @@ fn print_datagrams(datagrams: &DatagramMeasurement) {
 fn print_failover(report: &FailoverReport) {
     println!();
     println!("- 调度：{}", report.scheduler.description());
+    println!("- PTO 恢复：{}", report.pto_recovery.description());
     println!(
         "- 实验设置的单路径空闲判定上限：{:.0} ms",
         milliseconds(report.configured_path_idle_timeout)
     );
     println!("- 是否在原连接上恢复：{}", yes_or_no(report.recovered));
     match report.recovery_time {
-        Some(duration) => println!("- 从断路到恢复：{:.2} ms", milliseconds(duration)),
+        Some(duration) => println!(
+            "- 从断路到首个有效载荷字节恢复：{:.2} ms",
+            milliseconds(duration)
+        ),
         None => println!(
             "- 未恢复原因：{}",
             report.failure_reason.as_deref().unwrap_or("原因未知")
         ),
+    }
+    if let Some(duration) = report.completion_time {
+        println!(
+            "- 从断路到完整校验 256 KiB：{:.2} ms",
+            milliseconds(duration)
+        );
     }
     println!(
         "- 断路后主线路发送 {} 字节、丢失 {} 包",
@@ -635,6 +977,18 @@ fn print_failover(report: &FailoverReport) {
     println!(
         "- 断路后备用线路发送 {} 字节、丢失 {} 包",
         report.secondary_bytes_after_blackhole, report.secondary_lost_packets
+    );
+    println!(
+        "- 主路/备用路对冲：{} / {} 次，入队载荷 {} / {} 字节",
+        report.primary_pto_hedges,
+        report.secondary_pto_hedges,
+        report.primary_pto_hedge_bytes,
+        report.secondary_pto_hedge_bytes,
+    );
+    println!(
+        "- 观察结束时主路/备用路仍开放：{} / {}",
+        yes_or_no(report.primary_path_open),
+        yes_or_no(report.secondary_path_open),
     );
 }
 
@@ -828,7 +1182,7 @@ fn wire_ratio(report: &NetworkBenchmarkReport) -> f64 {
 
 fn write_benchmark_csv(path: &str, observations: &[ScreeningObservation]) -> LabResult<()> {
     let mut csv = String::from(
-        "scenario,round,line_one_seed,line_two_seed,participant,throughput_mbps,transfer_ms,line_one_fresh_bytes,line_two_fresh_bytes,line_one_retransmit_bytes,line_two_retransmit_bytes,total_udp_bytes,wire_ratio,minimum_effective_share_percent,best_single_ratio,cpu_time_ms,cpu_utilization_percent,peak_rss_kib\n",
+        "scenario,round,line_one_seed,line_two_seed,participant,pto_recovery,throughput_mbps,transfer_ms,line_one_fresh_bytes,line_two_fresh_bytes,line_one_retransmit_bytes,line_two_retransmit_bytes,total_udp_bytes,wire_ratio,minimum_effective_share_percent,best_single_ratio,cpu_time_ms,cpu_utilization_percent,peak_rss_kib,line_one_pto_hedges,line_two_pto_hedges,line_one_pto_hedge_bytes,line_two_pto_hedge_bytes,any_configured_path_open,all_configured_paths_open\n",
     );
 
     for observation in observations {
@@ -843,12 +1197,13 @@ fn write_benchmark_csv(path: &str, observations: &[ScreeningObservation]) -> Lab
         .unwrap_or_default();
         writeln!(
             csv,
-            "{},{},{},{},{},{:.6},{:.3},{},{},{},{},{},{:.6},{:.6},{},{:.3},{:.6},{}",
+            "{},{},{},{},{},{},{:.6},{:.3},{},{},{},{},{},{:.6},{:.6},{},{:.3},{:.6},{},{},{},{},{},{},{}",
             observation.scenario.description(),
             observation.round,
             observation.seeds.line_one,
             observation.seeds.line_two,
             observation.participant.description(),
+            observation.report.pto_recovery.description(),
             observation.report.throughput_mbps,
             milliseconds(observation.report.transfer_duration),
             observation.report.line_one.fresh_stream_bytes_sent,
@@ -862,6 +1217,91 @@ fn write_benchmark_csv(path: &str, observations: &[ScreeningObservation]) -> Lab
             milliseconds(observation.report.cpu_time),
             observation.report.cpu_utilization_percent,
             observation.report.peak_rss_kib,
+            observation.report.line_one.pto_hedges,
+            observation.report.line_two.pto_hedges,
+            observation.report.line_one.pto_hedge_bytes,
+            observation.report.line_two.pto_hedge_bytes,
+            observation.report.any_configured_path_open,
+            observation.report.all_configured_paths_open,
+        )?;
+    }
+
+    fs::create_dir_all("benchmark-results")?;
+    fs::write(path, csv)?;
+    Ok(())
+}
+
+fn write_recovery_screening_csv(
+    path: &str,
+    observations: &[RecoveryScreeningObservation],
+) -> LabResult<()> {
+    let mut csv = String::from(
+        "round,line_one_seed,line_two_seed,recovery,recovered,recovery_ms,completion_ms,failure_reason,primary_path_open,secondary_path_open,failover_primary_udp_bytes,failover_secondary_udp_bytes,failover_total_udp_bytes,primary_lost_packets,secondary_lost_packets,failover_pto_hedges,failover_pto_hedge_bytes,normal_throughput_mbps,normal_total_udp_bytes,normal_all_paths_open,normal_pto_hedges,normal_pto_hedge_bytes,high_loss_throughput_mbps,high_loss_total_udp_bytes,high_loss_any_path_open,high_loss_pto_hedges,high_loss_pto_hedge_bytes\n",
+    );
+
+    for observation in observations {
+        let failover_total_udp = observation
+            .failover
+            .primary_bytes_after_blackhole
+            .saturating_add(observation.failover.secondary_bytes_after_blackhole);
+        let failover_hedges = observation
+            .failover
+            .primary_pto_hedges
+            .saturating_add(observation.failover.secondary_pto_hedges);
+        let failover_hedge_bytes = observation
+            .failover
+            .primary_pto_hedge_bytes
+            .saturating_add(observation.failover.secondary_pto_hedge_bytes);
+        let recovery_ms = observation
+            .failover
+            .recovery_time
+            .map(milliseconds)
+            .map(|value| format!("{value:.3}"))
+            .unwrap_or_default();
+        let completion_ms = observation
+            .failover
+            .completion_time
+            .map(milliseconds)
+            .map(|value| format!("{value:.3}"))
+            .unwrap_or_default();
+        let failure_reason = observation
+            .failover
+            .failure_reason
+            .as_deref()
+            .unwrap_or_default()
+            .replace(',', ";")
+            .replace(['\n', '\r'], " ");
+
+        writeln!(
+            csv,
+            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{:.6},{},{},{},{},{:.6},{},{},{},{}",
+            observation.round,
+            observation.seeds.line_one,
+            observation.seeds.line_two,
+            observation.pto_recovery.description(),
+            observation.failover.recovered,
+            recovery_ms,
+            completion_ms,
+            failure_reason,
+            observation.failover.primary_path_open,
+            observation.failover.secondary_path_open,
+            observation.failover.primary_bytes_after_blackhole,
+            observation.failover.secondary_bytes_after_blackhole,
+            failover_total_udp,
+            observation.failover.primary_lost_packets,
+            observation.failover.secondary_lost_packets,
+            failover_hedges,
+            failover_hedge_bytes,
+            observation.normal.throughput_mbps,
+            observation.normal.total_udp_bytes_sent,
+            observation.normal.all_configured_paths_open,
+            total_pto_hedges(&observation.normal),
+            total_pto_hedge_bytes(&observation.normal),
+            observation.high_loss.throughput_mbps,
+            observation.high_loss.total_udp_bytes_sent,
+            observation.high_loss.any_configured_path_open,
+            total_pto_hedges(&observation.high_loss),
+            total_pto_hedge_bytes(&observation.high_loss),
         )?;
     }
 
