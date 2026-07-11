@@ -225,6 +225,7 @@ name = "flowweave-lab"
 version = "0.1.0"
 dependencies = [
  "noq",
+ "noq-proto",
  "rcgen",
  "tokio",
 ]

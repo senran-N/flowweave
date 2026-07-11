@@ -1,8 +1,8 @@
 use std::{env, fs, io, process::Command, time::Duration};
 
 use flowweave_lab::{
-    DatagramMeasurement, FailoverReport, LabResult, NetworkBenchmarkConfig, NetworkBenchmarkReport,
-    PathMode, run_blackhole_failover, run_network_benchmark,
+    DatagramMeasurement, FailoverReport, LabResult, MultipathScheduler, NetworkBenchmarkConfig,
+    NetworkBenchmarkReport, PathMode, run_blackhole_failover, run_network_benchmark,
 };
 
 const KIB: usize = 1024;
@@ -32,29 +32,24 @@ async fn controlled_bad_network_lab() -> LabResult<()> {
 
     println!();
     println!("场景一：两条质量不同、但都可用的线路");
-    apply_profiles(
-        LinkProfile::new("20ms", "0.1%", "20mbit"),
-        LinkProfile::new("80ms", "1%", "20mbit"),
-    )?;
-    let normal_multipath = run_network_benchmark(NetworkBenchmarkConfig::new(
-        PathMode::MultipathAvailable,
-        512 * KIB,
-        48,
-    ))
-    .await?;
-    print_benchmark(&normal_multipath);
+    let normal_line_one = LinkProfile::new("20ms", "0.1%", "20mbit");
+    let normal_line_two = LinkProfile::new("80ms", "1%", "20mbit");
+    let normal_multipath =
+        benchmark_multipath_candidates(normal_line_one, normal_line_two, 512 * KIB, 48).await?;
+    for report in &normal_multipath {
+        print_benchmark(report);
+    }
 
     println!();
     println!("场景二：传输中主线路突然变为 100% 丢包");
-    apply_profiles(
-        LinkProfile::new("20ms", "0.1%", "20mbit"),
-        LinkProfile::new("80ms", "1%", "20mbit"),
-    )?;
-    let failover = run_blackhole_failover(|| {
-        replace_line_profile("1:1", "10:", LinkProfile::new("20ms", "100%", "20mbit"))
-    })
-    .await?;
-    print_failover(&failover);
+    for scheduler in MultipathScheduler::CANDIDATES {
+        apply_profiles(normal_line_one, normal_line_two)?;
+        let failover = run_blackhole_failover(scheduler, || {
+            replace_line_profile("1:1", "10:", LinkProfile::new("20ms", "100%", "20mbit"))
+        })
+        .await?;
+        print_failover(&failover);
+    }
 
     println!();
     println!("场景三：线路一丢包 8%，线路二丢包 2%");
@@ -63,6 +58,7 @@ async fn controlled_bad_network_lab() -> LabResult<()> {
     apply_profiles(high_loss_line_one, high_loss_line_two)?;
     let loss_line_one = run_network_benchmark(NetworkBenchmarkConfig::new(
         PathMode::LineOneOnly,
+        MultipathScheduler::NoqDefault,
         384 * KIB,
         72,
     ))
@@ -70,58 +66,76 @@ async fn controlled_bad_network_lab() -> LabResult<()> {
     apply_profiles(high_loss_line_one, high_loss_line_two)?;
     let loss_line_two = run_network_benchmark(NetworkBenchmarkConfig::new(
         PathMode::LineTwoOnly,
+        MultipathScheduler::NoqDefault,
         384 * KIB,
         72,
     ))
     .await?;
-    apply_profiles(high_loss_line_one, high_loss_line_two)?;
-    let loss_multipath = run_network_benchmark(NetworkBenchmarkConfig::new(
-        PathMode::MultipathAvailable,
-        384 * KIB,
-        72,
-    ))
-    .await?;
+    let loss_multipath =
+        benchmark_multipath_candidates(high_loss_line_one, high_loss_line_two, 384 * KIB, 72)
+            .await?;
     print_benchmark(&loss_line_one);
     print_benchmark(&loss_line_two);
-    print_benchmark(&loss_multipath);
-    print_comparison(
-        "高丢包吞吐量",
-        &loss_line_one,
-        &loss_line_two,
-        &loss_multipath,
-    );
+    for report in &loss_multipath {
+        print_benchmark(report);
+        print_comparison("高丢包吞吐量", &loss_line_one, &loss_line_two, report);
+    }
 
     println!();
     println!("场景四：8 Mbit/s 低延迟线路 + 25 Mbit/s 高延迟线路");
     let slow_low_latency = LinkProfile::new("15ms", "0%", "8mbit");
     let fast_high_latency = LinkProfile::new("50ms", "0%", "25mbit");
     apply_profiles(slow_low_latency, fast_high_latency)?;
-    let speed_line_one =
-        run_network_benchmark(NetworkBenchmarkConfig::new(PathMode::LineOneOnly, MIB, 0)).await?;
-    apply_profiles(slow_low_latency, fast_high_latency)?;
-    let speed_line_two =
-        run_network_benchmark(NetworkBenchmarkConfig::new(PathMode::LineTwoOnly, MIB, 0)).await?;
-    apply_profiles(slow_low_latency, fast_high_latency)?;
-    let speed_multipath = run_network_benchmark(NetworkBenchmarkConfig::new(
-        PathMode::MultipathAvailable,
+    let speed_line_one = run_network_benchmark(NetworkBenchmarkConfig::new(
+        PathMode::LineOneOnly,
+        MultipathScheduler::NoqDefault,
         MIB,
         0,
     ))
     .await?;
+    apply_profiles(slow_low_latency, fast_high_latency)?;
+    let speed_line_two = run_network_benchmark(NetworkBenchmarkConfig::new(
+        PathMode::LineTwoOnly,
+        MultipathScheduler::NoqDefault,
+        MIB,
+        0,
+    ))
+    .await?;
+    let speed_multipath =
+        benchmark_multipath_candidates(slow_low_latency, fast_high_latency, MIB, 0).await?;
     print_benchmark(&speed_line_one);
     print_benchmark(&speed_line_two);
-    print_benchmark(&speed_multipath);
-    print_comparison(
-        "异构线路吞吐量",
-        &speed_line_one,
-        &speed_line_two,
-        &speed_multipath,
-    );
+    for report in &speed_multipath {
+        print_benchmark(report);
+        print_comparison("异构线路吞吐量", &speed_line_one, &speed_line_two, report);
+    }
 
     println!();
-    println!("实验结论只代表 NoQ 1.0.1 的当前默认行为，不代表我们已经实现聚合或 FEC。");
+    println!("实验结论是四种候选调度的单轮初筛，不是五种子最终结论，也不代表已经实现 FEC。");
     print_tc_statistics()?;
     Ok(())
+}
+
+async fn benchmark_multipath_candidates(
+    line_one: LinkProfile,
+    line_two: LinkProfile,
+    transfer_size: usize,
+    datagram_count: usize,
+) -> LabResult<Vec<NetworkBenchmarkReport>> {
+    let mut reports = Vec::with_capacity(MultipathScheduler::CANDIDATES.len());
+    for scheduler in MultipathScheduler::CANDIDATES {
+        apply_profiles(line_one, line_two)?;
+        reports.push(
+            run_network_benchmark(NetworkBenchmarkConfig::new(
+                PathMode::MultipathAvailable,
+                scheduler,
+                transfer_size,
+                datagram_count,
+            ))
+            .await?,
+        );
+    }
+    Ok(reports)
 }
 
 fn ensure_isolated_network_namespace() -> LabResult<()> {
@@ -217,6 +231,14 @@ fn print_benchmark(report: &NetworkBenchmarkReport) {
     println!();
     println!("- 模式：{}", report.mode.description());
     println!(
+        "  调度：{}",
+        if report.mode == PathMode::MultipathAvailable {
+            report.scheduler.description()
+        } else {
+            "单路径，不参与调度比较"
+        }
+    );
+    println!(
         "  流传输：{} 字节，耗时 {:.2} ms，吞吐量 {:.2} Mbit/s",
         report.transfer_size,
         milliseconds(report.transfer_duration),
@@ -268,6 +290,8 @@ fn print_datagrams(datagrams: &DatagramMeasurement) {
 }
 
 fn print_failover(report: &FailoverReport) {
+    println!();
+    println!("- 调度：{}", report.scheduler.description());
     println!(
         "- 实验设置的单路径空闲判定上限：{:.0} ms",
         milliseconds(report.configured_path_idle_timeout)
@@ -312,8 +336,9 @@ fn print_comparison(
 
     println!();
     println!(
-        "{name}对照：最佳单线路 {:.2} Mbit/s，默认多路径 {:.2} Mbit/s（{:.1}%）",
+        "{name}对照：最佳单线路 {:.2} Mbit/s，{} {:.2} Mbit/s（{:.1}%）",
         best_single,
+        multipath.scheduler.description(),
         multipath.throughput_mbps,
         ratio * 100.0
     );

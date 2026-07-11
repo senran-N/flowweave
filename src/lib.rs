@@ -17,6 +17,9 @@ use tokio::{
     time::{sleep, timeout},
 };
 
+mod scheduler;
+pub use scheduler::MultipathScheduler;
+
 pub type LabError = Box<dyn Error + Send + Sync + 'static>;
 pub type LabResult<T> = Result<T, LabError>;
 
@@ -60,7 +63,7 @@ impl PathMode {
         match self {
             Self::LineOneOnly => "仅线路一",
             Self::LineTwoOnly => "仅线路二",
-            Self::MultipathAvailable => "NoQ 默认多路径",
+            Self::MultipathAvailable => "MPQUIC 双路径",
         }
     }
 }
@@ -68,14 +71,21 @@ impl PathMode {
 #[derive(Debug, Clone, Copy)]
 pub struct NetworkBenchmarkConfig {
     pub mode: PathMode,
+    pub scheduler: MultipathScheduler,
     pub transfer_size: usize,
     pub datagram_count: usize,
 }
 
 impl NetworkBenchmarkConfig {
-    pub fn new(mode: PathMode, transfer_size: usize, datagram_count: usize) -> Self {
+    pub fn new(
+        mode: PathMode,
+        scheduler: MultipathScheduler,
+        transfer_size: usize,
+        datagram_count: usize,
+    ) -> Self {
         Self {
             mode,
+            scheduler,
             transfer_size,
             datagram_count,
         }
@@ -129,6 +139,7 @@ impl DatagramMeasurement {
 #[derive(Debug, Clone)]
 pub struct NetworkBenchmarkReport {
     pub mode: PathMode,
+    pub scheduler: MultipathScheduler,
     pub multipath_negotiated: bool,
     pub transfer_size: usize,
     pub transfer_duration: Duration,
@@ -152,6 +163,7 @@ impl NetworkBenchmarkReport {
 
 #[derive(Debug, Clone)]
 pub struct FailoverReport {
+    pub scheduler: MultipathScheduler,
     pub recovered: bool,
     pub recovery_time: Option<Duration>,
     pub failure_reason: Option<String>,
@@ -214,7 +226,7 @@ impl RunningLab {
 }
 
 pub async fn run_basic_lab() -> LabResult<BasicLabReport> {
-    let lab = start_connection(Ipv4Addr::UNSPECIFIED, None).await?;
+    let lab = start_connection(Ipv4Addr::UNSPECIFIED, None, MultipathScheduler::NoqDefault).await?;
 
     let report_result: LabResult<BasicLabReport> = async {
         let connection = &lab.connection;
@@ -296,7 +308,8 @@ pub async fn run_network_benchmark(
         PathMode::LineTwoOnly => LINE_TWO_IP,
         PathMode::MultipathAvailable => Ipv4Addr::UNSPECIFIED,
     };
-    let lab = start_connection(client_ip, Some(NETWORK_PATH_IDLE_TIMEOUT)).await?;
+    let lab =
+        start_connection(client_ip, Some(NETWORK_PATH_IDLE_TIMEOUT), config.scheduler).await?;
 
     let secondary = if config.mode == PathMode::MultipathAvailable {
         Some(lab.open_second_path(PathStatus::Available).await?)
@@ -337,6 +350,7 @@ pub async fn run_network_benchmark(
 
         Ok(NetworkBenchmarkReport {
             mode: config.mode,
+            scheduler: config.scheduler,
             multipath_negotiated: lab.connection.is_multipath_enabled(),
             transfer_size: config.transfer_size,
             transfer_duration,
@@ -356,11 +370,19 @@ pub async fn run_network_benchmark(
     Ok(report)
 }
 
-pub async fn run_blackhole_failover<F>(activate_blackhole: F) -> LabResult<FailoverReport>
+pub async fn run_blackhole_failover<F>(
+    scheduler: MultipathScheduler,
+    activate_blackhole: F,
+) -> LabResult<FailoverReport>
 where
     F: FnOnce() -> LabResult<()>,
 {
-    let lab = start_connection(Ipv4Addr::UNSPECIFIED, Some(NETWORK_PATH_IDLE_TIMEOUT)).await?;
+    let lab = start_connection(
+        Ipv4Addr::UNSPECIFIED,
+        Some(NETWORK_PATH_IDLE_TIMEOUT),
+        scheduler,
+    )
+    .await?;
     let secondary = lab.open_second_path(PathStatus::Backup).await?;
     sleep(Duration::from_millis(250)).await;
 
@@ -397,6 +419,7 @@ where
         let secondary_delta = path_delta(secondary_before, secondary_after);
 
         Ok(FailoverReport {
+            scheduler,
             recovered,
             recovery_time,
             failure_reason,
@@ -418,8 +441,9 @@ where
 async fn start_connection(
     client_ip: Ipv4Addr,
     path_idle_timeout: Option<Duration>,
+    scheduler: MultipathScheduler,
 ) -> LabResult<RunningLab> {
-    let (server_config, client_config) = make_configs(path_idle_timeout)?;
+    let (server_config, client_config) = make_configs(path_idle_timeout, scheduler)?;
     let server_endpoint =
         Endpoint::server(server_config, SocketAddr::new(IpAddr::V4(LINE_ONE_IP), 0))?;
     let server_addr = server_endpoint.local_addr()?;
@@ -465,7 +489,10 @@ async fn start_connection(
     })
 }
 
-fn make_configs(path_idle_timeout: Option<Duration>) -> LabResult<(ServerConfig, ClientConfig)> {
+fn make_configs(
+    path_idle_timeout: Option<Duration>,
+    scheduler: MultipathScheduler,
+) -> LabResult<(ServerConfig, ClientConfig)> {
     let generated = rcgen::generate_simple_self_signed(vec!["localhost".into()])?;
     let certificate = CertificateDer::from(generated.cert);
     let private_key = PrivatePkcs8KeyDer::from(generated.signing_key.serialize_der());
@@ -474,21 +501,26 @@ fn make_configs(path_idle_timeout: Option<Duration>) -> LabResult<(ServerConfig,
         ServerConfig::with_single_cert(vec![certificate.clone()], private_key.into())?;
     let server_transport = Arc::get_mut(&mut server_config.transport)
         .ok_or_else(|| other_error("无法配置服务端传输参数"))?;
-    configure_transport(server_transport, path_idle_timeout);
+    configure_transport(server_transport, path_idle_timeout, scheduler);
 
     let mut roots = noq::rustls::RootCertStore::empty();
     roots.add(certificate)?;
     let mut client_config = ClientConfig::with_root_certificates(Arc::new(roots))?;
     let mut client_transport = TransportConfig::default();
-    configure_transport(&mut client_transport, path_idle_timeout);
+    configure_transport(&mut client_transport, path_idle_timeout, scheduler);
     client_config.transport_config(Arc::new(client_transport));
 
     Ok((server_config, client_config))
 }
 
-fn configure_transport(transport: &mut TransportConfig, path_idle_timeout: Option<Duration>) {
+fn configure_transport(
+    transport: &mut TransportConfig,
+    path_idle_timeout: Option<Duration>,
+    scheduler: MultipathScheduler,
+) {
     transport
         .max_concurrent_multipath_paths(2)
+        .multipath_scheduling_policy(scheduler.to_noq())
         .default_path_max_idle_timeout(path_idle_timeout)
         .default_path_keep_alive_interval(Some(Duration::from_millis(200)))
         .datagram_receive_buffer_size(Some(1024 * 1024))
@@ -891,14 +923,28 @@ mod tests {
 
     #[test]
     fn unsafe_network_benchmark_sizes_are_rejected() {
-        let empty = NetworkBenchmarkConfig::new(PathMode::LineOneOnly, 0, 1);
+        let empty = NetworkBenchmarkConfig::new(
+            PathMode::LineOneOnly,
+            MultipathScheduler::NoqDefault,
+            0,
+            1,
+        );
         assert!(empty.validate().is_err());
 
-        let oversized = NetworkBenchmarkConfig::new(PathMode::LineOneOnly, MAX_PAYLOAD_SIZE + 1, 1);
+        let oversized = NetworkBenchmarkConfig::new(
+            PathMode::LineOneOnly,
+            MultipathScheduler::NoqDefault,
+            MAX_PAYLOAD_SIZE + 1,
+            1,
+        );
         assert!(oversized.validate().is_err());
 
-        let too_many_probes =
-            NetworkBenchmarkConfig::new(PathMode::LineOneOnly, 1024, MAX_DATAGRAM_PROBES + 1);
+        let too_many_probes = NetworkBenchmarkConfig::new(
+            PathMode::LineOneOnly,
+            MultipathScheduler::NoqDefault,
+            1024,
+            MAX_DATAGRAM_PROBES + 1,
+        );
         assert!(too_many_probes.validate().is_err());
     }
 }

@@ -7,6 +7,7 @@ publish = false
 
 [dependencies]
 noq = { version = "=1.0.1", default-features = false, features = ["runtime-tokio", "rustls", "ring"] }
+noq-proto = { version = "=1.0.1", default-features = false }
 rcgen = { version = "=0.14.5", default-features = false, features = ["crypto", "ring"] }
 tokio = { version = "=1.47.1", features = ["macros", "rt-multi-thread", "sync", "time"] }
 
