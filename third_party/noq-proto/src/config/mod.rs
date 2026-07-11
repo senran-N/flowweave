@@ -31,9 +31,7 @@ mod transport;
 
 #[cfg(feature = "qlog")]
 pub use qlog::{QlogConfig, QlogFactory, QlogFileFactory};
-pub use transport::{
-    AckFrequencyConfig, IdleTimeout, MtuDiscoveryConfig, MultipathSchedulingPolicy, TransportConfig,
-};
+pub use transport::{AckFrequencyConfig, IdleTimeout, MtuDiscoveryConfig, TransportConfig};
 
 /// Global configuration for the endpoint, affecting all connections
 ///

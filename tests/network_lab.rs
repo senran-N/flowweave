@@ -93,12 +93,10 @@ enum ScreeningParticipant {
 }
 
 impl ScreeningParticipant {
-    const ALL: [Self; 5] = [
+    const ALL: [Self; 3] = [
         Self::LineOne,
         Self::LineTwo,
         Self::Multipath(MultipathScheduler::NoqDefault),
-        Self::Multipath(MultipathScheduler::RoundRobin),
-        Self::Multipath(MultipathScheduler::EarliestDelivery),
     ];
 
     fn description(self) -> &'static str {
@@ -282,7 +280,7 @@ async fn controlled_bad_network_lab() -> LabResult<()> {
     }
 
     println!();
-    println!("实验结论是四种候选调度的单轮初筛，不是五种子最终结论，也不代表已经实现 FEC。");
+    println!("实验结论是当前调度矩阵的单轮基础测量，不是五种子最终结论，也不代表已经实现 FEC。");
     print_tc_statistics()?;
     Ok(())
 }
@@ -292,6 +290,7 @@ async fn controlled_bad_network_lab() -> LabResult<()> {
 async fn scheduler_five_seed_screening_lab() -> LabResult<()> {
     ensure_isolated_network_namespace()?;
 
+    const RESULT_PATH: &str = "benchmark-results/2026-07-11-scheduler-screening-survivors.csv";
     println!();
     println!("FlowWeave / 织流：多路径调度五种子筛选");
     println!("这是 2 MiB 候选筛选，不是 BENCHMARK.md 规定的 20 秒/64 MiB 最终验收。");
@@ -339,12 +338,9 @@ async fn scheduler_five_seed_screening_lab() -> LabResult<()> {
     }
 
     print_screening_summary(&observations);
-    write_benchmark_csv(
-        "benchmark-results/2026-07-11-scheduler-screening-survivors.csv",
-        &observations,
-    )?;
+    write_benchmark_csv(RESULT_PATH, &observations)?;
     println!();
-    println!("原始数据已写入 benchmark-results/2026-07-11-scheduler-screening-survivors.csv");
+    println!("原始数据已写入 {RESULT_PATH}");
     Ok(())
 }
 
@@ -353,7 +349,7 @@ async fn scheduler_five_seed_screening_lab() -> LabResult<()> {
 async fn scheduler_long_duration_benchmark_lab() -> LabResult<()> {
     ensure_isolated_network_namespace()?;
 
-    const RESULT_PATH: &str = "benchmark-results/2026-07-11-scheduler-long.csv";
+    const RESULT_PATH: &str = "benchmark-results/2026-07-11-scheduler-long-survivors.csv";
     println!();
     println!("FlowWeave / 织流：B 组长时聚合复赛");
     println!(
@@ -361,7 +357,7 @@ async fn scheduler_long_duration_benchmark_lab() -> LabResult<()> {
         LONG_WARMUP_DURATION.as_secs(),
         LONG_MEASUREMENT_DURATION.as_secs(),
     );
-    println!("参赛者：两条单路、NoQ 默认、轮询、预计最早送达。");
+    println!("参赛者：两条单路、NoQ 默认；当前没有通过筛选的自定义候选。");
 
     let mut observations = Vec::with_capacity(
         AggregationScenario::ALL.len() * SEED_PAIRS.len() * ScreeningParticipant::ALL.len(),

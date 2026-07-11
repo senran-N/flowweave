@@ -11,8 +11,8 @@ use tracing::info;
 
 use crate::{
     ClientConfig, ConnectionId, ConnectionIdGenerator, Endpoint, EndpointConfig, FourTuple,
-    LOCAL_CID_COUNT, MultipathSchedulingPolicy, NetworkChangeHint, PathId, PathStatus,
-    RandomConnectionIdGenerator, ServerConfig, Side::*, TransportConfig, cid_queue::CidQueue,
+    LOCAL_CID_COUNT, NetworkChangeHint, PathId, PathStatus, RandomConnectionIdGenerator,
+    ServerConfig, Side::*, TransportConfig, cid_queue::CidQueue,
 };
 use crate::{
     ClosePathError, Dir, Event, PathAbandonReason, PathEvent, StreamEvent, TransportErrorCode,
@@ -26,30 +26,7 @@ use super::util::{
 
 const MAX_PATHS: u32 = 3;
 
-fn pair_with_scheduling_policy(policy: MultipathSchedulingPolicy) -> ConnPair {
-    let mut builder = ConnPair::builder()
-        .enable_multipath()
-        .disable_mtud_discovery();
-    builder
-        .client_transport_cfg
-        .multipath_scheduling_policy(policy);
-    builder
-        .server_transport_cfg
-        .multipath_scheduling_policy(policy);
-    builder.connect()
-}
-
-fn open_available_second_path(pair: &mut ConnPair) -> Result<PathId, crate::PathError> {
-    let path_id = pair.open_path(
-        Client,
-        FourTuple::from_remote(pair.routes.public_server_addr()),
-        PathStatus::Available,
-    )?;
-    pair.drive();
-    Ok(path_id)
-}
-
-fn queue_scheduler_test_data(pair: &mut ConnPair) {
+fn queue_path_stats_test_data(pair: &mut ConnPair) {
     let stream = pair.streams(Client).open(Dir::Uni).unwrap();
     let data = vec![42; 64 * 1024];
     assert_eq!(
@@ -58,162 +35,23 @@ fn queue_scheduler_test_data(pair: &mut ConnPair) {
     );
 }
 
-fn poll_scheduler_data_path(pair: &mut ConnPair, paths: &[PathId]) -> PathId {
-    let before: Vec<_> = paths
-        .iter()
-        .map(|path_id| {
-            (
-                *path_id,
-                pair.path_stats(Client, *path_id).unwrap().udp_tx.datagrams,
-            )
-        })
-        .collect();
+fn poll_path_stats_test_data(pair: &mut ConnPair) {
     let mut buf = Vec::new();
     let _transmit = pair
         .poll_transmit(Client, NonZeroUsize::MIN, &mut buf)
         .expect("queued stream data should produce a transmit");
-
-    let used: Vec<_> = before
-        .into_iter()
-        .filter_map(|(path_id, datagrams)| {
-            (pair.path_stats(Client, path_id).unwrap().udp_tx.datagrams > datagrams)
-                .then_some(path_id)
-        })
-        .collect();
-    assert_eq!(used.len(), 1, "one transmit must use exactly one path");
-    used[0]
-}
-
-#[test]
-fn path_scheduling_default_prefers_lowest_path_id() -> TestResult {
-    let _guard = subscribe();
-    let mut pair = pair_with_scheduling_policy(MultipathSchedulingPolicy::Default);
-    let path_1 = open_available_second_path(&mut pair)?;
-    queue_scheduler_test_data(&mut pair);
-
-    assert_eq!(
-        poll_scheduler_data_path(&mut pair, &[PathId::ZERO, path_1]),
-        PathId::ZERO
-    );
-    assert_eq!(
-        poll_scheduler_data_path(&mut pair, &[PathId::ZERO, path_1]),
-        PathId::ZERO
-    );
-    Ok(())
-}
-
-#[test]
-fn path_scheduling_round_robin_alternates_data_transmits() -> TestResult {
-    let _guard = subscribe();
-    let mut pair = pair_with_scheduling_policy(MultipathSchedulingPolicy::RoundRobin);
-    let path_1 = open_available_second_path(&mut pair)?;
-    queue_scheduler_test_data(&mut pair);
-
-    assert_eq!(
-        poll_scheduler_data_path(&mut pair, &[PathId::ZERO, path_1]),
-        PathId::ZERO
-    );
-    assert_eq!(
-        poll_scheduler_data_path(&mut pair, &[PathId::ZERO, path_1]),
-        path_1
-    );
-    Ok(())
-}
-
-#[test]
-fn path_scheduling_earliest_delivery_considers_in_flight_load() -> TestResult {
-    let _guard = subscribe();
-    let mut pair = pair_with_scheduling_policy(MultipathSchedulingPolicy::EarliestDelivery);
-    let path_1 = open_available_second_path(&mut pair)?;
-    let path_0_stats = pair.path_stats(Client, PathId::ZERO).unwrap();
-    let two_packets = u64::from(path_0_stats.current_mtu) * 2;
-    let loaded_in_flight = path_0_stats
-        .cwnd
-        .checked_sub(two_packets)
-        .expect("test congestion window should fit at least two packets");
-    pair.conn_mut(Client).set_path_scheduler_metrics_for_test(
-        PathId::ZERO,
-        Duration::from_millis(10),
-        loaded_in_flight,
-    )?;
-    pair.conn_mut(Client).set_path_scheduler_metrics_for_test(
-        path_1,
-        Duration::from_millis(20),
-        0,
-    )?;
-    queue_scheduler_test_data(&mut pair);
-
-    assert_eq!(
-        poll_scheduler_data_path(&mut pair, &[PathId::ZERO, path_1]),
-        path_1,
-        "a lightly loaded 20ms path should beat a nearly full 10ms path"
-    );
-    Ok(())
-}
-
-#[test]
-fn path_scheduling_falls_back_when_preferred_path_is_congested() -> TestResult {
-    let _guard = subscribe();
-    let mut pair = pair_with_scheduling_policy(MultipathSchedulingPolicy::EarliestDelivery);
-    let path_1 = open_available_second_path(&mut pair)?;
-    let path_0_cwnd = pair.path_stats(Client, PathId::ZERO).unwrap().cwnd;
-    pair.conn_mut(Client).set_path_scheduler_metrics_for_test(
-        PathId::ZERO,
-        Duration::from_millis(1),
-        path_0_cwnd,
-    )?;
-    pair.conn_mut(Client).set_path_scheduler_metrics_for_test(
-        path_1,
-        Duration::from_millis(100),
-        0,
-    )?;
-    queue_scheduler_test_data(&mut pair);
-
-    assert_eq!(
-        poll_scheduler_data_path(&mut pair, &[PathId::ZERO, path_1]),
-        path_1
-    );
-    Ok(())
-}
-
-#[test]
-fn path_scheduling_keeps_available_paths_ahead_of_backups() -> TestResult {
-    let _guard = subscribe();
-    let mut pair = pair_with_scheduling_policy(MultipathSchedulingPolicy::RoundRobin);
-    let path_1 = open_available_second_path(&mut pair)?;
-    pair.set_path_status(Client, PathId::ZERO, PathStatus::Backup)?;
-    pair.drive();
-    queue_scheduler_test_data(&mut pair);
-
-    assert_eq!(
-        poll_scheduler_data_path(&mut pair, &[PathId::ZERO, path_1]),
-        path_1
-    );
-    Ok(())
-}
-
-#[test]
-fn path_scheduling_single_path_is_unchanged() {
-    let _guard = subscribe();
-    let mut pair = pair_with_scheduling_policy(MultipathSchedulingPolicy::RoundRobin);
-    queue_scheduler_test_data(&mut pair);
-
-    assert_eq!(
-        poll_scheduler_data_path(&mut pair, &[PathId::ZERO]),
-        PathId::ZERO
-    );
 }
 
 #[test]
 fn path_stats_count_fresh_stream_payload_separately() {
     let _guard = subscribe();
-    let mut pair = pair_with_scheduling_policy(MultipathSchedulingPolicy::Default);
+    let mut pair = ConnPair::builder()
+        .enable_multipath()
+        .disable_mtud_discovery()
+        .connect();
     let before = pair.path_stats(Client, PathId::ZERO).unwrap().frame_tx;
-    queue_scheduler_test_data(&mut pair);
-    assert_eq!(
-        poll_scheduler_data_path(&mut pair, &[PathId::ZERO]),
-        PathId::ZERO
-    );
+    queue_path_stats_test_data(&mut pair);
+    poll_path_stats_test_data(&mut pair);
     let after = pair.path_stats(Client, PathId::ZERO).unwrap().frame_tx;
 
     assert!(after.stream_fresh_bytes > before.stream_fresh_bytes);

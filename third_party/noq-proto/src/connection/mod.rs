@@ -22,7 +22,7 @@ use crate::{
     TransportError, TransportErrorCode, VarInt,
     cid_generator::ConnectionIdGenerator,
     cid_queue::CidQueue,
-    config::{MultipathSchedulingPolicy, ServerConfig, TransportConfig},
+    config::{ServerConfig, TransportConfig},
     congestion::Controller,
     connection::{
         paths::PathRetransmits,
@@ -308,12 +308,6 @@ pub struct Connection {
     /// time after a path is abandoned.
     abandoned_paths: AbandonedPaths,
 
-    /// Last path that successfully carried scheduler-selected data.
-    ///
-    /// Only used by [`MultipathSchedulingPolicy::RoundRobin`]. Path-specific control traffic does
-    /// not advance this cursor.
-    last_scheduled_data_path: Option<PathId>,
-
     /// State for n0's (<https://n0.computer>) nat traversal protocol.
     n0_nat_traversal: n0_nat_traversal::State,
     qlog: QlogSink,
@@ -438,7 +432,6 @@ impl Connection {
             remote_max_path_id: PathId::ZERO,
             max_path_id_with_cids: PathId::ZERO,
             abandoned_paths: Default::default(),
-            last_scheduled_data_path: None,
 
             n0_nat_traversal: Default::default(),
             qlog,
@@ -799,20 +792,6 @@ impl Connection {
             .map(|path_state| &mut path_state.data)
     }
 
-    #[cfg(test)]
-    pub(crate) fn set_path_scheduler_metrics_for_test(
-        &mut self,
-        path_id: PathId,
-        rtt: Duration,
-        bytes_in_flight: u64,
-    ) -> Result<(), ClosedPath> {
-        let path = self.path_mut(path_id).ok_or(ClosedPath { _private: () })?;
-        path.rtt = RttEstimator::new(rtt);
-        path.in_flight.bytes = bytes_in_flight;
-        path.in_flight.ack_eliciting = u64::from(bytes_in_flight != 0);
-        Ok(())
-    }
-
     /// Returns all known paths.
     ///
     /// There is no guarantee any of these paths are open or usable.
@@ -1088,40 +1067,34 @@ impl Connection {
                 && self.peer_supports_ack_frequency();
         }
 
-        if self.config.multipath_scheduling_policy == MultipathSchedulingPolicy::Default {
-            let mut next_path_id = self.paths.first_entry().map(|e| *e.key());
-            while let Some(path_id) = next_path_id {
-                if !connection_close_pending
-                    && let Some(transmit) = self.poll_transmit_off_path(now, buf, path_id)
-                {
-                    return Some(transmit);
-                }
-
-                let info = self.scheduling_info(path_id);
-                if let Some(transmit) = self.poll_transmit_on_path(
-                    now,
-                    buf,
-                    path_id,
-                    max_datagrams,
-                    &info,
-                    connection_close_pending,
-                ) {
-                    return Some(transmit);
-                }
-
-                // Continue checking other paths, tail-loss probes may need to be sent
-                // in all spaces.
-                debug_assert!(
-                    buf.is_empty(),
-                    "nothing to send on path but buffer not empty"
-                );
-
-                next_path_id = self.paths.keys().find(|i| **i > path_id).copied();
+        let mut next_path_id = self.paths.first_entry().map(|e| *e.key());
+        while let Some(path_id) = next_path_id {
+            if !connection_close_pending
+                && let Some(transmit) = self.poll_transmit_off_path(now, buf, path_id)
+            {
+                return Some(transmit);
             }
-        } else if let Some(transmit) =
-            self.poll_transmit_scheduled_paths(now, buf, max_datagrams, connection_close_pending)
-        {
-            return Some(transmit);
+
+            let info = self.scheduling_info(path_id);
+            if let Some(transmit) = self.poll_transmit_on_path(
+                now,
+                buf,
+                path_id,
+                max_datagrams,
+                &info,
+                connection_close_pending,
+            ) {
+                return Some(transmit);
+            }
+
+            // Continue checking other paths, tail-loss probes may need to be sent
+            // in all spaces.
+            debug_assert!(
+                buf.is_empty(),
+                "nothing to send on path but buffer not empty"
+            );
+
+            next_path_id = self.paths.keys().find(|i| **i > path_id).copied();
         }
 
         // We didn't produce any application data packet
@@ -1142,125 +1115,6 @@ impl Connection {
         }
 
         None
-    }
-
-    /// Polls paths using an explicit application-data scheduler.
-    ///
-    /// The first two passes preserve prompt delivery of off-path and path-specific control
-    /// traffic. Only the final pass applies the configured policy to frames that may use any
-    /// equally eligible data path.
-    fn poll_transmit_scheduled_paths(
-        &mut self,
-        now: Instant,
-        buf: &mut Vec<u8>,
-        max_datagrams: NonZeroUsize,
-        connection_close_pending: bool,
-    ) -> Option<Transmit> {
-        let path_ids: Vec<_> = self.paths.keys().copied().collect();
-
-        if !connection_close_pending {
-            for path_id in path_ids.iter().copied() {
-                if let Some(transmit) = self.poll_transmit_off_path(now, buf, path_id) {
-                    return Some(transmit);
-                }
-            }
-        }
-
-        for path_id in path_ids {
-            let mut info = self.scheduling_info(path_id);
-            info.may_send_data = false;
-            if let Some(transmit) = self.poll_transmit_on_path(
-                now,
-                buf,
-                path_id,
-                max_datagrams,
-                &info,
-                connection_close_pending,
-            ) {
-                return Some(transmit);
-            }
-
-            debug_assert!(
-                buf.is_empty(),
-                "nothing to send on path but buffer not empty"
-            );
-        }
-
-        let policy = self.config.multipath_scheduling_policy;
-        for path_id in self.scheduled_data_paths(policy) {
-            let info = self.scheduling_info(path_id);
-            debug_assert!(info.may_send_data, "scheduler selected an ineligible path");
-            if let Some(transmit) = self.poll_transmit_on_path(
-                now,
-                buf,
-                path_id,
-                max_datagrams,
-                &info,
-                connection_close_pending,
-            ) {
-                if policy == MultipathSchedulingPolicy::RoundRobin {
-                    self.last_scheduled_data_path = Some(path_id);
-                }
-                return Some(transmit);
-            }
-
-            // A preferred path may be congestion or pacing blocked. Continue in policy order so
-            // another eligible path can make progress.
-            debug_assert!(
-                buf.is_empty(),
-                "nothing to send on path but buffer not empty"
-            );
-        }
-
-        None
-    }
-
-    /// Returns eligible application-data paths in the order they should be attempted.
-    fn scheduled_data_paths(&self, policy: MultipathSchedulingPolicy) -> Vec<PathId> {
-        let mut paths: Vec<_> = self
-            .paths
-            .keys()
-            .copied()
-            .filter(|path_id| self.scheduling_info(*path_id).may_send_data)
-            .collect();
-
-        match policy {
-            MultipathSchedulingPolicy::Default => {}
-            MultipathSchedulingPolicy::RoundRobin => {
-                if let Some(last) = self.last_scheduled_data_path
-                    && let Some(start) = paths.iter().position(|path_id| *path_id > last)
-                {
-                    paths.rotate_left(start);
-                }
-            }
-            MultipathSchedulingPolicy::EarliestDelivery => {
-                paths.sort_by_key(|path_id| {
-                    (
-                        self.earliest_delivery_score(*path_id),
-                        self.path_data(*path_id).rtt.get(),
-                        *path_id,
-                    )
-                });
-            }
-        }
-
-        paths
-    }
-
-    /// Estimates delivery time as half an RTT of propagation plus the time needed to drain the
-    /// current in-flight bytes and one MTU at the path's congestion-window rate.
-    fn earliest_delivery_score(&self, path_id: PathId) -> u128 {
-        let path = self.path_data(path_id);
-        let rtt_nanos = path.rtt.get().as_nanos();
-        let congestion_window = u128::from(path.congestion.window().max(1));
-        let queued_bytes =
-            u128::from(path.in_flight.bytes).saturating_add(u128::from(path.current_mtu()));
-        let drain_nanos = rtt_nanos
-            .saturating_mul(queued_bytes)
-            .checked_div(congestion_window)
-            .unwrap_or(u128::MAX);
-
-        (rtt_nanos / 2).saturating_add(drain_nanos)
     }
 
     /// Computes the packet scheduling information for this path.
