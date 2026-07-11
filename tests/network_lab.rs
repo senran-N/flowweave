@@ -1,9 +1,11 @@
 use std::{env, fmt::Write as _, fs, io, process::Command, time::Duration};
 
 use flowweave_lab::{
-    DatagramMeasurement, FailoverReport, LabResult, MultipathScheduler, NetworkBenchmarkConfig,
-    NetworkBenchmarkReport, PathMode, PtoRecovery, SustainedBenchmarkConfig,
-    run_blackhole_failover, run_network_benchmark, run_sustained_network_benchmark,
+    DatagramMeasurement, FailoverDirection, FailoverReport, LabResult, MultipathScheduler,
+    NetworkBenchmarkConfig, NetworkBenchmarkReport, PathMode, PtoRecovery,
+    SustainedBenchmarkConfig, SustainedFailoverConfig, SustainedFailoverReport,
+    run_blackhole_failover, run_network_benchmark, run_sustained_blackhole_failover,
+    run_sustained_network_benchmark,
 };
 
 const KIB: usize = 1024;
@@ -12,6 +14,9 @@ const SCREENING_TRANSFER_SIZE: usize = 2 * MIB;
 const LONG_WARMUP_DURATION: Duration = Duration::from_secs(2);
 const LONG_MEASUREMENT_DURATION: Duration = Duration::from_secs(20);
 const LONG_CHUNK_SIZE: usize = 512 * KIB;
+const FORMAL_FAILOVER_DURATION: Duration = Duration::from_secs(30);
+const FORMAL_FAILOVER_AT: Duration = Duration::from_secs(10);
+const FORMAL_FAILOVER_CHUNK_SIZE: usize = 16 * KIB;
 
 #[derive(Clone, Copy)]
 struct LinkProfile {
@@ -161,6 +166,14 @@ struct RecoveryScreeningObservation {
     failover: FailoverReport,
     normal: NetworkBenchmarkReport,
     high_loss: NetworkBenchmarkReport,
+}
+
+struct FormalFailoverObservation {
+    direction: FailoverDirection,
+    round: usize,
+    seeds: NetemSeeds,
+    pto_recovery: PtoRecovery,
+    report: SustainedFailoverReport,
 }
 
 struct NumericSummary {
@@ -391,6 +404,89 @@ async fn failover_five_seed_screening_lab() -> LabResult<()> {
     print_recovery_screening_summary(&observations);
     println!();
     println!("A 组短筛原始数据已写入 {RESULT_PATH}");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "必须通过 scripts/run_netem_lab.sh formal-a 在隔离网络命名空间中运行"]
+async fn failover_formal_bidirectional_lab() -> LabResult<()> {
+    ensure_isolated_network_namespace()?;
+
+    const RESULT_PATH: &str = "benchmark-results/2026-07-12-pto-hedge-formal-a-v2.csv";
+    let normal_line_one = LinkProfile::new("20ms", "0.1%", "20mbit");
+    let normal_line_two = LinkProfile::new("80ms", "1%", "20mbit");
+
+    println!();
+    println!("FlowWeave / 织流：正式 A 组双向持续换网实验");
+    println!("每场在同一条 QUIC 业务流上持续发送 30 秒，第 10 秒把主路改为 100% 丢包。");
+    println!("接收端逐条校验序号和内容，并以故障后的最大相邻到达间隔衡量断流。");
+
+    let mut observations = Vec::with_capacity(
+        FailoverDirection::ALL.len() * SEED_PAIRS.len() * PtoRecovery::CANDIDATES.len(),
+    );
+    write_formal_failover_csv(RESULT_PATH, &observations)?;
+
+    for (direction_index, direction) in FailoverDirection::ALL.into_iter().enumerate() {
+        println!();
+        println!("传输方向：{}", direction.description());
+        for (round_index, seeds) in SEED_PAIRS.iter().copied().enumerate() {
+            let round = round_index + 1;
+            let order = recovery_screening_order(round_index + direction_index);
+            println!();
+            println!(
+                "第 {round} 轮：线路一种子 {}，线路二种子 {}；顺序 {}",
+                seeds.line_one,
+                seeds.line_two,
+                order
+                    .iter()
+                    .map(|candidate| candidate.description())
+                    .collect::<Vec<_>>()
+                    .join(" → "),
+            );
+
+            for pto_recovery in order {
+                apply_profiles(normal_line_one, normal_line_two, seeds)?;
+                let report = run_sustained_blackhole_failover(
+                    SustainedFailoverConfig::new(
+                        MultipathScheduler::NoqDefault,
+                        pto_recovery,
+                        direction,
+                        FORMAL_FAILOVER_DURATION,
+                        FORMAL_FAILOVER_AT,
+                        FORMAL_FAILOVER_CHUNK_SIZE,
+                        151_u8
+                            .wrapping_add(round as u8)
+                            .wrapping_add((direction_index as u8).wrapping_mul(17)),
+                    ),
+                    || {
+                        replace_line_profile(
+                            "1:1",
+                            "10:",
+                            LinkProfile::new("20ms", "100%", "20mbit"),
+                            seeds.line_one,
+                        )
+                    },
+                    || replace_line_profile("1:1", "10:", normal_line_one, seeds.line_one),
+                )
+                .await?;
+
+                let observation = FormalFailoverObservation {
+                    direction,
+                    round,
+                    seeds,
+                    pto_recovery,
+                    report,
+                };
+                print_formal_failover_observation(&observation);
+                observations.push(observation);
+                write_formal_failover_csv(RESULT_PATH, &observations)?;
+            }
+        }
+    }
+
+    print_formal_failover_summary(&observations);
+    println!();
+    println!("正式 A 组原始数据已写入 {RESULT_PATH}");
     Ok(())
 }
 
@@ -686,6 +782,162 @@ fn print_recovery_screening_summary(observations: &[RecoveryScreeningObservation
         "- PTO 对冲是否同时通过三组短筛：{}",
         yes_or_no(blackhole_pass && normal_pass && high_loss_pass),
     );
+}
+
+fn print_formal_failover_observation(observation: &FormalFailoverObservation) {
+    let total_udp = observation
+        .report
+        .primary_bytes_after_blackhole
+        .saturating_add(observation.report.secondary_bytes_after_blackhole);
+    let total_hedges = observation
+        .report
+        .primary_pto_hedges
+        .saturating_add(observation.report.secondary_pto_hedges);
+    let total_hedge_bytes = observation
+        .report
+        .primary_pto_hedge_bytes
+        .saturating_add(observation.report.secondary_pto_hedge_bytes);
+    let pre_blackhole_hedges = observation
+        .report
+        .primary_pto_hedges_before_blackhole
+        .saturating_add(observation.report.secondary_pto_hedges_before_blackhole);
+    let pre_blackhole_hedge_bytes = observation
+        .report
+        .primary_pto_hedge_bytes_before_blackhole
+        .saturating_add(
+            observation
+                .report
+                .secondary_pto_hedge_bytes_before_blackhole,
+        );
+
+    println!("- {}", observation.pto_recovery.description());
+    println!(
+        "  完整 {}，恢复 {}，断流 {}，持续 {}，记录 {} 条 / {} 字节",
+        yes_or_no(observation.report.data_intact),
+        yes_or_no(observation.report.recovered),
+        optional_milliseconds(observation.report.recovery_gap),
+        optional_milliseconds(observation.report.transfer_duration),
+        observation.report.records_received,
+        observation.report.application_bytes_received,
+    );
+    println!(
+        "  黑洞前主路/备用路首次数据 {} / {} 字节，对冲 {} 次 / {} 字节；黑洞后 UDP {} 字节，对冲 {} 次 / {} 字节",
+        observation.report.primary_fresh_bytes_before_blackhole,
+        observation.report.secondary_fresh_bytes_before_blackhole,
+        pre_blackhole_hedges,
+        pre_blackhole_hedge_bytes,
+        total_udp,
+        total_hedges,
+        total_hedge_bytes,
+    );
+    println!(
+        "  结束时主路/备用路仍开放 {} / {}{}",
+        yes_or_no(observation.report.primary_path_open),
+        yes_or_no(observation.report.secondary_path_open),
+        observation
+            .report
+            .failure_reason
+            .as_deref()
+            .map(|reason| format!("；失败原因：{reason}"))
+            .unwrap_or_default(),
+    );
+}
+
+fn print_formal_failover_summary(observations: &[FormalFailoverObservation]) {
+    println!();
+    println!("正式 A 组汇总：");
+
+    let mut all_directions_pass = true;
+    for direction in FailoverDirection::ALL {
+        let candidates: Vec<_> = observations
+            .iter()
+            .filter(|observation| {
+                observation.direction == direction
+                    && observation.pto_recovery == PtoRecovery::CrossPathHedge
+            })
+            .collect();
+        let intact = candidates
+            .iter()
+            .filter(|observation| observation.report.data_intact)
+            .count();
+        let recovered = candidates
+            .iter()
+            .filter(|observation| observation.report.recovered)
+            .count();
+        let primary_used = candidates
+            .iter()
+            .filter(|observation| observation.report.primary_fresh_bytes_before_blackhole > 0)
+            .count();
+        let gaps: Vec<_> = candidates
+            .iter()
+            .filter_map(|observation| observation.report.recovery_gap)
+            .map(milliseconds)
+            .collect();
+        let gap_summary = (!gaps.is_empty()).then(|| NumericSummary::from_samples(gaps));
+        let pass = candidates.len() == SEED_PAIRS.len()
+            && intact == SEED_PAIRS.len()
+            && recovered == SEED_PAIRS.len()
+            && primary_used == SEED_PAIRS.len()
+            && gap_summary
+                .as_ref()
+                .is_some_and(|summary| summary.p95 < 1_000.0);
+        all_directions_pass &= pass;
+
+        let udp_ratios: Vec<_> = candidates
+            .iter()
+            .map(|candidate| {
+                formal_failover_udp_bytes(&candidate.report) as f64
+                    / formal_failover_udp_bytes(
+                        &matching_formal_failover_baseline(
+                            observations,
+                            direction,
+                            candidate.round,
+                        )
+                        .report,
+                    ) as f64
+                    * 100.0
+            })
+            .collect();
+        let udp_summary = NumericSummary::from_samples(udp_ratios);
+
+        println!(
+            "- {}：完整 {intact}/{total}，恢复 {recovered}/{total}，黑洞前主路承载数据 {primary_used}/{total}，P95 {}，黑洞后 UDP 相对基线中位 {:.2}%，门槛 {}",
+            direction.description(),
+            gap_summary
+                .as_ref()
+                .map(|summary| format!("{:.2} ms", summary.p95))
+                .unwrap_or_else(|| "无有效样本".to_owned()),
+            udp_summary.median,
+            yes_or_no(pass),
+            total = SEED_PAIRS.len(),
+        );
+    }
+
+    println!(
+        "- 正反两个方向是否都通过正式 A 组阶段门槛：{}",
+        yes_or_no(all_directions_pass),
+    );
+}
+
+fn formal_failover_udp_bytes(report: &SustainedFailoverReport) -> u64 {
+    report
+        .primary_bytes_after_blackhole
+        .saturating_add(report.secondary_bytes_after_blackhole)
+}
+
+fn matching_formal_failover_baseline(
+    observations: &[FormalFailoverObservation],
+    direction: FailoverDirection,
+    round: usize,
+) -> &FormalFailoverObservation {
+    observations
+        .iter()
+        .find(|observation| {
+            observation.direction == direction
+                && observation.round == round
+                && observation.pto_recovery == PtoRecovery::Disabled
+        })
+        .expect("each completed formal failover round must contain the NoQ baseline")
 }
 
 fn matching_recovery_baseline(
@@ -1302,6 +1554,84 @@ fn write_recovery_screening_csv(
             observation.high_loss.any_configured_path_open,
             total_pto_hedges(&observation.high_loss),
             total_pto_hedge_bytes(&observation.high_loss),
+        )?;
+    }
+
+    fs::create_dir_all("benchmark-results")?;
+    fs::write(path, csv)?;
+    Ok(())
+}
+
+fn write_formal_failover_csv(
+    path: &str,
+    observations: &[FormalFailoverObservation],
+) -> LabResult<()> {
+    let mut csv = String::from(
+        "direction,round,line_one_seed,line_two_seed,recovery,recovered,data_intact,recovery_gap_ms,transfer_duration_ms,records_received,application_bytes_received,failure_reason,primary_fresh_bytes_before_blackhole,secondary_fresh_bytes_before_blackhole,primary_pto_hedges_before_blackhole,secondary_pto_hedges_before_blackhole,primary_pto_hedge_bytes_before_blackhole,secondary_pto_hedge_bytes_before_blackhole,primary_udp_bytes_after_blackhole,secondary_udp_bytes_after_blackhole,total_udp_bytes_after_blackhole,primary_lost_packets,secondary_lost_packets,pto_hedges_after_blackhole,pto_hedge_bytes_after_blackhole,primary_path_open,secondary_path_open\n",
+    );
+
+    for observation in observations {
+        let failure_reason = observation
+            .report
+            .failure_reason
+            .as_deref()
+            .unwrap_or_default()
+            .replace(',', ";")
+            .replace(['\n', '\r'], " ");
+        let recovery_gap_ms = observation
+            .report
+            .recovery_gap
+            .map(milliseconds)
+            .map(|value| format!("{value:.3}"))
+            .unwrap_or_default();
+        let transfer_duration_ms = observation
+            .report
+            .transfer_duration
+            .map(milliseconds)
+            .map(|value| format!("{value:.3}"))
+            .unwrap_or_default();
+        let total_udp = formal_failover_udp_bytes(&observation.report);
+        let total_hedges = observation
+            .report
+            .primary_pto_hedges
+            .saturating_add(observation.report.secondary_pto_hedges);
+        let total_hedge_bytes = observation
+            .report
+            .primary_pto_hedge_bytes
+            .saturating_add(observation.report.secondary_pto_hedge_bytes);
+
+        writeln!(
+            csv,
+            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+            observation.direction.description(),
+            observation.round,
+            observation.seeds.line_one,
+            observation.seeds.line_two,
+            observation.pto_recovery.description(),
+            observation.report.recovered,
+            observation.report.data_intact,
+            recovery_gap_ms,
+            transfer_duration_ms,
+            observation.report.records_received,
+            observation.report.application_bytes_received,
+            failure_reason,
+            observation.report.primary_fresh_bytes_before_blackhole,
+            observation.report.secondary_fresh_bytes_before_blackhole,
+            observation.report.primary_pto_hedges_before_blackhole,
+            observation.report.secondary_pto_hedges_before_blackhole,
+            observation.report.primary_pto_hedge_bytes_before_blackhole,
+            observation
+                .report
+                .secondary_pto_hedge_bytes_before_blackhole,
+            observation.report.primary_bytes_after_blackhole,
+            observation.report.secondary_bytes_after_blackhole,
+            total_udp,
+            observation.report.primary_lost_packets,
+            observation.report.secondary_lost_packets,
+            total_hedges,
+            total_hedge_bytes,
+            observation.report.primary_path_open,
+            observation.report.secondary_path_open,
         )?;
     }
 

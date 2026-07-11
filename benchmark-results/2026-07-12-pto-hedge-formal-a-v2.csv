@@ -1,0 +1,21 @@
+direction,round,line_one_seed,line_two_seed,recovery,recovered,data_intact,recovery_gap_ms,transfer_duration_ms,records_received,application_bytes_received,failure_reason,primary_fresh_bytes_before_blackhole,secondary_fresh_bytes_before_blackhole,primary_pto_hedges_before_blackhole,secondary_pto_hedges_before_blackhole,primary_pto_hedge_bytes_before_blackhole,secondary_pto_hedge_bytes_before_blackhole,primary_udp_bytes_after_blackhole,secondary_udp_bytes_after_blackhole,total_udp_bytes_after_blackhole,primary_lost_packets,secondary_lost_packets,pto_hedges_after_blackhole,pto_hedge_bytes_after_blackhole,primary_path_open,secondary_path_open
+正向（客户端到服务端）,1,1101,2201,NoQ 默认恢复,true,true,6100.903,42091.114,1619,26525696,,23494954,0,0,0,0,0,476196,3603438,4079634,631,26,0,0,false,true
+正向（客户端到服务端）,1,1101,2201,FlowWeave PTO 跨路径对冲,true,true,2804.332,43230.219,1662,27230208,,23651314,0,0,0,0,0,354819,3772827,4127646,271,29,1,939283,false,true
+正向（客户端到服务端）,2,1102,2202,FlowWeave PTO 跨路径对冲,true,true,5570.670,40797.499,1668,27328512,,23323934,0,0,0,0,0,180228,4367269,4547497,269,27,1,373154,false,true
+正向（客户端到服务端）,2,1102,2202,NoQ 默认恢复,true,true,6457.053,43424.423,1623,26591232,,23760243,0,0,0,0,0,657436,3500748,4158184,848,28,0,0,false,true
+正向（客户端到服务端）,3,1103,2203,NoQ 默认恢复,true,true,6156.737,40881.761,2253,36913152,,23838685,0,0,0,0,0,1279908,14126121,15406029,1321,76,0,0,false,true
+正向（客户端到服务端）,3,1103,2203,FlowWeave PTO 跨路径对冲,true,true,6114.429,37430.385,1905,31211520,,23783621,0,0,0,0,0,1279884,8293864,9573748,1295,66,0,0,false,true
+正向（客户端到服务端）,4,1104,2204,FlowWeave PTO 跨路径对冲,true,true,3334.681,42869.951,1636,26804224,,23163439,0,0,0,0,0,413951,3811506,4225457,291,30,1,476779,false,true
+正向（客户端到服务端）,4,1104,2204,NoQ 默认恢复,true,true,8963.596,41439.835,1576,25821184,,23630184,0,0,0,0,0,668809,2912510,3581319,906,23,0,0,false,true
+正向（客户端到服务端）,5,1105,2205,NoQ 默认恢复,true,true,5957.263,40474.477,1856,30408704,,23770263,0,0,0,0,0,1279895,7479314,8759209,1311,47,0,0,false,true
+正向（客户端到服务端）,5,1105,2205,FlowWeave PTO 跨路径对冲,true,true,10830.880,38617.081,1560,25559040,,23684366,0,0,0,0,0,797954,2563579,3361533,983,18,0,0,false,true
+反向（服务端到客户端）,1,1101,2201,FlowWeave PTO 跨路径对冲,false,false,,,0,0,等待持续换网记录载荷超时,23211736,1213307,0,0,0,0,132960,0,132960,0,0,0,0,true,false
+反向（服务端到客户端）,1,1101,2201,NoQ 默认恢复,false,false,,,0,0,等待持续换网记录载荷超时,23583164,537151,0,0,0,0,638315,0,638315,0,0,0,0,true,false
+反向（服务端到客户端）,2,1102,2202,NoQ 默认恢复,false,false,,,0,0,等待持续换网记录载荷超时,23232535,3496220,0,0,0,0,355620,0,355620,0,0,0,0,true,false
+反向（服务端到客户端）,2,1102,2202,FlowWeave PTO 跨路径对冲,false,false,,,0,0,等待持续换网记录载荷超时,22920636,2827019,1,0,4,0,289776,0,289776,0,0,0,0,true,false
+反向（服务端到客户端）,3,1103,2203,FlowWeave PTO 跨路径对冲,false,false,,,0,0,等待持续换网记录载荷超时,23661101,208031,0,0,0,0,504665,0,504665,0,0,0,0,true,false
+反向（服务端到客户端）,3,1103,2203,NoQ 默认恢复,false,false,,,0,0,等待持续换网记录载荷超时,23348134,204023,0,0,0,0,481944,0,481944,0,0,0,0,true,false
+反向（服务端到客户端）,4,1104,2204,NoQ 默认恢复,false,false,,,0,0,等待持续换网记录载荷超时,21005236,3094719,0,0,0,0,205560,0,205560,0,0,0,0,true,false
+反向（服务端到客户端）,4,1104,2204,FlowWeave PTO 跨路径对冲,false,false,,,0,0,等待持续换网记录载荷超时,23068626,2382185,0,0,0,0,175068,0,175068,0,0,0,0,true,false
+反向（服务端到客户端）,5,1105,2205,FlowWeave PTO 跨路径对冲,false,false,,,0,0,等待持续换网记录载荷超时,23300780,1884438,0,0,0,0,189588,0,189588,0,0,0,0,true,false
+反向（服务端到客户端）,5,1105,2205,NoQ 默认恢复,false,false,,,0,0,等待持续换网记录载荷超时,23483931,886803,0,0,0,0,516354,0,516354,0,0,0,0,true,false

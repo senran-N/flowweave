@@ -16,7 +16,7 @@ use noq::{
     rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer},
 };
 use tokio::{
-    sync::mpsc,
+    sync::{mpsc, oneshot},
     task::JoinHandle,
     time::{sleep, timeout},
 };
@@ -30,6 +30,13 @@ pub type LabResult<T> = Result<T, LabError>;
 const MAGIC: &[u8; 4] = b"FWL1";
 const FAILOVER_MAGIC: &[u8; 4] = b"FWP1";
 const FAILOVER_PROGRESS: &[u8; 4] = b"FWP+";
+const SUSTAINED_FAILOVER_MAGIC: &[u8; 4] = b"FWA1";
+const SUSTAINED_FAILOVER_READY: &[u8; 4] = b"FWA+";
+const SUSTAINED_FAILOVER_OK: &[u8; 4] = b"FWA=";
+const SUSTAINED_FAILOVER_GO: u8 = 1;
+const SUSTAINED_FAILOVER_HEADER_SIZE: usize = 20;
+const SUSTAINED_RECORD_HEADER_SIZE: usize = 16;
+const SUSTAINED_RECORD_END: u64 = u64::MAX;
 const DATAGRAM_MAGIC: &[u8; 4] = b"FWDG";
 const DATAGRAM_PROBE_SIZE: usize = 8;
 const MAX_PAYLOAD_SIZE: usize = 2 * 1024 * 1024;
@@ -37,6 +44,7 @@ const MAX_FRAME_SIZE: usize = MAX_PAYLOAD_SIZE + 8;
 const MAX_DATAGRAM_PROBES: usize = 2_000;
 const OPERATION_TIMEOUT: Duration = Duration::from_secs(15);
 const FAILOVER_OBSERVATION_TIMEOUT: Duration = Duration::from_secs(8);
+const SUSTAINED_FAILOVER_GRACE: Duration = Duration::from_secs(60);
 const NETWORK_PATH_IDLE_TIMEOUT: Duration = Duration::from_secs(3);
 const DATAGRAM_SEND_INTERVAL: Duration = Duration::from_millis(5);
 const DATAGRAM_RECEIVE_GRACE: Duration = Duration::from_millis(1_500);
@@ -81,6 +89,36 @@ pub enum PtoRecovery {
     #[default]
     Disabled,
     CrossPathHedge,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum FailoverDirection {
+    ClientToServer = 0,
+    ServerToClient = 1,
+}
+
+impl FailoverDirection {
+    pub const ALL: [Self; 2] = [Self::ClientToServer, Self::ServerToClient];
+
+    pub fn description(self) -> &'static str {
+        match self {
+            Self::ClientToServer => "正向（客户端到服务端）",
+            Self::ServerToClient => "反向（服务端到客户端）",
+        }
+    }
+}
+
+impl TryFrom<u8> for FailoverDirection {
+    type Error = LabError;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(Self::ClientToServer),
+            1 => Ok(Self::ServerToClient),
+            _ => Err(other_error("持续换网实验的传输方向不合法")),
+        }
+    }
 }
 
 impl PtoRecovery {
@@ -204,6 +242,58 @@ impl SustainedBenchmarkConfig {
 }
 
 #[derive(Debug, Clone, Copy)]
+pub struct SustainedFailoverConfig {
+    pub scheduler: MultipathScheduler,
+    pub pto_recovery: PtoRecovery,
+    pub direction: FailoverDirection,
+    pub total_duration: Duration,
+    pub failure_after: Duration,
+    pub chunk_size: usize,
+    pub seed: u8,
+}
+
+impl SustainedFailoverConfig {
+    pub fn new(
+        scheduler: MultipathScheduler,
+        pto_recovery: PtoRecovery,
+        direction: FailoverDirection,
+        total_duration: Duration,
+        failure_after: Duration,
+        chunk_size: usize,
+        seed: u8,
+    ) -> Self {
+        Self {
+            scheduler,
+            pto_recovery,
+            direction,
+            total_duration,
+            failure_after,
+            chunk_size,
+            seed,
+        }
+    }
+
+    fn validate(self) -> LabResult<()> {
+        if self.total_duration.is_zero() || self.total_duration > MAX_SUSTAINED_MEASUREMENT {
+            return Err(other_error(format!(
+                "正式换网实验总时长必须在 0 到 {} 秒之间",
+                MAX_SUSTAINED_MEASUREMENT.as_secs()
+            )));
+        }
+        if self.failure_after.is_zero() || self.failure_after >= self.total_duration {
+            return Err(other_error("黑洞时刻必须晚于开始且早于实验结束"));
+        }
+        if self.chunk_size < SUSTAINED_RECORD_HEADER_SIZE || self.chunk_size > MAX_PAYLOAD_SIZE {
+            return Err(other_error(format!(
+                "正式换网实验记录载荷必须在 {} 到 {} 字节之间",
+                SUSTAINED_RECORD_HEADER_SIZE, MAX_PAYLOAD_SIZE
+            )));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
 enum BenchmarkWorkload {
     Fixed {
         transfer_size: usize,
@@ -304,8 +394,54 @@ pub struct FailoverReport {
     pub secondary_path_open: bool,
 }
 
+#[derive(Debug, Clone)]
+pub struct SustainedFailoverReport {
+    pub scheduler: MultipathScheduler,
+    pub pto_recovery: PtoRecovery,
+    pub direction: FailoverDirection,
+    pub recovered: bool,
+    pub data_intact: bool,
+    pub recovery_gap: Option<Duration>,
+    pub transfer_duration: Option<Duration>,
+    pub records_received: u64,
+    pub application_bytes_received: u64,
+    pub failure_reason: Option<String>,
+    pub primary_fresh_bytes_before_blackhole: u64,
+    pub secondary_fresh_bytes_before_blackhole: u64,
+    pub primary_pto_hedges_before_blackhole: u64,
+    pub secondary_pto_hedges_before_blackhole: u64,
+    pub primary_pto_hedge_bytes_before_blackhole: u64,
+    pub secondary_pto_hedge_bytes_before_blackhole: u64,
+    pub primary_bytes_after_blackhole: u64,
+    pub secondary_bytes_after_blackhole: u64,
+    pub primary_lost_packets: u64,
+    pub secondary_lost_packets: u64,
+    pub primary_pto_hedges: u64,
+    pub secondary_pto_hedges: u64,
+    pub primary_pto_hedge_bytes: u64,
+    pub secondary_pto_hedge_bytes: u64,
+    pub primary_path_open: bool,
+    pub secondary_path_open: bool,
+}
+
+#[derive(Debug)]
+enum SustainedServerEvent {
+    Record { sequence: u64, received_at: Instant },
+    Finished { records: u64, bytes: u64 },
+    Failed(String),
+}
+
+#[derive(Debug)]
+struct SustainedReceiveTrace {
+    received_at: Vec<Instant>,
+    records: u64,
+    bytes: u64,
+    elapsed: Duration,
+}
+
 struct RunningLab {
     server_task: JoinHandle<LabResult<()>>,
+    server_connection: Connection,
     client_endpoint: Endpoint,
     connection: Connection,
     server_addr: SocketAddr,
@@ -735,15 +871,321 @@ where
     Ok(report)
 }
 
+pub async fn run_sustained_blackhole_failover<Activate, Restore>(
+    config: SustainedFailoverConfig,
+    activate_blackhole: Activate,
+    restore_network: Restore,
+) -> LabResult<SustainedFailoverReport>
+where
+    Activate: FnOnce() -> LabResult<()>,
+    Restore: FnOnce() -> LabResult<()>,
+{
+    config.validate()?;
+    let (lab, server_events) = start_connection_with_sustained_observer(
+        Ipv4Addr::UNSPECIFIED,
+        Some(NETWORK_PATH_IDLE_TIMEOUT),
+        config.pto_recovery,
+    )
+    .await?;
+    let secondary = lab.open_second_path(PathStatus::Backup).await?;
+    sleep(Duration::from_millis(250)).await;
+    let (sender_primary, sender_secondary) = match config.direction {
+        FailoverDirection::ClientToServer => (lab.primary.clone(), secondary.clone()),
+        FailoverDirection::ServerToClient => (
+            lab.server_connection
+                .path(PathId::ZERO)
+                .ok_or_else(|| other_error("服务端找不到正式反向实验的主路径"))?,
+            lab.server_connection
+                .path(secondary.id())
+                .ok_or_else(|| other_error("服务端找不到正式反向实验的备用路径"))?,
+        ),
+    };
+
+    let operation_result: LabResult<SustainedFailoverReport> = async {
+        let primary_before = sender_primary.stats();
+        let secondary_before = sender_secondary.stats();
+        let (started_tx, started_rx) = oneshot::channel();
+        let flow_connection = lab.connection.clone();
+        let mut flow_task = tokio::spawn(run_sustained_failover_flow(
+            flow_connection,
+            config,
+            server_events,
+            started_tx,
+        ));
+
+        let started_at = match timeout(OPERATION_TIMEOUT, started_rx).await {
+            Ok(Ok(started_at)) => started_at,
+            Ok(Err(_)) => {
+                let result = flow_task
+                    .await
+                    .map_err(|error| other_error(format!("持续换网任务异常退出：{error}")))?;
+                return Err(result
+                    .err()
+                    .unwrap_or_else(|| other_error("持续换网任务没有报告开始时刻")));
+            }
+            Err(_) => {
+                flow_task.abort();
+                let _ = flow_task.await;
+                return Err(other_error("等待持续换网业务开始超时"));
+            }
+        };
+
+        tokio::select! {
+            result = &mut flow_task => {
+                let result = result
+                    .map_err(|error| other_error(format!("持续换网任务异常退出：{error}")))?;
+                return Err(result
+                    .err()
+                    .unwrap_or_else(|| other_error("持续换网业务在制造黑洞前提前结束")));
+            }
+            () = sleep(config.failure_after) => {}
+        }
+
+        let primary_at_blackhole = sender_primary.stats();
+        let secondary_at_blackhole = sender_secondary.stats();
+        if let Err(error) = activate_blackhole() {
+            flow_task.abort();
+            let _ = flow_task.await;
+            return Err(error);
+        }
+        let failure_started = Instant::now();
+
+        let remaining = config
+            .total_duration
+            .saturating_add(SUSTAINED_FAILOVER_GRACE)
+            .saturating_sub(started_at.elapsed());
+        let flow_result = match timeout(remaining, &mut flow_task).await {
+            Ok(result) => Some(
+                result.map_err(|error| other_error(format!("持续换网任务异常退出：{error}")))?,
+            ),
+            Err(_) => {
+                flow_task.abort();
+                let _ = flow_task.await;
+                None
+            }
+        };
+
+        let primary_after = sender_primary.stats();
+        let secondary_after = sender_secondary.stats();
+        let primary_before_delta = path_delta(primary_before, primary_at_blackhole);
+        let secondary_before_delta = path_delta(secondary_before, secondary_at_blackhole);
+        let primary_after_delta = path_delta(primary_at_blackhole, primary_after);
+        let secondary_after_delta = path_delta(secondary_at_blackhole, secondary_after);
+
+        let (trace, flow_failure) = match flow_result {
+            Some(Ok(trace)) => (Some(trace), None),
+            Some(Err(error)) => (None, Some(error.to_string())),
+            None => (
+                None,
+                Some(format!(
+                    "业务开始后 {} 秒内没有完成持续传输",
+                    (config.total_duration + SUSTAINED_FAILOVER_GRACE).as_secs()
+                )),
+            ),
+        };
+        let recovery_gap = trace
+            .as_ref()
+            .and_then(|trace| recovery_gap_after_fault(&trace.received_at, failure_started));
+        let data_intact = trace.is_some();
+        let recovered = data_intact && recovery_gap.is_some();
+        let failure_reason = flow_failure
+            .or_else(|| (!recovered).then(|| "没有找到同时覆盖故障前后数据的恢复间隔".to_owned()));
+
+        Ok(SustainedFailoverReport {
+            scheduler: config.scheduler,
+            pto_recovery: config.pto_recovery,
+            direction: config.direction,
+            recovered,
+            data_intact,
+            recovery_gap,
+            transfer_duration: trace.as_ref().map(|trace| trace.elapsed),
+            records_received: trace.as_ref().map_or(0, |trace| trace.records),
+            application_bytes_received: trace.as_ref().map_or(0, |trace| trace.bytes),
+            failure_reason,
+            primary_fresh_bytes_before_blackhole: primary_before_delta.fresh_stream_bytes_sent,
+            secondary_fresh_bytes_before_blackhole: secondary_before_delta.fresh_stream_bytes_sent,
+            primary_pto_hedges_before_blackhole: primary_before_delta.pto_hedges,
+            secondary_pto_hedges_before_blackhole: secondary_before_delta.pto_hedges,
+            primary_pto_hedge_bytes_before_blackhole: primary_before_delta.pto_hedge_bytes,
+            secondary_pto_hedge_bytes_before_blackhole: secondary_before_delta.pto_hedge_bytes,
+            primary_bytes_after_blackhole: primary_after_delta.udp_bytes_sent,
+            secondary_bytes_after_blackhole: secondary_after_delta.udp_bytes_sent,
+            primary_lost_packets: primary_after_delta.lost_packets,
+            secondary_lost_packets: secondary_after_delta.lost_packets,
+            primary_pto_hedges: primary_after_delta.pto_hedges,
+            secondary_pto_hedges: secondary_after_delta.pto_hedges,
+            primary_pto_hedge_bytes: primary_after_delta.pto_hedge_bytes,
+            secondary_pto_hedge_bytes: secondary_after_delta.pto_hedge_bytes,
+            primary_path_open: sender_primary.status().is_ok(),
+            secondary_path_open: sender_secondary.status().is_ok(),
+        })
+    }
+    .await;
+
+    let restore_result = restore_network();
+    let shutdown_result = lab.shutdown().await;
+    let report = operation_result?;
+    restore_result?;
+    shutdown_result?;
+    Ok(report)
+}
+
+async fn run_sustained_failover_flow(
+    connection: Connection,
+    config: SustainedFailoverConfig,
+    mut server_events: mpsc::UnboundedReceiver<SustainedServerEvent>,
+    started_tx: oneshot::Sender<Instant>,
+) -> LabResult<SustainedReceiveTrace> {
+    let (mut send, mut receive) = timeout(OPERATION_TIMEOUT, connection.open_bi())
+        .await
+        .map_err(|_| other_error("打开正式换网业务流超时"))??;
+    let request = make_sustained_stream_request(config)?;
+    timeout(OPERATION_TIMEOUT, send.write_all(&request))
+        .await
+        .map_err(|_| other_error("发送正式换网请求超时"))??;
+
+    let mut ready = [0_u8; SUSTAINED_FAILOVER_READY.len()];
+    timeout(OPERATION_TIMEOUT, receive.read_exact(&mut ready))
+        .await
+        .map_err(|_| other_error("等待正式换网服务端就绪超时"))??;
+    if &ready != SUSTAINED_FAILOVER_READY {
+        return Err(other_error("服务端没有返回正式换网就绪标记"));
+    }
+    timeout(OPERATION_TIMEOUT, send.write_all(&[SUSTAINED_FAILOVER_GO]))
+        .await
+        .map_err(|_| other_error("发送正式换网开始标记超时"))??;
+    let started_at = Instant::now();
+    started_tx
+        .send(started_at)
+        .map_err(|_| other_error("正式换网启动时刻无人接收"))?;
+
+    match config.direction {
+        FailoverDirection::ClientToServer => {
+            let network = async {
+                let (sent_records, sent_bytes, _) = write_sustained_records(
+                    &mut send,
+                    config.total_duration,
+                    config.chunk_size,
+                    config.seed,
+                )
+                .await?;
+                let response = timeout(OPERATION_TIMEOUT, receive.read_to_end(64))
+                    .await
+                    .map_err(|_| other_error("等待正式换网服务端校验结果超时"))??;
+                let (received_records, received_bytes) =
+                    parse_sustained_success_response(&response)?;
+                if (sent_records, sent_bytes) != (received_records, received_bytes) {
+                    return Err(other_error("正式换网收发记录总数或字节数不一致"));
+                }
+                Ok::<(u64, u64), LabError>((sent_records, sent_bytes))
+            };
+            let events = collect_sustained_server_trace(&mut server_events);
+            let (network, trace) = tokio::join!(network, events);
+            let (sent_records, sent_bytes) = network?;
+            let mut trace = trace?;
+            if (trace.records, trace.bytes) != (sent_records, sent_bytes) {
+                return Err(other_error("正式换网服务端事件统计与线上的校验结果不一致"));
+            }
+            trace.elapsed = started_at.elapsed();
+            Ok(trace)
+        }
+        FailoverDirection::ServerToClient => {
+            send.finish()?;
+            let mut trace =
+                receive_sustained_records(&mut receive, config.chunk_size, config.seed, None)
+                    .await?;
+            trace.elapsed = started_at.elapsed();
+            Ok(trace)
+        }
+    }
+}
+
+async fn collect_sustained_server_trace(
+    events: &mut mpsc::UnboundedReceiver<SustainedServerEvent>,
+) -> LabResult<SustainedReceiveTrace> {
+    let started = Instant::now();
+    let mut expected_sequence = 0_u64;
+    let mut received_at = Vec::new();
+    loop {
+        match events.recv().await {
+            Some(SustainedServerEvent::Record {
+                sequence,
+                received_at: timestamp,
+            }) => {
+                if sequence != expected_sequence {
+                    return Err(other_error(format!(
+                        "服务端事件记录编号错误：期望 {expected_sequence}，实际 {sequence}"
+                    )));
+                }
+                expected_sequence += 1;
+                received_at.push(timestamp);
+            }
+            Some(SustainedServerEvent::Finished { records, bytes }) => {
+                if records != expected_sequence {
+                    return Err(other_error("服务端完成事件的记录总数不正确"));
+                }
+                return Ok(SustainedReceiveTrace {
+                    received_at,
+                    records,
+                    bytes,
+                    elapsed: started.elapsed(),
+                });
+            }
+            Some(SustainedServerEvent::Failed(reason)) => return Err(other_error(reason)),
+            None => return Err(other_error("持续换网服务端事件通道提前关闭")),
+        }
+    }
+}
+
+fn recovery_gap_after_fault(received_at: &[Instant], failure_started: Instant) -> Option<Duration> {
+    let has_before = received_at
+        .iter()
+        .any(|timestamp| *timestamp < failure_started);
+    let has_after = received_at
+        .iter()
+        .any(|timestamp| *timestamp >= failure_started);
+    if !has_before || !has_after {
+        return None;
+    }
+
+    received_at
+        .windows(2)
+        .filter(|pair| pair[1] >= failure_started)
+        .map(|pair| pair[1].saturating_duration_since(pair[0]))
+        .max()
+}
+
 async fn start_connection(
     client_ip: Ipv4Addr,
     path_idle_timeout: Option<Duration>,
     pto_recovery: PtoRecovery,
 ) -> LabResult<RunningLab> {
+    start_connection_internal(client_ip, path_idle_timeout, pto_recovery, None).await
+}
+
+async fn start_connection_with_sustained_observer(
+    client_ip: Ipv4Addr,
+    path_idle_timeout: Option<Duration>,
+    pto_recovery: PtoRecovery,
+) -> LabResult<(RunningLab, mpsc::UnboundedReceiver<SustainedServerEvent>)> {
+    let (events_tx, events_rx) = mpsc::unbounded_channel();
+    let lab =
+        start_connection_internal(client_ip, path_idle_timeout, pto_recovery, Some(events_tx))
+            .await?;
+    Ok((lab, events_rx))
+}
+
+async fn start_connection_internal(
+    client_ip: Ipv4Addr,
+    path_idle_timeout: Option<Duration>,
+    pto_recovery: PtoRecovery,
+    sustained_events: Option<mpsc::UnboundedSender<SustainedServerEvent>>,
+) -> LabResult<RunningLab> {
     let (server_config, client_config) = make_configs(path_idle_timeout, pto_recovery)?;
     let server_endpoint =
         Endpoint::server(server_config, SocketAddr::new(IpAddr::V4(LINE_ONE_IP), 0))?;
     let server_addr = server_endpoint.local_addr()?;
+    let (server_connection_tx, server_connection_rx) = oneshot::channel();
 
     let server_task = tokio::spawn(async move {
         let incoming = timeout(OPERATION_TIMEOUT, server_endpoint.accept())
@@ -753,7 +1195,10 @@ async fn start_connection(
         let connection = timeout(OPERATION_TIMEOUT, incoming)
             .await
             .map_err(|_| other_error("服务端握手超时"))??;
-        serve_connection(connection).await
+        server_connection_tx
+            .send(connection.clone())
+            .map_err(|_| other_error("实验控制器没有接收服务端连接"))?;
+        serve_connection(connection, sustained_events).await
     });
 
     let client_endpoint = Endpoint::client(SocketAddr::new(IpAddr::V4(client_ip), 0))?;
@@ -767,6 +1212,10 @@ async fn start_connection(
     )
     .await
     .map_err(|_| other_error("客户端握手超时"))??;
+    let server_connection = timeout(OPERATION_TIMEOUT, server_connection_rx)
+        .await
+        .map_err(|_| other_error("等待服务端连接句柄超时"))?
+        .map_err(|_| other_error("服务端没有返回连接句柄"))?;
 
     if !connection.is_multipath_enabled() {
         connection.close(0_u8.into(), b"multipath negotiation failed");
@@ -779,6 +1228,7 @@ async fn start_connection(
 
     Ok(RunningLab {
         server_task,
+        server_connection,
         client_endpoint,
         connection,
         server_addr,
@@ -824,7 +1274,10 @@ fn configure_transport(
         .datagram_send_buffer_size(1024 * 1024);
 }
 
-async fn serve_connection(connection: Connection) -> LabResult<()> {
+async fn serve_connection(
+    connection: Connection,
+    sustained_events: Option<mpsc::UnboundedSender<SustainedServerEvent>>,
+) -> LabResult<()> {
     let datagram_connection = connection.clone();
     let datagram_task = tokio::spawn(async move {
         loop {
@@ -850,8 +1303,9 @@ async fn serve_connection(connection: Connection) -> LabResult<()> {
             Err(error) => return Err(error.into()),
         };
 
+        let stream_events = sustained_events.clone();
         tokio::spawn(async move {
-            if let Err(error) = handle_stream(send, receive).await {
+            if let Err(error) = handle_stream(send, receive, stream_events).await {
                 eprintln!("服务端处理数据流失败：{error}");
             }
         });
@@ -864,12 +1318,20 @@ async fn serve_connection(connection: Connection) -> LabResult<()> {
     }
 }
 
-async fn handle_stream(mut send: noq::SendStream, mut receive: noq::RecvStream) -> LabResult<()> {
+async fn handle_stream(
+    mut send: noq::SendStream,
+    mut receive: noq::RecvStream,
+    sustained_events: Option<mpsc::UnboundedSender<SustainedServerEvent>>,
+) -> LabResult<()> {
     let mut header = [0_u8; 8];
     receive.read_exact(&mut header).await?;
 
     if &header[..4] == FAILOVER_MAGIC {
         return handle_progress_stream(send, receive, header).await;
+    }
+
+    if &header[..4] == SUSTAINED_FAILOVER_MAGIC {
+        return handle_sustained_failover_stream(send, receive, header, sustained_events).await;
     }
 
     let remaining = receive.read_to_end(MAX_FRAME_SIZE - header.len()).await?;
@@ -918,6 +1380,293 @@ async fn handle_progress_stream(
     send.write_all(&make_success_response(&payload)).await?;
     send.finish()?;
     Ok(())
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SustainedStreamRequest {
+    direction: FailoverDirection,
+    duration: Duration,
+    chunk_size: usize,
+    seed: u8,
+}
+
+async fn handle_sustained_failover_stream(
+    mut send: noq::SendStream,
+    mut receive: noq::RecvStream,
+    first: [u8; 8],
+    sustained_events: Option<mpsc::UnboundedSender<SustainedServerEvent>>,
+) -> LabResult<()> {
+    let result = async {
+        let request = read_sustained_stream_request(&mut receive, first).await?;
+        send.write_all(SUSTAINED_FAILOVER_READY).await?;
+
+        let mut go = [0_u8; 1];
+        receive.read_exact(&mut go).await?;
+        if go[0] != SUSTAINED_FAILOVER_GO {
+            return Err(other_error("持续换网实验缺少开始标记"));
+        }
+
+        match request.direction {
+            FailoverDirection::ClientToServer => {
+                let trace = receive_sustained_records(
+                    &mut receive,
+                    request.chunk_size,
+                    request.seed,
+                    sustained_events.as_ref(),
+                )
+                .await?;
+                let response = make_sustained_success_response(trace.records, trace.bytes);
+                send.write_all(&response).await?;
+                send.finish()?;
+            }
+            FailoverDirection::ServerToClient => {
+                let trailing = receive.read_to_end(1).await?;
+                if !trailing.is_empty() {
+                    return Err(other_error("反向持续换网请求包含多余数据"));
+                }
+                write_sustained_records(
+                    &mut send,
+                    request.duration,
+                    request.chunk_size,
+                    request.seed,
+                )
+                .await?;
+            }
+        }
+        Ok(())
+    }
+    .await;
+
+    if let Err(error) = &result
+        && let Some(events) = sustained_events
+    {
+        let _ = events.send(SustainedServerEvent::Failed(error.to_string()));
+    }
+    result
+}
+
+async fn read_sustained_stream_request(
+    receive: &mut noq::RecvStream,
+    first: [u8; 8],
+) -> LabResult<SustainedStreamRequest> {
+    let mut header = [0_u8; SUSTAINED_FAILOVER_HEADER_SIZE];
+    header[..first.len()].copy_from_slice(&first);
+    receive.read_exact(&mut header[first.len()..]).await?;
+
+    if &header[..4] != SUSTAINED_FAILOVER_MAGIC
+        || header[5..8] != [0; 3]
+        || header[17..20] != [0; 3]
+    {
+        return Err(other_error("持续换网实验请求头格式不正确"));
+    }
+
+    let direction = FailoverDirection::try_from(header[4])?;
+    let duration_millis = u32::from_be_bytes(
+        header[8..12]
+            .try_into()
+            .expect("持续换网实验时长固定为 4 字节"),
+    );
+    let chunk_size = u32::from_be_bytes(
+        header[12..16]
+            .try_into()
+            .expect("持续换网实验记录大小固定为 4 字节"),
+    ) as usize;
+    let duration = Duration::from_millis(duration_millis.into());
+    if duration.is_zero() || duration > MAX_SUSTAINED_MEASUREMENT {
+        return Err(other_error("持续换网实验请求的时长不合法"));
+    }
+    if !(SUSTAINED_RECORD_HEADER_SIZE..=MAX_PAYLOAD_SIZE).contains(&chunk_size) {
+        return Err(other_error("持续换网实验请求的记录大小不合法"));
+    }
+
+    Ok(SustainedStreamRequest {
+        direction,
+        duration,
+        chunk_size,
+        seed: header[16],
+    })
+}
+
+fn make_sustained_stream_request(config: SustainedFailoverConfig) -> LabResult<[u8; 20]> {
+    let duration_millis = u32::try_from(config.total_duration.as_millis())
+        .map_err(|_| other_error("持续换网实验时长无法写入请求头"))?;
+    let chunk_size = u32::try_from(config.chunk_size)
+        .map_err(|_| other_error("持续换网实验记录大小无法写入请求头"))?;
+    let mut header = [0_u8; SUSTAINED_FAILOVER_HEADER_SIZE];
+    header[..4].copy_from_slice(SUSTAINED_FAILOVER_MAGIC);
+    header[4] = config.direction as u8;
+    header[8..12].copy_from_slice(&duration_millis.to_be_bytes());
+    header[12..16].copy_from_slice(&chunk_size.to_be_bytes());
+    header[16] = config.seed;
+    Ok(header)
+}
+
+fn make_sustained_success_response(records: u64, bytes: u64) -> [u8; 20] {
+    let mut response = [0_u8; 20];
+    response[..4].copy_from_slice(SUSTAINED_FAILOVER_OK);
+    response[4..12].copy_from_slice(&records.to_be_bytes());
+    response[12..20].copy_from_slice(&bytes.to_be_bytes());
+    response
+}
+
+fn parse_sustained_success_response(response: &[u8]) -> LabResult<(u64, u64)> {
+    if response.len() != 20 || &response[..4] != SUSTAINED_FAILOVER_OK {
+        return Err(other_error("服务端没有返回有效的持续换网校验结果"));
+    }
+    let records = u64::from_be_bytes(
+        response[4..12]
+            .try_into()
+            .expect("持续换网记录数固定为 8 字节"),
+    );
+    let bytes = u64::from_be_bytes(
+        response[12..20]
+            .try_into()
+            .expect("持续换网字节数固定为 8 字节"),
+    );
+    Ok((records, bytes))
+}
+
+async fn write_sustained_records(
+    send: &mut noq::SendStream,
+    duration: Duration,
+    chunk_size: usize,
+    seed: u8,
+) -> LabResult<(u64, u64, Duration)> {
+    let started = Instant::now();
+    let mut sequence = 0_u64;
+    let mut bytes = 0_u64;
+    let mut payload = vec![0_u8; chunk_size];
+
+    while started.elapsed() < duration {
+        fill_sustained_payload(&mut payload, seed, sequence);
+        let mut header = [0_u8; SUSTAINED_RECORD_HEADER_SIZE];
+        header[..8].copy_from_slice(&sequence.to_be_bytes());
+        header[8..].copy_from_slice(&digest(&payload).to_be_bytes());
+        timeout(OPERATION_TIMEOUT, async {
+            send.write_all(&header).await?;
+            send.write_all(&payload).await?;
+            Ok::<(), LabError>(())
+        })
+        .await
+        .map_err(|_| other_error("持续换网数据记录发送超时"))??;
+
+        sequence = sequence
+            .checked_add(1)
+            .ok_or_else(|| other_error("持续换网记录编号溢出"))?;
+        bytes = bytes
+            .checked_add(chunk_size as u64)
+            .ok_or_else(|| other_error("持续换网累计字节数溢出"))?;
+    }
+
+    let mut end = [0_u8; SUSTAINED_RECORD_HEADER_SIZE];
+    end[..8].copy_from_slice(&SUSTAINED_RECORD_END.to_be_bytes());
+    end[8..].copy_from_slice(&sequence.to_be_bytes());
+    timeout(OPERATION_TIMEOUT, send.write_all(&end))
+        .await
+        .map_err(|_| other_error("持续换网结束标记发送超时"))??;
+    send.finish()?;
+    Ok((sequence, bytes, started.elapsed()))
+}
+
+async fn receive_sustained_records(
+    receive: &mut noq::RecvStream,
+    chunk_size: usize,
+    seed: u8,
+    sustained_events: Option<&mpsc::UnboundedSender<SustainedServerEvent>>,
+) -> LabResult<SustainedReceiveTrace> {
+    let started = Instant::now();
+    let mut expected_sequence = 0_u64;
+    let mut bytes = 0_u64;
+    let mut payload = vec![0_u8; chunk_size];
+    let mut received_at = Vec::new();
+
+    loop {
+        let mut header = [0_u8; SUSTAINED_RECORD_HEADER_SIZE];
+        timeout(OPERATION_TIMEOUT, receive.read_exact(&mut header))
+            .await
+            .map_err(|_| other_error("等待持续换网数据记录超时"))??;
+        let sequence = u64::from_be_bytes(
+            header[..8]
+                .try_into()
+                .expect("持续换网记录编号固定为 8 字节"),
+        );
+        let expected_digest =
+            u64::from_be_bytes(header[8..].try_into().expect("持续换网摘要固定为 8 字节"));
+
+        if sequence == SUSTAINED_RECORD_END {
+            if expected_digest != expected_sequence {
+                return Err(other_error("持续换网结束标记的记录总数不正确"));
+            }
+            let trailing = receive.read_to_end(1).await?;
+            if !trailing.is_empty() {
+                return Err(other_error("持续换网结束标记后仍有多余数据"));
+            }
+            if let Some(events) = sustained_events {
+                events
+                    .send(SustainedServerEvent::Finished {
+                        records: expected_sequence,
+                        bytes,
+                    })
+                    .map_err(|_| other_error("持续换网服务端事件接收端已关闭"))?;
+            }
+            return Ok(SustainedReceiveTrace {
+                received_at,
+                records: expected_sequence,
+                bytes,
+                elapsed: started.elapsed(),
+            });
+        }
+
+        if sequence != expected_sequence {
+            return Err(other_error(format!(
+                "持续换网记录编号错误：期望 {expected_sequence}，实际 {sequence}"
+            )));
+        }
+        timeout(OPERATION_TIMEOUT, receive.read_exact(&mut payload))
+            .await
+            .map_err(|_| other_error("等待持续换网记录载荷超时"))??;
+        if !sustained_payload_is_valid(&payload, seed, sequence)
+            || digest(&payload) != expected_digest
+        {
+            return Err(other_error(format!(
+                "持续换网记录 {sequence} 的内容摘要不正确"
+            )));
+        }
+
+        let now = Instant::now();
+        received_at.push(now);
+        if let Some(events) = sustained_events {
+            events
+                .send(SustainedServerEvent::Record {
+                    sequence,
+                    received_at: now,
+                })
+                .map_err(|_| other_error("持续换网服务端事件接收端已关闭"))?;
+        }
+        expected_sequence += 1;
+        bytes = bytes
+            .checked_add(chunk_size as u64)
+            .ok_or_else(|| other_error("持续换网接收字节数溢出"))?;
+    }
+}
+
+fn fill_sustained_payload(payload: &mut [u8], seed: u8, sequence: u64) {
+    let sequence = sequence as u8;
+    for (index, byte) in payload.iter_mut().enumerate() {
+        *byte = seed
+            .wrapping_add(sequence)
+            .wrapping_add((index as u8).wrapping_mul(31));
+    }
+}
+
+fn sustained_payload_is_valid(payload: &[u8], seed: u8, sequence: u64) -> bool {
+    let sequence = sequence as u8;
+    payload.iter().enumerate().all(|(index, byte)| {
+        *byte
+            == seed
+                .wrapping_add(sequence)
+                .wrapping_add((index as u8).wrapping_mul(31))
+    })
 }
 
 struct PreparedTransfer {
@@ -1431,6 +2180,73 @@ mod tests {
         lab.shutdown().await.expect("进度实验应正常关闭");
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sustained_failover_protocol_preserves_both_directions() {
+        for direction in FailoverDirection::ALL {
+            let (lab, events) = start_connection_with_sustained_observer(
+                Ipv4Addr::UNSPECIFIED,
+                None,
+                PtoRecovery::Disabled,
+            )
+            .await
+            .expect("正式换网协议实验应建立连接");
+            let config = SustainedFailoverConfig::new(
+                MultipathScheduler::NoqDefault,
+                PtoRecovery::Disabled,
+                direction,
+                Duration::from_millis(100),
+                Duration::from_millis(50),
+                4 * 1024,
+                31,
+            );
+            let (started_tx, started_rx) = oneshot::channel();
+            let task = tokio::spawn(run_sustained_failover_flow(
+                lab.connection.clone(),
+                config,
+                events,
+                started_tx,
+            ));
+            let _ = timeout(OPERATION_TIMEOUT, started_rx)
+                .await
+                .expect("正式换网协议应报告开始")
+                .expect("正式换网协议开始通道不应关闭");
+            let trace = timeout(OPERATION_TIMEOUT, task)
+                .await
+                .expect("正式换网协议不应超时")
+                .expect("正式换网协议任务不应崩溃")
+                .expect("正式换网协议应完整校验");
+
+            assert!(trace.records > 0);
+            assert_eq!(trace.bytes, trace.records * config.chunk_size as u64);
+            assert_eq!(trace.received_at.len() as u64, trace.records);
+            lab.shutdown().await.expect("正式换网协议实验应正常关闭");
+        }
+    }
+
+    #[test]
+    fn recovery_gap_keeps_stale_post_fault_delivery_from_hiding_outage() {
+        let base = Instant::now();
+        let received = [
+            base,
+            base + Duration::from_millis(10),
+            base + Duration::from_millis(12),
+            base + Duration::from_millis(412),
+            base + Duration::from_millis(420),
+        ];
+        let gap = recovery_gap_after_fault(&received, base + Duration::from_millis(11))
+            .expect("故障前后都有数据，应找到恢复间隔");
+        assert_eq!(gap, Duration::from_millis(400));
+    }
+
+    #[test]
+    fn sustained_payload_validation_detects_corruption() {
+        let mut payload = vec![0_u8; 1024];
+        fill_sustained_payload(&mut payload, 7, 19);
+        assert!(sustained_payload_is_valid(&payload, 7, 19));
+        payload[511] ^= 0x80;
+        assert!(!sustained_payload_is_valid(&payload, 7, 19));
+    }
+
     #[test]
     fn malformed_application_frame_is_rejected() {
         assert_eq!(parse_frame(b"bad"), Err("数据太短"));
@@ -1492,5 +2308,27 @@ mod tests {
             MAX_PAYLOAD_SIZE + 1,
         );
         assert!(oversized_chunk.validate().is_err());
+
+        let fault_after_end = SustainedFailoverConfig::new(
+            MultipathScheduler::NoqDefault,
+            PtoRecovery::Disabled,
+            FailoverDirection::ClientToServer,
+            Duration::from_secs(30),
+            Duration::from_secs(30),
+            16 * 1024,
+            1,
+        );
+        assert!(fault_after_end.validate().is_err());
+
+        let tiny_failover_chunk = SustainedFailoverConfig::new(
+            MultipathScheduler::NoqDefault,
+            PtoRecovery::Disabled,
+            FailoverDirection::ServerToClient,
+            Duration::from_secs(30),
+            Duration::from_secs(10),
+            SUSTAINED_RECORD_HEADER_SIZE - 1,
+            1,
+        );
+        assert!(tiny_failover_chunk.validate().is_err());
     }
 }
