@@ -1,8 +1,12 @@
 use std::{
     error::Error,
-    io,
+    fs, io,
     net::{IpAddr, Ipv4Addr, SocketAddr},
-    sync::Arc,
+    process::Command,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -34,6 +38,8 @@ const FAILOVER_OBSERVATION_TIMEOUT: Duration = Duration::from_secs(8);
 const NETWORK_PATH_IDLE_TIMEOUT: Duration = Duration::from_secs(3);
 const DATAGRAM_SEND_INTERVAL: Duration = Duration::from_millis(5);
 const DATAGRAM_RECEIVE_GRACE: Duration = Duration::from_millis(1_500);
+const MAX_SUSTAINED_WARMUP: Duration = Duration::from_secs(30);
+const MAX_SUSTAINED_MEASUREMENT: Duration = Duration::from_secs(120);
 const LINE_ONE_IP: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 1);
 const LINE_TWO_IP: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 2);
 
@@ -109,6 +115,69 @@ impl NetworkBenchmarkConfig {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct SustainedBenchmarkConfig {
+    pub mode: PathMode,
+    pub scheduler: MultipathScheduler,
+    pub warmup_duration: Duration,
+    pub measurement_duration: Duration,
+    pub chunk_size: usize,
+}
+
+impl SustainedBenchmarkConfig {
+    pub fn new(
+        mode: PathMode,
+        scheduler: MultipathScheduler,
+        warmup_duration: Duration,
+        measurement_duration: Duration,
+        chunk_size: usize,
+    ) -> Self {
+        Self {
+            mode,
+            scheduler,
+            warmup_duration,
+            measurement_duration,
+            chunk_size,
+        }
+    }
+
+    fn validate(self) -> LabResult<()> {
+        if self.warmup_duration.is_zero() || self.warmup_duration > MAX_SUSTAINED_WARMUP {
+            return Err(other_error(format!(
+                "持续实验预热时间必须大于 0 且不超过 {} 秒",
+                MAX_SUSTAINED_WARMUP.as_secs()
+            )));
+        }
+        if self.measurement_duration.is_zero()
+            || self.measurement_duration > MAX_SUSTAINED_MEASUREMENT
+        {
+            return Err(other_error(format!(
+                "持续实验计时时间必须大于 0 且不超过 {} 秒",
+                MAX_SUSTAINED_MEASUREMENT.as_secs()
+            )));
+        }
+        if self.chunk_size == 0 || self.chunk_size > MAX_PAYLOAD_SIZE {
+            return Err(other_error(format!(
+                "持续实验单块大小必须大于 0 且不超过 {MAX_PAYLOAD_SIZE} 字节"
+            )));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum BenchmarkWorkload {
+    Fixed {
+        transfer_size: usize,
+        datagram_count: usize,
+    },
+    Sustained {
+        warmup_duration: Duration,
+        measurement_duration: Duration,
+        chunk_size: usize,
+    },
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 pub struct PathMeasurement {
     pub udp_bytes_sent: u64,
@@ -151,6 +220,9 @@ pub struct NetworkBenchmarkReport {
     pub line_two: PathMeasurement,
     pub total_udp_bytes_sent: u64,
     pub extra_udp_bytes_sent: u64,
+    pub cpu_time: Duration,
+    pub cpu_utilization_percent: f64,
+    pub peak_rss_kib: u64,
 }
 
 impl NetworkBenchmarkReport {
@@ -187,6 +259,80 @@ struct RunningLab {
     connection: Connection,
     server_addr: SocketAddr,
     primary: Path,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ResourceMeasurement {
+    cpu_time: Duration,
+    cpu_utilization_percent: f64,
+    peak_rss_kib: u64,
+}
+
+struct ResourceMonitor {
+    cpu_ticks_before: u64,
+    stop: Arc<AtomicBool>,
+    peak_rss_kib: Arc<AtomicU64>,
+    task: Option<JoinHandle<()>>,
+}
+
+impl ResourceMonitor {
+    fn start() -> LabResult<Self> {
+        let cpu_ticks_before = read_process_cpu_ticks()?;
+        let initial_rss = read_process_rss_kib()?;
+        let stop = Arc::new(AtomicBool::new(false));
+        let peak_rss_kib = Arc::new(AtomicU64::new(initial_rss));
+        let monitor_stop = stop.clone();
+        let monitor_peak = peak_rss_kib.clone();
+        let task = tokio::spawn(async move {
+            while !monitor_stop.load(Ordering::Relaxed) {
+                if let Ok(rss_kib) = read_process_rss_kib() {
+                    monitor_peak.fetch_max(rss_kib, Ordering::Relaxed);
+                }
+                sleep(Duration::from_millis(50)).await;
+            }
+        });
+
+        Ok(Self {
+            cpu_ticks_before,
+            stop,
+            peak_rss_kib,
+            task: Some(task),
+        })
+    }
+
+    async fn finish(mut self, elapsed: Duration) -> LabResult<ResourceMeasurement> {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(task) = self.task.take() {
+            task.await
+                .map_err(|error| other_error(format!("资源监控任务异常退出：{error}")))?;
+        }
+        let final_rss = read_process_rss_kib()?;
+        self.peak_rss_kib.fetch_max(final_rss, Ordering::Relaxed);
+
+        let cpu_ticks = read_process_cpu_ticks()?.saturating_sub(self.cpu_ticks_before);
+        let ticks_per_second = process_clock_ticks_per_second()?;
+        let cpu_time = Duration::from_secs_f64(cpu_ticks as f64 / ticks_per_second as f64);
+        let cpu_utilization_percent = if elapsed.is_zero() {
+            0.0
+        } else {
+            cpu_time.as_secs_f64() / elapsed.as_secs_f64() * 100.0
+        };
+
+        Ok(ResourceMeasurement {
+            cpu_time,
+            cpu_utilization_percent,
+            peak_rss_kib: self.peak_rss_kib.load(Ordering::Relaxed),
+        })
+    }
+}
+
+impl Drop for ResourceMonitor {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
+    }
 }
 
 impl RunningLab {
@@ -310,15 +456,52 @@ pub async fn run_network_benchmark(
 ) -> LabResult<NetworkBenchmarkReport> {
     config.validate()?;
 
-    let client_ip = match config.mode {
+    run_network_workload(
+        config.mode,
+        config.scheduler,
+        BenchmarkWorkload::Fixed {
+            transfer_size: config.transfer_size,
+            datagram_count: config.datagram_count,
+        },
+    )
+    .await
+}
+
+pub async fn run_sustained_network_benchmark(
+    config: SustainedBenchmarkConfig,
+) -> LabResult<NetworkBenchmarkReport> {
+    config.validate()?;
+
+    run_network_workload(
+        config.mode,
+        config.scheduler,
+        BenchmarkWorkload::Sustained {
+            warmup_duration: config.warmup_duration,
+            measurement_duration: config.measurement_duration,
+            chunk_size: config.chunk_size,
+        },
+    )
+    .await
+}
+
+async fn run_network_workload(
+    mode: PathMode,
+    scheduler: MultipathScheduler,
+    workload: BenchmarkWorkload,
+) -> LabResult<NetworkBenchmarkReport> {
+    let datagram_count = match workload {
+        BenchmarkWorkload::Fixed { datagram_count, .. } => datagram_count,
+        BenchmarkWorkload::Sustained { .. } => 0,
+    };
+
+    let client_ip = match mode {
         PathMode::LineOneOnly => LINE_ONE_IP,
         PathMode::LineTwoOnly => LINE_TWO_IP,
         PathMode::MultipathAvailable => Ipv4Addr::UNSPECIFIED,
     };
-    let lab =
-        start_connection(client_ip, Some(NETWORK_PATH_IDLE_TIMEOUT), config.scheduler).await?;
+    let lab = start_connection(client_ip, Some(NETWORK_PATH_IDLE_TIMEOUT), scheduler).await?;
 
-    let secondary = if config.mode == PathMode::MultipathAvailable {
+    let secondary = if mode == PathMode::MultipathAvailable {
         Some(lab.open_second_path(PathStatus::Available).await?)
     } else {
         None
@@ -326,14 +509,38 @@ pub async fn run_network_benchmark(
     sleep(Duration::from_millis(150)).await;
 
     let operation_result: LabResult<NetworkBenchmarkReport> = async {
+        if let BenchmarkWorkload::Sustained {
+            warmup_duration,
+            chunk_size,
+            ..
+        } = workload
+        {
+            let _ =
+                transfer_for_duration(&lab.connection, warmup_duration, chunk_size, 131).await?;
+        }
+
         let primary_before = lab.primary.stats();
         let secondary_before = secondary.as_ref().map(Path::stats);
+        let resource_monitor = ResourceMonitor::start()?;
 
-        let transfer_started = Instant::now();
-        transfer_and_verify(&lab.connection, config.transfer_size, 83).await?;
-        let transfer_duration = transfer_started.elapsed();
+        let (transfer_size, transfer_duration) = match workload {
+            BenchmarkWorkload::Fixed { transfer_size, .. } => {
+                let transfer_started = Instant::now();
+                transfer_and_verify(&lab.connection, transfer_size, 83).await?;
+                (transfer_size, transfer_started.elapsed())
+            }
+            BenchmarkWorkload::Sustained {
+                measurement_duration,
+                chunk_size,
+                ..
+            } => {
+                transfer_for_duration(&lab.connection, measurement_duration, chunk_size, 197)
+                    .await?
+            }
+        };
+        let resources = resource_monitor.finish(transfer_duration).await?;
 
-        let datagrams = datagram_echo_probe(&lab.connection, config.datagram_count).await?;
+        let datagrams = datagram_echo_probe(&lab.connection, datagram_count).await?;
 
         let primary_after = lab.primary.stats();
         let secondary_after = secondary.as_ref().map(Path::stats);
@@ -343,7 +550,7 @@ pub async fn run_network_benchmark(
             _ => PathMeasurement::default(),
         };
 
-        let (line_one, line_two) = match config.mode {
+        let (line_one, line_two) = match mode {
             PathMode::LineOneOnly => (primary_measurement, PathMeasurement::default()),
             PathMode::LineTwoOnly => (PathMeasurement::default(), primary_measurement),
             PathMode::MultipathAvailable => (primary_measurement, secondary_measurement),
@@ -351,22 +558,24 @@ pub async fn run_network_benchmark(
         let total_udp_bytes_sent = line_one
             .udp_bytes_sent
             .saturating_add(line_two.udp_bytes_sent);
-        let application_bytes_sent = (config.transfer_size as u64).saturating_add(
-            (config.datagram_count as u64).saturating_mul(DATAGRAM_PROBE_SIZE as u64),
-        );
+        let application_bytes_sent = (transfer_size as u64)
+            .saturating_add((datagram_count as u64).saturating_mul(DATAGRAM_PROBE_SIZE as u64));
 
         Ok(NetworkBenchmarkReport {
-            mode: config.mode,
-            scheduler: config.scheduler,
+            mode,
+            scheduler,
             multipath_negotiated: lab.connection.is_multipath_enabled(),
-            transfer_size: config.transfer_size,
+            transfer_size,
             transfer_duration,
-            throughput_mbps: throughput_mbps(config.transfer_size, transfer_duration),
+            throughput_mbps: throughput_mbps(transfer_size, transfer_duration),
             datagrams,
             line_one,
             line_two,
             total_udp_bytes_sent,
             extra_udp_bytes_sent: total_udp_bytes_sent.saturating_sub(application_bytes_sent),
+            cpu_time: resources.cpu_time,
+            cpu_utilization_percent: resources.cpu_utilization_percent,
+            peak_rss_kib: resources.peak_rss_kib,
         })
     }
     .await;
@@ -586,15 +795,56 @@ async fn handle_stream(mut send: noq::SendStream, mut receive: noq::RecvStream) 
     Ok(())
 }
 
-async fn transfer_and_verify(connection: &Connection, size: usize, seed: u8) -> LabResult<()> {
-    let payload = make_payload(size, seed);
-    let request = make_frame(&payload);
-    let expected_digest = digest(&payload);
+struct PreparedTransfer {
+    request: Vec<u8>,
+    payload_size: usize,
+    expected_digest: u64,
+}
 
+impl PreparedTransfer {
+    fn new(size: usize, seed: u8) -> Self {
+        let payload = make_payload(size, seed);
+        Self {
+            request: make_frame(&payload),
+            payload_size: size,
+            expected_digest: digest(&payload),
+        }
+    }
+}
+
+async fn transfer_and_verify(connection: &Connection, size: usize, seed: u8) -> LabResult<()> {
+    let transfer = PreparedTransfer::new(size, seed);
+    transfer_prepared_and_verify(connection, &transfer).await
+}
+
+async fn transfer_for_duration(
+    connection: &Connection,
+    duration: Duration,
+    chunk_size: usize,
+    seed: u8,
+) -> LabResult<(usize, Duration)> {
+    let transfer = PreparedTransfer::new(chunk_size, seed);
+    let started = Instant::now();
+    let mut transferred = 0usize;
+
+    while started.elapsed() < duration {
+        transfer_prepared_and_verify(connection, &transfer).await?;
+        transferred = transferred
+            .checked_add(chunk_size)
+            .ok_or_else(|| other_error("持续实验累计字节数溢出"))?;
+    }
+
+    Ok((transferred, started.elapsed()))
+}
+
+async fn transfer_prepared_and_verify(
+    connection: &Connection,
+    transfer: &PreparedTransfer,
+) -> LabResult<()> {
     let (mut send, mut receive) = timeout(OPERATION_TIMEOUT, connection.open_bi())
         .await
         .map_err(|_| other_error("打开数据流超时"))??;
-    timeout(OPERATION_TIMEOUT, send.write_all(&request))
+    timeout(OPERATION_TIMEOUT, send.write_all(&transfer.request))
         .await
         .map_err(|_| other_error("发送测试数据超时"))??;
     send.finish()?;
@@ -602,7 +852,7 @@ async fn transfer_and_verify(connection: &Connection, size: usize, seed: u8) -> 
     let response = timeout(OPERATION_TIMEOUT, receive.read_to_end(64))
         .await
         .map_err(|_| other_error("等待服务端校验结果超时"))??;
-    verify_success_response(&response, size, expected_digest)
+    verify_success_response(&response, transfer.payload_size, transfer.expected_digest)
 }
 
 async fn send_malformed_frame(connection: &Connection) -> LabResult<bool> {
@@ -860,6 +1110,56 @@ fn throughput_mbps(bytes: usize, elapsed: Duration) -> f64 {
     (bytes as f64 * 8.0) / elapsed.as_secs_f64() / 1_000_000.0
 }
 
+fn read_process_cpu_ticks() -> LabResult<u64> {
+    let stat = fs::read_to_string("/proc/self/stat")?;
+    let fields = stat
+        .rfind(") ")
+        .map(|index| &stat[index + 2..])
+        .ok_or_else(|| other_error("无法解析 /proc/self/stat 中的进程名称"))?;
+    let mut fields = fields.split_whitespace();
+    let user_ticks = fields
+        .nth(11)
+        .ok_or_else(|| other_error("/proc/self/stat 缺少用户 CPU 时间"))?
+        .parse::<u64>()?;
+    let system_ticks = fields
+        .next()
+        .ok_or_else(|| other_error("/proc/self/stat 缺少系统 CPU 时间"))?
+        .parse::<u64>()?;
+    Ok(user_ticks.saturating_add(system_ticks))
+}
+
+fn read_process_rss_kib() -> LabResult<u64> {
+    let status = fs::read_to_string("/proc/self/status")?;
+    let value = status
+        .lines()
+        .find_map(|line| line.strip_prefix("VmRSS:"))
+        .and_then(|value| value.split_whitespace().next())
+        .ok_or_else(|| other_error("/proc/self/status 缺少 VmRSS"))?;
+    Ok(value.parse()?)
+}
+
+fn process_clock_ticks_per_second() -> LabResult<u64> {
+    static TICKS_PER_SECOND: AtomicU64 = AtomicU64::new(0);
+    let cached = TICKS_PER_SECOND.load(Ordering::Relaxed);
+    if cached != 0 {
+        return Ok(cached);
+    }
+
+    let output = Command::new("getconf").arg("CLK_TCK").output()?;
+    if !output.status.success() {
+        return Err(other_error(format!(
+            "getconf CLK_TCK 失败：{}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    let ticks = String::from_utf8(output.stdout)?.trim().parse::<u64>()?;
+    if ticks == 0 {
+        return Err(other_error("getconf CLK_TCK 返回了 0"));
+    }
+    TICKS_PER_SECOND.store(ticks, Ordering::Relaxed);
+    Ok(ticks)
+}
+
 pub fn verify_basic_report(report: &BasicLabReport) -> LabResult<()> {
     if !report.multipath_negotiated {
         return Err(other_error("MPQUIC 没有协商成功"));
@@ -927,6 +1227,24 @@ mod tests {
         verify_basic_report(&report).expect("实验报告中的全部基础条件都应通过");
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sustained_mpquic_workload_runs_past_requested_duration() {
+        let report = run_sustained_network_benchmark(SustainedBenchmarkConfig::new(
+            PathMode::MultipathAvailable,
+            MultipathScheduler::RoundRobin,
+            Duration::from_millis(50),
+            Duration::from_millis(100),
+            64 * 1024,
+        ))
+        .await
+        .expect("持续 MPQUIC 实验应成功运行");
+
+        assert!(report.multipath_negotiated);
+        assert!(report.transfer_duration >= Duration::from_millis(100));
+        assert!(report.transfer_size >= 64 * 1024);
+        assert!(report.peak_rss_kib > 0);
+    }
+
     #[test]
     fn malformed_application_frame_is_rejected() {
         assert_eq!(parse_frame(b"bad"), Err("数据太短"));
@@ -961,5 +1279,32 @@ mod tests {
             MAX_DATAGRAM_PROBES + 1,
         );
         assert!(too_many_probes.validate().is_err());
+
+        let no_warmup = SustainedBenchmarkConfig::new(
+            PathMode::MultipathAvailable,
+            MultipathScheduler::RoundRobin,
+            Duration::ZERO,
+            Duration::from_secs(20),
+            512 * 1024,
+        );
+        assert!(no_warmup.validate().is_err());
+
+        let too_long = SustainedBenchmarkConfig::new(
+            PathMode::MultipathAvailable,
+            MultipathScheduler::RoundRobin,
+            Duration::from_secs(2),
+            MAX_SUSTAINED_MEASUREMENT + Duration::from_secs(1),
+            512 * 1024,
+        );
+        assert!(too_long.validate().is_err());
+
+        let oversized_chunk = SustainedBenchmarkConfig::new(
+            PathMode::MultipathAvailable,
+            MultipathScheduler::RoundRobin,
+            Duration::from_secs(2),
+            Duration::from_secs(20),
+            MAX_PAYLOAD_SIZE + 1,
+        );
+        assert!(oversized_chunk.validate().is_err());
     }
 }

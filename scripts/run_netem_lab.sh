@@ -12,13 +12,16 @@ case "$mode" in
     screen)
         test_name="scheduler_five_seed_screening_lab"
         ;;
+    long)
+        test_name="scheduler_long_duration_benchmark_lab"
+        ;;
     *)
-        echo "用法：$0 [smoke|screen]" >&2
+        echo "用法：$0 [smoke|screen|long]" >&2
         exit 2
         ;;
 esac
 
-for required_command in unshare ip tc cargo readlink; do
+for required_command in unshare ip tc cargo readlink getconf; do
     if ! command -v "$required_command" >/dev/null 2>&1; then
         echo "缺少实验所需命令：$required_command" >&2
         exit 1
@@ -29,7 +32,7 @@ cd "$repo_root"
 
 parent_netns="$(readlink /proc/self/ns/net)"
 
-FLOWWEAVE_LAB_TEST="$test_name" FLOWWEAVE_PARENT_NETNS="$parent_netns" unshare --user --map-root-user --net -- bash -c '
+FLOWWEAVE_LAB_MODE="$mode" FLOWWEAVE_LAB_TEST="$test_name" FLOWWEAVE_PARENT_NETNS="$parent_netns" unshare --user --map-root-user --net -- bash -c '
 set -euo pipefail
 
 ip link set lo up
@@ -43,5 +46,9 @@ tc filter add dev lo protocol ip parent 1: prio 2 u32 match ip dst 127.0.0.2/32 
 tc filter add dev lo protocol ip parent 1: prio 3 u32 match u32 0 0 flowid 1:1
 
 export FLOWWEAVE_NETEM_LAB=1
-cargo test --test network_lab "$FLOWWEAVE_LAB_TEST" -- --ignored --nocapture --test-threads=1
+if [[ "$FLOWWEAVE_LAB_MODE" == "long" ]]; then
+    cargo test --release --test network_lab "$FLOWWEAVE_LAB_TEST" -- --ignored --nocapture --test-threads=1
+else
+    cargo test --test network_lab "$FLOWWEAVE_LAB_TEST" -- --ignored --nocapture --test-threads=1
+fi
 '
