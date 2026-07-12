@@ -504,6 +504,7 @@ async fn failover_timeline_diagnostic_lab() -> LabResult<()> {
         "FlowWeave / 织流：A 组 PATH_ACK 同路优先修复诊断",
         "只复跑两个正向代表种子和一个反向种子；不改变 PTO 恢复算法或超时。",
         &CASES,
+        None,
     )
     .await
 }
@@ -557,6 +558,22 @@ async fn failover_ack_escape_representative_diagnostic_lab() -> LabResult<()> {
         "FlowWeave / 织流：A 组 ACK 逃生代表场诊断",
         "使用完全相同的 ACK 逃生候选复跑正向与反向种子 1101；不改算法、不调门槛。",
         &CASES,
+        None,
+    )
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "必须通过 scripts/run_netem_lab.sh diagnose-second-gap 在隔离网络命名空间中运行"]
+async fn failover_second_gap_stream_state_diagnostic_lab() -> LabResult<()> {
+    const CASES: [(FailoverDirection, usize); 1] = [(FailoverDirection::ClientToServer, 0_usize)];
+    run_failover_diagnostic_cases(
+        "benchmark-results/2026-07-12-second-gap-stream-state-summary.csv",
+        PtoRecovery::CrossPathRecoveryWithAckEscape,
+        "FlowWeave / 织流：A 组第二缺口数据级状态诊断",
+        "只复跑正向种子 1101；每 5 毫秒只读采集 R/H/A/Q，不改变发包、超时或线协议。",
+        &CASES,
+        Some("benchmark-results/2026-07-12-second-gap-stream-state-timeline.csv"),
     )
     .await
 }
@@ -567,6 +584,7 @@ async fn run_failover_diagnostic_cases(
     title: &str,
     note: &str,
     cases: &[(FailoverDirection, usize)],
+    stream_state_path: Option<&str>,
 ) -> LabResult<()> {
     ensure_isolated_network_namespace()?;
 
@@ -579,6 +597,9 @@ async fn run_failover_diagnostic_cases(
 
     let mut observations = Vec::with_capacity(cases.len());
     write_formal_failover_csv(result_path, &observations)?;
+    if let Some(path) = stream_state_path {
+        write_stream_state_csv(path, &observations)?;
+    }
     for &(direction, seed_index) in cases {
         let seeds = SEED_PAIRS[seed_index];
         let round = seed_index + 1;
@@ -590,18 +611,22 @@ async fn run_failover_diagnostic_cases(
             seeds.line_two,
         );
         apply_profiles(normal_line_one, normal_line_two, seeds)?;
+        let mut config = SustainedFailoverConfig::new(
+            MultipathScheduler::NoqDefault,
+            pto_recovery,
+            direction,
+            FORMAL_FAILOVER_DURATION,
+            FORMAL_FAILOVER_AT,
+            FORMAL_FAILOVER_CHUNK_SIZE,
+            151_u8
+                .wrapping_add(round as u8)
+                .wrapping_add((direction as u8).wrapping_mul(17)),
+        );
+        if stream_state_path.is_some() {
+            config = config.with_stream_state_diagnostics();
+        }
         let report = run_sustained_blackhole_failover(
-            SustainedFailoverConfig::new(
-                MultipathScheduler::NoqDefault,
-                pto_recovery,
-                direction,
-                FORMAL_FAILOVER_DURATION,
-                FORMAL_FAILOVER_AT,
-                FORMAL_FAILOVER_CHUNK_SIZE,
-                151_u8
-                    .wrapping_add(round as u8)
-                    .wrapping_add((direction as u8).wrapping_mul(17)),
-            ),
+            config,
             || {
                 replace_line_profile(
                     "1:1",
@@ -624,10 +649,16 @@ async fn run_failover_diagnostic_cases(
         print_formal_failover_observation(&observation);
         observations.push(observation);
         write_formal_failover_csv(result_path, &observations)?;
+        if let Some(path) = stream_state_path {
+            write_stream_state_csv(path, &observations)?;
+        }
     }
 
     println!();
     println!("诊断原始数据已写入 {result_path}");
+    if let Some(path) = stream_state_path {
+        println!("数据级状态时间线已写入 {path}");
+    }
     Ok(())
 }
 
@@ -2191,6 +2222,71 @@ fn write_formal_failover_csv(
     Ok(())
 }
 
+fn write_stream_state_csv(path: &str, observations: &[FormalFailoverObservation]) -> LabResult<()> {
+    let mut csv = String::from(
+        "direction,round,line_one_seed,line_two_seed,elapsed_after_fault_ms,stream_id,sender_fully_acked_offset,sender_unacknowledged_bytes,sender_lowest_retransmit_offset,sender_retransmit_bytes,receiver_contiguous_offset,receiver_highest_offset,receiver_buffered_after_gap_bytes,feedback_debt_bytes,retransmit_target_minus_receiver_bytes,secondary_lost_packets,secondary_stream_retransmit_bytes,secondary_pto_timeouts,secondary_cwnd,secondary_bytes_in_flight\n",
+    );
+
+    for observation in observations {
+        for sample in &observation.report.stream_state_samples {
+            let buffered_after_gap = match (
+                sample.receiver_highest_offset,
+                sample.receiver_contiguous_offset,
+            ) {
+                (Some(highest), Some(contiguous)) => Some(highest.saturating_sub(contiguous)),
+                _ => None,
+            };
+            let feedback_debt = match (
+                sample.receiver_contiguous_offset,
+                sample.sender_fully_acked_offset,
+            ) {
+                (Some(contiguous), Some(acked)) => Some(contiguous.saturating_sub(acked)),
+                _ => None,
+            };
+            let retransmit_target_delta = match (
+                sample.sender_lowest_retransmit_offset,
+                sample.receiver_contiguous_offset,
+            ) {
+                (Some(target), Some(contiguous)) => {
+                    Some(i128::from(target) - i128::from(contiguous))
+                }
+                _ => None,
+            };
+
+            writeln!(
+                csv,
+                "{},{},{},{},{:.3},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+                observation.direction.description(),
+                observation.round,
+                observation.seeds.line_one,
+                observation.seeds.line_two,
+                milliseconds(sample.elapsed_after_fault),
+                u64::from(sample.stream_id),
+                csv_optional_u64(sample.sender_fully_acked_offset),
+                csv_optional_u64(sample.sender_unacknowledged_bytes),
+                csv_optional_u64(sample.sender_lowest_retransmit_offset),
+                csv_optional_u64(sample.sender_retransmit_bytes),
+                csv_optional_u64(sample.receiver_contiguous_offset),
+                csv_optional_u64(sample.receiver_highest_offset),
+                csv_optional_u64(buffered_after_gap),
+                csv_optional_u64(feedback_debt),
+                retransmit_target_delta
+                    .map(|value| value.to_string())
+                    .unwrap_or_default(),
+                sample.secondary_lost_packets,
+                sample.secondary_stream_retransmit_bytes,
+                sample.secondary_pto_timeouts,
+                sample.secondary_cwnd,
+                sample.secondary_bytes_in_flight,
+            )?;
+        }
+    }
+
+    fs::create_dir_all("benchmark-results")?;
+    fs::write(path, csv)?;
+    Ok(())
+}
+
 fn optional_milliseconds(duration: Option<Duration>) -> String {
     duration
         .map(|value| format!("{:.2} ms", milliseconds(value)))
@@ -2202,6 +2298,10 @@ fn csv_optional_milliseconds(duration: Option<Duration>) -> String {
         .map(milliseconds)
         .map(|value| format!("{value:.3}"))
         .unwrap_or_default()
+}
+
+fn csv_optional_u64(value: Option<u64>) -> String {
+    value.map(|value| value.to_string()).unwrap_or_default()
 }
 
 fn milliseconds(duration: Duration) -> f64 {

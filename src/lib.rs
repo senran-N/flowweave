@@ -12,7 +12,7 @@ use std::{
 
 use noq::{
     ClientConfig, Connection, ConnectionError, Endpoint, FourTuple, Path, PathError, PathId,
-    PathStats, PathStatus, ServerConfig, TransportConfig,
+    PathStats, PathStatus, ServerConfig, StreamId, TransportConfig,
     rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer},
 };
 use tokio::{
@@ -282,6 +282,7 @@ pub struct SustainedFailoverConfig {
     pub failure_after: Duration,
     pub chunk_size: usize,
     pub seed: u8,
+    pub collect_stream_state_diagnostics: bool,
 }
 
 impl SustainedFailoverConfig {
@@ -302,7 +303,13 @@ impl SustainedFailoverConfig {
             failure_after,
             chunk_size,
             seed,
+            collect_stream_state_diagnostics: false,
         }
+    }
+
+    pub fn with_stream_state_diagnostics(mut self) -> Self {
+        self.collect_stream_state_diagnostics = true;
+        self
     }
 
     fn validate(self) -> LabResult<()> {
@@ -497,6 +504,23 @@ pub struct SustainedFailoverTimeline {
     observed_primary_udp_rx_datagrams: u64,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct StreamStateSample {
+    pub elapsed_after_fault: Duration,
+    pub stream_id: StreamId,
+    pub sender_fully_acked_offset: Option<u64>,
+    pub sender_unacknowledged_bytes: Option<u64>,
+    pub sender_lowest_retransmit_offset: Option<u64>,
+    pub sender_retransmit_bytes: Option<u64>,
+    pub receiver_contiguous_offset: Option<u64>,
+    pub receiver_highest_offset: Option<u64>,
+    pub secondary_lost_packets: u64,
+    pub secondary_stream_retransmit_bytes: u64,
+    pub secondary_pto_timeouts: u64,
+    pub secondary_cwnd: u64,
+    pub secondary_bytes_in_flight: u64,
+}
+
 impl SustainedFailoverTimeline {
     fn new(
         primary_open_at_fault: bool,
@@ -585,6 +609,7 @@ pub struct SustainedFailoverReport {
     pub recovery_gap_next_sequence: Option<u64>,
     pub primary_path_open: bool,
     pub secondary_path_open: bool,
+    pub stream_state_samples: Vec<StreamStateSample>,
 }
 
 #[derive(Debug)]
@@ -1075,6 +1100,14 @@ where
                 secondary.clone(),
             ),
         };
+    let (sender_connection, receiver_connection) = match config.direction {
+        FailoverDirection::ClientToServer => {
+            (lab.connection.clone(), lab.server_connection.clone())
+        }
+        FailoverDirection::ServerToClient => {
+            (lab.server_connection.clone(), lab.connection.clone())
+        }
+    };
 
     let operation_result: LabResult<SustainedFailoverReport> = async {
         let primary_before = sender_primary.stats();
@@ -1088,8 +1121,8 @@ where
             started_tx,
         ));
 
-        let started_at = match timeout(OPERATION_TIMEOUT, started_rx).await {
-            Ok(Ok(started_at)) => started_at,
+        let (started_at, stream_id) = match timeout(OPERATION_TIMEOUT, started_rx).await {
+            Ok(Ok(started)) => started,
             Ok(Err(_)) => {
                 let result = flow_task
                     .await
@@ -1143,6 +1176,18 @@ where
             receiver_primary_at_blackhole,
             receiver_secondary_at_blackhole,
         );
+        let mut stream_state_samples = Vec::new();
+        if config.collect_stream_state_diagnostics {
+            observe_sustained_stream_state(
+                &mut stream_state_samples,
+                failure_started,
+                stream_id,
+                &sender_connection,
+                &receiver_connection,
+                &sender_secondary,
+                secondary_at_blackhole,
+            );
+        }
 
         let remaining = config
             .total_duration
@@ -1165,6 +1210,17 @@ where
                             receiver_primary_at_blackhole,
                             receiver_secondary_at_blackhole,
                         );
+                        if config.collect_stream_state_diagnostics {
+                            observe_sustained_stream_state(
+                                &mut stream_state_samples,
+                                failure_started,
+                                stream_id,
+                                &sender_connection,
+                                &receiver_connection,
+                                &sender_secondary,
+                                secondary_at_blackhole,
+                            );
+                        }
                     }
                 }
             }
@@ -1196,6 +1252,17 @@ where
             receiver_primary_at_blackhole,
             receiver_secondary_at_blackhole,
         );
+        if config.collect_stream_state_diagnostics {
+            observe_sustained_stream_state(
+                &mut stream_state_samples,
+                failure_started,
+                stream_id,
+                &sender_connection,
+                &receiver_connection,
+                &sender_secondary,
+                secondary_at_blackhole,
+            );
+        }
         let primary_before_delta = path_delta(primary_before, primary_at_blackhole);
         let secondary_before_delta = path_delta(secondary_before, secondary_at_blackhole);
         let primary_after_delta = path_delta(primary_at_blackhole, primary_after);
@@ -1248,6 +1315,7 @@ where
             recovery_gap_next_sequence: recovery_gap_trace.map(|gap| gap.next_sequence),
             primary_path_open: sender_primary.status().is_ok(),
             secondary_path_open: sender_secondary.status().is_ok(),
+            stream_state_samples,
         })
     }
     .await;
@@ -1264,7 +1332,7 @@ async fn run_sustained_failover_flow(
     connection: Connection,
     config: SustainedFailoverConfig,
     mut server_events: mpsc::UnboundedReceiver<SustainedServerEvent>,
-    started_tx: oneshot::Sender<Instant>,
+    started_tx: oneshot::Sender<(Instant, StreamId)>,
 ) -> LabResult<SustainedReceiveTrace> {
     let (mut send, mut receive) = timeout(OPERATION_TIMEOUT, connection.open_bi())
         .await
@@ -1286,7 +1354,7 @@ async fn run_sustained_failover_flow(
         .map_err(|_| other_error("发送正式换网开始标记超时"))??;
     let started_at = Instant::now();
     started_tx
-        .send(started_at)
+        .send((started_at, send.id()))
         .map_err(|_| other_error("正式换网启动时刻无人接收"))?;
 
     match config.direction {
@@ -1547,6 +1615,51 @@ fn observe_sustained_failover_timeline(
         sender_secondary.status().is_err(),
         elapsed,
     );
+}
+
+fn observe_sustained_stream_state(
+    samples: &mut Vec<StreamStateSample>,
+    failure_started: Instant,
+    stream_id: StreamId,
+    sender_connection: &Connection,
+    receiver_connection: &Connection,
+    sender_secondary: &Path,
+    secondary_at_blackhole: PathStats,
+) {
+    let sender = sender_connection.stats();
+    let receiver = receiver_connection.stats();
+    let sender_stream = sender.streams.iter().find(|stream| stream.id == stream_id);
+    let receiver_stream = receiver
+        .streams
+        .iter()
+        .find(|stream| stream.id == stream_id);
+    let secondary = sender_secondary.stats();
+
+    samples.push(StreamStateSample {
+        elapsed_after_fault: failure_started.elapsed(),
+        stream_id,
+        sender_fully_acked_offset: sender_stream.and_then(|stream| stream.send_fully_acked_offset),
+        sender_unacknowledged_bytes: sender_stream
+            .and_then(|stream| stream.send_unacknowledged_bytes),
+        sender_lowest_retransmit_offset: sender_stream
+            .and_then(|stream| stream.send_lowest_retransmit_offset),
+        sender_retransmit_bytes: sender_stream.and_then(|stream| stream.send_retransmit_bytes),
+        receiver_contiguous_offset: receiver_stream
+            .and_then(|stream| stream.receive_contiguous_offset),
+        receiver_highest_offset: receiver_stream.and_then(|stream| stream.receive_highest_offset),
+        secondary_lost_packets: secondary
+            .lost_packets
+            .saturating_sub(secondary_at_blackhole.lost_packets),
+        secondary_stream_retransmit_bytes: secondary
+            .frame_tx
+            .stream_retransmit_bytes
+            .saturating_sub(secondary_at_blackhole.frame_tx.stream_retransmit_bytes),
+        secondary_pto_timeouts: secondary
+            .pto_timeouts
+            .saturating_sub(secondary_at_blackhole.pto_timeouts),
+        secondary_cwnd: secondary.cwnd,
+        secondary_bytes_in_flight: secondary.bytes_in_flight,
+    });
 }
 
 fn record_first_timeline_event(slot: &mut Option<Duration>, happened: bool, elapsed: Duration) {
@@ -2737,6 +2850,25 @@ mod tests {
         assert!(recovery.ack_escape_enabled());
         assert!(!PtoRecovery::CrossPathRecovery.ack_escape_enabled());
         assert!(!PtoRecovery::CANDIDATES.contains(&recovery));
+    }
+
+    #[test]
+    fn stream_state_sampling_is_diagnostic_only() {
+        let config = SustainedFailoverConfig::new(
+            MultipathScheduler::NoqDefault,
+            PtoRecovery::CrossPathRecoveryWithAckEscape,
+            FailoverDirection::ClientToServer,
+            Duration::from_secs(30),
+            Duration::from_secs(10),
+            16 * 1024,
+            1,
+        );
+        assert!(!config.collect_stream_state_diagnostics);
+        assert!(
+            config
+                .with_stream_state_diagnostics()
+                .collect_stream_state_diagnostics
+        );
     }
 
     #[test]

@@ -348,8 +348,18 @@ impl SendBuffer {
     }
 
     /// Offset up to which all data has been acknowledged
-    fn fully_acked_offset(&self) -> u64 {
+    pub(super) fn fully_acked_offset(&self) -> u64 {
         self.data.range().start
+    }
+
+    /// Lowest stream offset currently queued for retransmission.
+    pub(super) fn lowest_retransmit_offset(&self) -> Option<u64> {
+        self.retransmits.min()
+    }
+
+    /// Total STREAM payload bytes currently queued for retransmission.
+    pub(super) fn retransmit_bytes(&self) -> u64 {
+        self.retransmits.elts_count()
     }
 
     /// First stream offset unwritten by the application, i.e. the offset that the next write will

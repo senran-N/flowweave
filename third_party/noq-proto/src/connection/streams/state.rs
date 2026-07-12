@@ -13,7 +13,7 @@ use super::{
 };
 use crate::{
     Dir, MAX_STREAM_COUNT, Side, StreamId, TransportError, VarInt,
-    connection::{PacketBuilder, stats::FrameStats},
+    connection::{PacketBuilder, stats::{FrameStats, StreamStats}},
     frame::{self, FrameStruct},
     transport_parameters::TransportParameters,
 };
@@ -187,6 +187,41 @@ impl StreamsState {
 
     pub(crate) fn unacked_data(&self) -> u64 {
         self.unacked_data
+    }
+
+    pub(crate) fn stream_stats(&self) -> Vec<StreamStats> {
+        let mut ids = self
+            .send
+            .keys()
+            .chain(self.recv.keys())
+            .copied()
+            .collect::<Vec<_>>();
+        ids.sort_unstable();
+        ids.dedup();
+
+        ids.into_iter()
+            .map(|id| {
+                let send = self.send.get(&id).and_then(Option::as_deref);
+                let receive = self
+                    .recv
+                    .get(&id)
+                    .and_then(Option::as_ref)
+                    .and_then(StreamRecv::as_open_recv);
+                StreamStats {
+                    id,
+                    send_fully_acked_offset: send
+                        .map(|stream| stream.pending.fully_acked_offset()),
+                    send_unacknowledged_bytes: send.map(|stream| stream.pending.unacked()),
+                    send_lowest_retransmit_offset: send
+                        .and_then(|stream| stream.pending.lowest_retransmit_offset()),
+                    send_retransmit_bytes: send
+                        .map(|stream| stream.pending.retransmit_bytes()),
+                    receive_contiguous_offset: receive
+                        .map(|stream| stream.assembler.bytes_read()),
+                    receive_highest_offset: receive.map(|stream| stream.end),
+                }
+            })
+            .collect()
     }
 
     pub(crate) fn set_params(&mut self, params: &TransportParameters) {
@@ -1631,6 +1666,59 @@ mod tests {
         };
         stream.stop(0u32.into()).unwrap();
         assert!(client.recv.get_mut(&id).is_none(), "stream is freed");
+    }
+
+    #[test]
+    fn stream_stats_expose_receive_hole_and_pending_retransmit() {
+        let mut client = make(Side::Client);
+        client.set_params(&TransportParameters {
+            initial_max_streams_bidi: 1u32.into(),
+            initial_max_data: 64u32.into(),
+            initial_max_stream_data_bidi_remote: 64u32.into(),
+            initial_max_stream_data_bidi_local: 64u32.into(),
+            ..TransportParameters::default()
+        });
+
+        let (mut pending, state) = (Retransmits::default(), ConnState::established());
+        let id = Streams {
+            state: &mut client,
+            conn_state: &state,
+        }
+        .open(Dir::Bi)
+        .unwrap();
+        let mut send = SendStream {
+            id,
+            state: &mut client,
+            pending: &mut pending,
+            conn_state: &state,
+        };
+        send.write(b"abcdefgh").unwrap();
+        let transmitted = send.state.send.get_mut(&id).unwrap().as_mut().unwrap();
+        assert_eq!(transmitted.pending.poll_transmit(64).0, 0..8);
+        assert_eq!(transmitted.pending.retransmit(2..5), 3);
+
+        let _ = client
+            .received(
+                frame::Stream {
+                    id,
+                    offset: 4,
+                    fin: false,
+                    data: bytes::Bytes::from_static(b"efgh"),
+                },
+                4,
+            )
+            .unwrap();
+
+        let stats = client.stream_stats();
+        assert_eq!(stats.len(), 1);
+        let stream = stats[0];
+        assert_eq!(stream.id, id);
+        assert_eq!(stream.send_fully_acked_offset, Some(0));
+        assert_eq!(stream.send_unacknowledged_bytes, Some(8));
+        assert_eq!(stream.send_lowest_retransmit_offset, Some(2));
+        assert_eq!(stream.send_retransmit_bytes, Some(3));
+        assert_eq!(stream.receive_contiguous_offset, Some(0));
+        assert_eq!(stream.receive_highest_offset, Some(8));
     }
 
     // Verify that a stream that's been reset doesn't cause the appearance of pending data

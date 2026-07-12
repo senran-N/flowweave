@@ -4,6 +4,7 @@ use rustc_hash::FxHashMap;
 
 use crate::Duration;
 use crate::FrameType;
+use crate::StreamId;
 
 use super::PathId;
 
@@ -324,6 +325,32 @@ pub struct PathStats {
     pub current_mtu: u16,
 }
 
+/// Read-only delivery state for one QUIC stream.
+///
+/// These gauges are intended for diagnostics. They do not affect packet scheduling, loss
+/// detection, flow control, or acknowledgment processing.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct StreamStats {
+    /// Stream whose state is being reported.
+    pub id: StreamId,
+    /// End of the contiguous prefix acknowledged by the peer, when this endpoint sends on the
+    /// stream.
+    pub send_fully_acked_offset: Option<u64>,
+    /// STREAM payload bytes which have not yet been acknowledged, excluding out-of-order ACKed
+    /// ranges.
+    pub send_unacknowledged_bytes: Option<u64>,
+    /// Lowest offset currently waiting in the retransmission queue.
+    pub send_lowest_retransmit_offset: Option<u64>,
+    /// Total STREAM payload bytes currently waiting in the retransmission queue.
+    pub send_retransmit_bytes: Option<u64>,
+    /// End of the contiguous prefix already consumed by the local application, when this endpoint
+    /// receives on the stream.
+    pub receive_contiguous_offset: Option<u64>,
+    /// Highest stream offset observed from received STREAM frames.
+    pub receive_highest_offset: Option<u64>,
+}
+
 /// Connection statistics.
 ///
 /// The fields here are a sum of the respective fields in the [`PathStats`] for all the
@@ -343,6 +370,8 @@ pub struct ConnectionStats {
     pub lost_packets: u64,
     /// The number of bytes lost on the connection.
     pub lost_bytes: u64,
+    /// Current per-stream delivery gauges.
+    pub streams: Vec<StreamStats>,
 }
 
 impl std::ops::Add<PathStats> for ConnectionStats {
@@ -400,6 +429,7 @@ impl std::ops::Add<PathStats> for ConnectionStats {
             frame_rx: self.frame_rx + frame_rx,
             lost_packets: self.lost_packets + lost_packets,
             lost_bytes: self.lost_bytes + lost_bytes,
+            streams: self.streams,
         }
     }
 }
@@ -457,6 +487,7 @@ impl std::ops::AddAssign<PathStats> for ConnectionStats {
             frame_rx,
             lost_packets,
             lost_bytes,
+            streams: _,
         } = self;
         *udp_tx += path_udp_tx;
         *udp_rx += path_udp_rx;

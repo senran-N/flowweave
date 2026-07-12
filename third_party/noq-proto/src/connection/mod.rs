@@ -91,7 +91,7 @@ pub(crate) use spaces::SpaceKind;
 use spaces::{OpenStatus, PacketSpace, SendableFrames, SentPacket, ThinRetransmits};
 
 mod stats;
-pub use stats::{ConnectionStats, FrameStats, PathStats, UdpStats};
+pub use stats::{ConnectionStats, FrameStats, PathStats, StreamStats, UdpStats};
 
 mod streams;
 #[cfg(fuzzing)]
@@ -2724,6 +2724,8 @@ impl Connection {
             // Add<PathStats> for ConnectionStats`.
             stats += *path_stats;
         }
+
+        stats.streams = self.streams.stream_stats();
 
         stats
     }
