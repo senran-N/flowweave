@@ -596,6 +596,21 @@ async fn failover_feedback_handoff_representative_diagnostic_lab() -> LabResult<
     .await
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "必须通过 scripts/run_netem_lab.sh diagnose-feedback-handoff-1103 在隔离网络命名空间中运行"]
+async fn failover_feedback_handoff_seed_1103_diagnostic_lab() -> LabResult<()> {
+    const CASES: [(FailoverDirection, usize); 1] = [(FailoverDirection::ClientToServer, 2_usize)];
+    run_failover_diagnostic_cases(
+        "benchmark-results/2026-07-12-feedback-handoff-1103-summary.csv",
+        PtoRecovery::CrossPathRecoveryWithFeedbackHandoff,
+        "FlowWeave / 织流：A 组关键反馈路径交接 1103 诊断",
+        "只运行一次正向种子 1103；保留旧 1006.353 ms 原始数据，并采集 R/H/A/Q 验证时间预算。",
+        &CASES,
+        Some("benchmark-results/2026-07-12-feedback-handoff-1103-timeline.csv"),
+    )
+    .await
+}
+
 async fn run_failover_diagnostic_cases(
     result_path: &str,
     pto_recovery: PtoRecovery,

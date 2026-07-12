@@ -10,7 +10,7 @@
 - B：多条线路可以共同传输，提高总速度。
 - C：丢包严重时，实时数据仍尽量保持低延迟。
 
-目前第二阶段 A 已验证“开放路径同路返回 PATH_ACK、关闭后跨路回退”的反馈面修复，并定位正向种子 1103 的无 PTO 根因。默认关闭的 abandoned 即时对冲已把该种子的最大断流从约 `14.75 s` 降到 `3.71 s`；ACK 进展恢复和有界跨路径 ACK 逃生又把 1103 压到 `1006.35 ms`。正向 1101 的约 12 秒停顿已被 `R/H/A/Q` 诊断定位为 `MAX_STREAM_DATA` 流控额度反馈被困在故障优先路，而不是第二个数据洞。新的默认关闭候选在收到“恢复 STREAM + IMMEDIATE_ACK”后，用标准 `PATH_STATUS` 把承载恢复的路径提升为本端 Available、其他开放路降为 Backup，让 ACK 和流控反馈一起走健康路。相同正反向 1101 代表场分别得到 `667.669 ms` 和 `754.293 ms`，均严格低于 1 秒；正向原有 `11765 ms` 全空平台消失。反向相对旧单场 `381.864 ms` 有约 `372 ms` 回退，且 1103 尚未复跑，所以候选仍不能晋级正式 A 组。第二阶段 B 的容量观测路线仍暂停。项目还不是可日常使用的代理软件，也没有宣称性能超过 Hysteria 2、VLESS 或其他现有方案。
+目前第二阶段 A 已验证“开放路径同路返回 PATH_ACK、关闭后跨路回退”的反馈面修复，并定位正向种子 1103 的无 PTO 根因。默认关闭的 abandoned 即时对冲已把该种子的最大断流从约 `14.75 s` 降到 `3.71 s`；ACK 进展恢复和有界跨路径 ACK 逃生又把 1103 压到 `1006.35 ms`。正向 1101 的约 12 秒停顿已被 `R/H/A/Q` 诊断定位为 `MAX_STREAM_DATA` 流控额度反馈被困在故障优先路，而不是第二个数据洞。新的默认关闭候选在收到“恢复 STREAM + IMMEDIATE_ACK”后，用标准 `PATH_STATUS` 把承载恢复的路径提升为本端 Available、其他开放路降为 Backup，让 ACK 和流控反馈一起走健康路。正反向 1101 分别为 `667.669 ms` 和 `754.293 ms`；正向 1103 单次为 `929.097 ms`，三个代表状态均严格低于 1 秒。数学拆解同时表明 1103 的约 `70.9 ms` 余量主要来自断流起点后移，不是绝对恢复时刻提前，因此只能进入正式 20 场，仍不能宣布 A 完成。第二阶段 B 的容量观测路线仍暂停。项目还不是可日常使用的代理软件，也没有宣称性能超过 Hysteria 2、VLESS 或其他现有方案。
 
 ## 当前技术选择
 
@@ -194,7 +194,7 @@
 
 ### 第二阶段 A：关键反馈路径交接候选
 
-2026-07-12 已完成默认关闭的确定性实现和正反向 1101 代表场：
+2026-07-12 已完成默认关闭的确定性实现、正反向 1101 和正向 1103 代表场：
 
 - 历史 `CrossPathRecoveryWithAckEscape` 保持不变；新变体单独开启反馈路径交接，旧 CSV 仍可复现。
 - 接收端只有在同一个已验证路径包内同时看到恢复 STREAM 和 IMMEDIATE_ACK 时才交接；普通探测、MTU、PATH_CHALLENGE 或单独 IMMEDIATE_ACK 不会改路径状态。
@@ -203,7 +203,10 @@
 - 原始摘要保存在 `benchmark-results/2026-07-12-feedback-handoff-representative-summary.csv`，逐流时间线保存在 `benchmark-results/2026-07-12-feedback-handoff-representative-timeline.csv`。
 - 正向 1101 数据完整，最大断流 `667.669 ms`，相对旧候选 `12025.460 ms` 缩短约 `11357.791 ms`；`R(t)` 最长平台约 `506.767 ms`，原来的 11.765 秒流控平台已经消失。
 - 反向 1101 数据完整，最大断流 `754.293 ms`，仍严格过线；但比旧候选该单场 `381.864 ms` 慢约 `372.429 ms`，必须如实作为潜在代价继续检查。
-- 下一步只复跑正向 1103。三个代表状态全部 `<1 s` 后，才允许重跑正式 20 场；当前仍不宣称 A 完成。
+- 正向 1103 数据完整，最大断流 `929.097 ms`，原始摘要和时间线分别保存在 `benchmark-results/2026-07-12-feedback-handoff-1103-summary.csv` 与 `benchmark-results/2026-07-12-feedback-handoff-1103-timeline.csv`；没有重跑挑结果。
+- 1103 的绝对恢复时刻比旧候选晚约 `47 ms`，断流变短主要因为最后一个正常记录晚到约 `125 ms`。这次过线有效，但只有约 `70.9 ms` 余量，不能当作稳定提速证据。
+- Age of Information、Value of Information 和 Quickest Change Detection 的复核支持“只关注正在阻塞发送的陈旧反馈，并继续用协议原生 RTT/PTO 约束误报”；当前没有引入概率模型、机器学习或新依赖。
+- 三个代表状态已经全部 `<1 s`，下一步进入新文件保存的正式 20 场；当前仍不宣称 A 完成。
 
 ### 第二阶段 B：调度与公平基准
 
@@ -368,8 +371,9 @@ cargo test --all-targets
 ./scripts/run_netem_lab.sh diagnose-ack-escape-representative
 ./scripts/run_netem_lab.sh diagnose-second-gap
 ./scripts/run_netem_lab.sh diagnose-feedback-handoff
+./scripts/run_netem_lab.sh diagnose-feedback-handoff-1103
 ./scripts/run_netem_lab.sh screen
 ./scripts/run_netem_lab.sh long
 ~~~
 
-默认 `smoke` 坏网络实验会运行约一分钟；`failover` 运行 A 组 30 场五种子短筛；`formal-a` 使用 release 构建运行 20 场、约 11 分钟的双向持续换网正式实验；`diagnose-a` 使用三个代表场景运行约 2 分钟的 A 组事件时间线；`diagnose-no-pto` 只复跑正向种子 1103 的 PTO-only 历史状态；`diagnose-abandon` 用相同种子验证 abandoned 即时对冲；`diagnose-ack-escape-representative` 用旧 ACK 逃生候选复跑正反向 1101；`diagnose-second-gap` 只复跑正向 1101 并输出逐流 `R/H/A/Q`；`diagnose-feedback-handoff` 用新候选复跑正反向 1101 并输出相同时间线。这些诊断都不修改门槛，并记录 RTT/PTO、在途包、包表、最后一次需确认发包和定时器状态；`screen` 运行 B 组五种子短流筛选；`long` 使用 release 构建，运行约 19 分钟的正式时长 B 组复赛。看到最终 `test result: ok` 表示实验基础设施成功完成；指标不好不代表测试程序失败，它可能正是在如实揭示协议短板。
+默认 `smoke` 坏网络实验会运行约一分钟；`failover` 运行 A 组 30 场五种子短筛；`formal-a` 使用 release 构建运行 20 场、约 11 分钟的双向持续换网正式实验；`diagnose-a` 使用三个代表场景运行约 2 分钟的 A 组事件时间线；`diagnose-no-pto` 只复跑正向种子 1103 的 PTO-only 历史状态；`diagnose-abandon` 用相同种子验证 abandoned 即时对冲；`diagnose-ack-escape-representative` 用旧 ACK 逃生候选复跑正反向 1101；`diagnose-second-gap` 只复跑正向 1101 并输出逐流 `R/H/A/Q`；`diagnose-feedback-handoff` 用新候选复跑正反向 1101；`diagnose-feedback-handoff-1103` 只运行一次正向 1103，并写入独立摘要和 `R/H/A/Q` 时间线。这些诊断都不修改门槛，并记录 RTT/PTO、在途包、包表、最后一次需确认发包和定时器状态；`screen` 运行 B 组五种子短流筛选；`long` 使用 release 构建，运行约 19 分钟的正式时长 B 组复赛。看到最终 `test result: ok` 表示实验基础设施成功完成；指标不好不代表测试程序失败，它可能正是在如实揭示协议短板。
