@@ -454,11 +454,96 @@ NoQ 413 项全量测试、FlowWeave 10 项普通测试和两边 Clippy 均通过
 
 结果非常接近，但仍比严格门槛多 `6.353 ms`，所以 A 继续判失败。这个差值小于系统调度和队列抖动，既不能据此调低门槛，也不能靠重跑挑一次幸运值。下一步先用相同候选跑正向 1101 与反向 1101：前者历史上是“PTO 已触发但服务仍慢”，后者是“反馈修复后仍约 1.35 秒”。只有两个代表场没有暴露更大的结构性缺口，才值得研究如何为 1103 增加稳定余量。
 
+### 数学魔法复核：先问清楚，再搬整车数据
+
+1103 的 `1006.353 ms` 不是一个不可解释的总数，可以精确拆成三段：
+
+```text
+等待恢复动作：783.550 - 161.115 = 622.435 ms
+取得累计反馈：865.403 - 783.550 =  81.853 ms
+反馈后补齐缺口：1167.468 - 865.403 = 302.065 ms
+
+总计：622.435 + 81.853 + 302.065 = 1006.353 ms
+```
+
+这说明继续优化“跨路 ACK 怎么返回”已经不是首要问题；它只用了约 `81.85 ms`。剩余风险主要在恢复动作开始前的等待，以及累计反馈回来后真正缺口的服务时间。
+
+复核 RACK-TLP、Google Reactive、MPTCP TLP、FUSO、MPTCP Data ACK、MRC 和 Varuna 后，几项工作虽然场景不同，却共同指向同一个结构：
+
+- RACK-TLP 每次只允许一个额外探针在途，并用探针带回的 SACK 证据判断更早的数据；它证明“先花一包取得信息”可以避免直接进入昂贵的 RTO 恢复。
+- `Probe or Wait` 在 MPTCP 中把 TLP 的恢复包同时重注入备用子流，证明探针不应继续只走疑似故障的原路；但它仍面向尾部短流，不能直接解释持续流的无 ACK 进展状态。
+- FUSO 在有备用拥塞窗口时优先复制最老的未确认数据，并限制每段最多被主动保护一次；它的目标是先修最可能阻塞交付的位置。不过 FUSO 只在没有新数据可发时使用空闲窗口，不能原样套到 FlowWeave 的持续流。
+- MPTCP 的 Data ACK 是跨所有子流的累计数据级确认，值就是“接收端下一字节还期待什么”。这与前文的 `R(t)` 完全同构，能直接区分数据已经收到与子流 ACK 丢失。
+- MRC 把可靠性探针做成独立原语：探针不消耗数据序号、不改变连接前进状态，只要求接收端返回当前 SACK；恢复又明确优先最早缺失序号。它给出了当前最清楚的架构参照。
+- Varuna 使用接收端完成记录区分“操作已经执行、只是返回丢了”和“操作确实没执行”。它比字节流需要的机制更重，但再次证明恢复前先消除这类不确定性是有价值的。
+
+因此下一代最小候选不应是“把完整恢复时钟提前几毫秒”，而应是两级动作：
+
+```text
+阶段一：有界可靠性探针
+  只在备用路发送最多一包最早未确认 STREAM 数据，并请求立即反馈；
+  不暂停原路，不改变 PATH_STATUS，不把整个 U_sender 重新排队。
+
+阶段二：完整恢复
+  到现有 ACK 进展 PTO 仍没有新进展时，才执行当前已经验证的完整跨路恢复；
+  标准 PTO、PathIdle 和 3 PTO 状态保留继续不变。
+```
+
+一包探针有两种结果，两种都产生有效信息：
+
+```text
+探针范围属于 M_missing：它直接补上一个真实缺口；
+探针范围属于 D_ack_lost：它虽然是副本，却逼出跨路径累计 PATH_ACK，剪掉大批无效旧范围。
+```
+
+可以把一包探针 `p` 的价值粗略写成：
+
+```text
+V(p) = P(p 属于 M_missing) × 队头修复收益
+     + P(p 属于 D_ack_lost) × 不确定集合缩减收益
+     - 一包额外流量成本
+```
+
+RACK-TLP 选择最高序号段，是为了让它的 SACK 对所有更早段形成时间证据；FUSO 选择最老未确认段，是为了直接修最早阻塞。FlowWeave 已经能在同一次响应里取得原路径完整 PATH_ACK 范围，因此第一候选倾向“最早未确认的一包”：最坏情况下它能直接补队头，反馈信息仍由 PATH_ACK 范围提供。这个选择必须先用确定性反例证明，不能只凭直觉接线。
+
+探针时间 `tau_probe` 暂不选常数。对任一场景 `s`，令：
+
+```text
+R_s = 从探针发出到有序记录恢复的剩余时间
+D   = 1000 ms 的严格断流预算
+
+要达标必须满足：
+tau_probe_s - gap_start_s < D - R_s
+```
+
+1103 当前 `R_1103 = 383.918 ms`，所以在这次样本里，探针最迟需要在故障后 `777.197 ms` 发出；现有完整恢复在 `783.550 ms`，恰好晚 `6.353 ms`。但单样本不能估计 `R_s` 的尾部，也不能据此硬编码 `777 ms`。先跑正向和反向 1101，是为了取得至少三种代表状态下的 `R_s`：
+
+- 若三场的恢复余量都稳定且主要只差等待时间，优先实现“一包可靠性探针”；
+- 若某场在取得累计确认后仍长期阻塞，说明发送端 PATH_ACK 仍不是充分信息，应升级为协商后的数据级 `STREAM_PROGRESS`，先只报告每条流的连续接收 offset；
+- 若某场连备用路反馈本身都不稳定，先修反馈路径，不得用更早定时器掩盖。
+
+`STREAM_PROGRESS` 的第一版只需表达 MPTCP Data ACK 同等级的信息：
+
+```text
+stream_id
+contiguous_offset  # 接收端已经无洞连续收到的位置，等价于 R(t)
+```
+
+发送端只允许该值单调增加，且不得超过已经发送的最高 offset；它可以释放数据级重传负担，但原路径包号、拥塞和 RTT 账仍按 PATH_ACK 独立处理。只有代表场证明一包探针的信息仍不够，才值得承担这个新帧和协商状态的复杂度。
+
+本轮明确排除三条伪捷径：不缩短 PathIdle，不缩短 3 PTO 清场，不用 FEC 掩盖 ACK/数据状态不确定性。FEC 可以降低未来新数据丢失，却不能告诉发送端过去的 `U_sender` 中哪些字节其实已经到达。
+
 新增依据：
 
 - TCP RTO 管理，RFC 6298：<https://www.rfc-editor.org/rfc/rfc6298>
 - TCP/SCTP RTO Restart，RFC 7765：<https://www.rfc-editor.org/rfc/rfc7765>
 - RACK-TLP，RFC 8985：<https://www.rfc-editor.org/rfc/rfc8985>
+- Google Reactive / Gentle Aggression：<http://conferences.sigcomm.org/sigcomm/2013/papers/sigcomm/p159.pdf>
+- MPTCP 尾丢包探针跨路重注入：<https://dl.ifip.org/db/conf/networking/networking2017/1570351631.pdf>
+- FUSO：<https://www.microsoft.com/en-us/research/publication/fast-and-cautious-leveraging-multi-path-diversity-for-transport-loss-recovery-in-data-centers/>
+- MPTCP Data ACK，RFC 8684 第 3.3.2 节：<https://www.rfc-editor.org/rfc/rfc8684>
+- Optimal Reissue / SingleR：<https://dspace.mit.edu/handle/1721.1/116708>
+- MRC Transport：<https://arxiv.org/abs/2606.18170>
 - T-RACKs：<https://arxiv.org/abs/2102.07477>
 - φ Accrual Failure Detector：<https://doi.org/10.1109/RELDIS.2004.1353004>
 - Varuna：<https://arxiv.org/abs/2603.28001>
