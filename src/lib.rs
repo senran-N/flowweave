@@ -470,8 +470,11 @@ pub struct SustainedFailoverTimeline {
     pub max_primary_tracked_sent_packets: u64,
     pub max_primary_tracked_ack_eliciting_packets: u64,
     pub first_secondary_udp_send: Option<Duration>,
+    pub first_secondary_stream_retransmit: Option<Duration>,
+    pub first_secondary_fresh_stream: Option<Duration>,
     pub first_receiver_primary_cross_path_ack: Option<Duration>,
     pub first_receiver_secondary_same_path_ack: Option<Duration>,
+    pub first_receiver_secondary_cross_path_ack: Option<Duration>,
     pub primary_closed: Option<Duration>,
     pub secondary_closed: Option<Duration>,
     observed_primary_latest_ack_eliciting_packet_number: u64,
@@ -528,8 +531,11 @@ impl SustainedFailoverTimeline {
             max_primary_tracked_ack_eliciting_packets: primary_at_fault
                 .tracked_ack_eliciting_packets,
             first_secondary_udp_send: None,
+            first_secondary_stream_retransmit: None,
+            first_secondary_fresh_stream: None,
             first_receiver_primary_cross_path_ack: None,
             first_receiver_secondary_same_path_ack: None,
+            first_receiver_secondary_cross_path_ack: None,
             primary_closed: (!primary_open_at_fault).then_some(Duration::ZERO),
             secondary_closed: (!secondary_open_at_fault).then_some(Duration::ZERO),
             observed_primary_latest_ack_eliciting_packet_number: primary_at_fault
@@ -1485,6 +1491,17 @@ fn observe_sustained_failover_timeline(
         elapsed,
     );
     record_first_timeline_event(
+        &mut timeline.first_secondary_stream_retransmit,
+        secondary.frame_tx.stream_retransmit_bytes
+            > secondary_at_blackhole.frame_tx.stream_retransmit_bytes,
+        elapsed,
+    );
+    record_first_timeline_event(
+        &mut timeline.first_secondary_fresh_stream,
+        secondary.frame_tx.stream_fresh_bytes > secondary_at_blackhole.frame_tx.stream_fresh_bytes,
+        elapsed,
+    );
+    record_first_timeline_event(
         &mut timeline.first_receiver_primary_cross_path_ack,
         receiver_primary.frame_tx.path_acks_cross_path
             > receiver_primary_at_blackhole.frame_tx.path_acks_cross_path,
@@ -1494,6 +1511,14 @@ fn observe_sustained_failover_timeline(
         &mut timeline.first_receiver_secondary_same_path_ack,
         receiver_secondary.frame_tx.path_acks_same_path
             > receiver_secondary_at_blackhole.frame_tx.path_acks_same_path,
+        elapsed,
+    );
+    record_first_timeline_event(
+        &mut timeline.first_receiver_secondary_cross_path_ack,
+        receiver_secondary.frame_tx.path_acks_cross_path
+            > receiver_secondary_at_blackhole
+                .frame_tx
+                .path_acks_cross_path,
         elapsed,
     );
     record_first_timeline_event(
