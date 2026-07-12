@@ -27,6 +27,9 @@ case "$mode" in
     diagnose-ack-progress)
         test_name="failover_ack_progress_reinjection_diagnostic_lab"
         ;;
+    diagnose-ack-escape-representative)
+        test_name="failover_ack_escape_representative_diagnostic_lab"
+        ;;
     screen)
         test_name="scheduler_five_seed_screening_lab"
         ;;
@@ -34,7 +37,7 @@ case "$mode" in
         test_name="scheduler_long_duration_benchmark_lab"
         ;;
     *)
-        echo "用法：$0 [smoke|failover|formal-a|diagnose-a|diagnose-no-pto|diagnose-abandon|diagnose-ack-progress|screen|long]" >&2
+        echo "用法：$0 [smoke|failover|formal-a|diagnose-a|diagnose-no-pto|diagnose-abandon|diagnose-ack-progress|diagnose-ack-escape-representative|screen|long]" >&2
         exit 2
         ;;
 esac
@@ -64,7 +67,7 @@ tc filter add dev lo protocol ip parent 1: prio 2 u32 match ip dst 127.0.0.2/32 
 tc filter add dev lo protocol ip parent 1: prio 3 u32 match u32 0 0 flowid 1:1
 
 export FLOWWEAVE_NETEM_LAB=1
-if [[ "$FLOWWEAVE_LAB_MODE" == "long" || "$FLOWWEAVE_LAB_MODE" == "formal-a" || "$FLOWWEAVE_LAB_MODE" == "diagnose-a" || "$FLOWWEAVE_LAB_MODE" == "diagnose-no-pto" || "$FLOWWEAVE_LAB_MODE" == "diagnose-abandon" || "$FLOWWEAVE_LAB_MODE" == "diagnose-ack-progress" ]]; then
+if [[ "$FLOWWEAVE_LAB_MODE" == "long" || "$FLOWWEAVE_LAB_MODE" == "formal-a" || "$FLOWWEAVE_LAB_MODE" == "diagnose-a" || "$FLOWWEAVE_LAB_MODE" == "diagnose-no-pto" || "$FLOWWEAVE_LAB_MODE" == "diagnose-abandon" || "$FLOWWEAVE_LAB_MODE" == "diagnose-ack-progress" || "$FLOWWEAVE_LAB_MODE" == "diagnose-ack-escape-representative" ]]; then
     cargo test --release --test network_lab "$FLOWWEAVE_LAB_TEST" -- --ignored --nocapture --test-threads=1
 else
     cargo test --test network_lab "$FLOWWEAVE_LAB_TEST" -- --ignored --nocapture --test-threads=1

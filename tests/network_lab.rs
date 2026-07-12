@@ -493,73 +493,19 @@ async fn failover_formal_bidirectional_lab() -> LabResult<()> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "必须通过 scripts/run_netem_lab.sh diagnose-a 在隔离网络命名空间中运行"]
 async fn failover_timeline_diagnostic_lab() -> LabResult<()> {
-    ensure_isolated_network_namespace()?;
-
-    const RESULT_PATH: &str = "benchmark-results/2026-07-12-path-ack-affinity-diagnostic.csv";
-    let normal_line_one = LinkProfile::new("20ms", "0.1%", "20mbit");
-    let normal_line_two = LinkProfile::new("80ms", "1%", "20mbit");
-    let cases = [
+    const CASES: [(FailoverDirection, usize); 3] = [
         (FailoverDirection::ClientToServer, 0_usize),
         (FailoverDirection::ClientToServer, 2_usize),
         (FailoverDirection::ServerToClient, 0_usize),
     ];
-
-    println!();
-    println!("FlowWeave / 织流：A 组 PATH_ACK 同路优先修复诊断");
-    println!("只复跑两个正向代表种子和一个反向种子；不改变 PTO 恢复算法或超时。");
-
-    let mut observations = Vec::with_capacity(cases.len());
-    write_formal_failover_csv(RESULT_PATH, &observations)?;
-    for (direction, seed_index) in cases {
-        let seeds = SEED_PAIRS[seed_index];
-        let round = seed_index + 1;
-        println!();
-        println!(
-            "诊断 {} 第 {round} 轮：线路一种子 {}，线路二种子 {}",
-            direction.description(),
-            seeds.line_one,
-            seeds.line_two,
-        );
-        apply_profiles(normal_line_one, normal_line_two, seeds)?;
-        let report = run_sustained_blackhole_failover(
-            SustainedFailoverConfig::new(
-                MultipathScheduler::NoqDefault,
-                PtoRecovery::CrossPathHedge,
-                direction,
-                FORMAL_FAILOVER_DURATION,
-                FORMAL_FAILOVER_AT,
-                FORMAL_FAILOVER_CHUNK_SIZE,
-                151_u8
-                    .wrapping_add(round as u8)
-                    .wrapping_add((direction as u8).wrapping_mul(17)),
-            ),
-            || {
-                replace_line_profile(
-                    "1:1",
-                    "10:",
-                    LinkProfile::new("20ms", "100%", "20mbit"),
-                    seeds.line_one,
-                )
-            },
-            || replace_line_profile("1:1", "10:", normal_line_one, seeds.line_one),
-        )
-        .await?;
-
-        let observation = FormalFailoverObservation {
-            direction,
-            round,
-            seeds,
-            pto_recovery: PtoRecovery::CrossPathHedge,
-            report,
-        };
-        print_formal_failover_observation(&observation);
-        observations.push(observation);
-        write_formal_failover_csv(RESULT_PATH, &observations)?;
-    }
-
-    println!();
-    println!("A 组诊断原始数据已写入 {RESULT_PATH}");
-    Ok(())
+    run_failover_diagnostic_cases(
+        "benchmark-results/2026-07-12-path-ack-affinity-diagnostic.csv",
+        PtoRecovery::CrossPathHedge,
+        "FlowWeave / 织流：A 组 PATH_ACK 同路优先修复诊断",
+        "只复跑两个正向代表种子和一个反向种子；不改变 PTO 恢复算法或超时。",
+        &CASES,
+    )
+    .await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -596,6 +542,93 @@ async fn failover_ack_progress_reinjection_diagnostic_lab() -> LabResult<()> {
         "只复跑正向种子 1103；恢复时在备用路请求一次累计 PATH_ACK，不改变路径状态或计时器。",
     )
     .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "必须通过 scripts/run_netem_lab.sh diagnose-ack-escape-representative 在隔离网络命名空间中运行"]
+async fn failover_ack_escape_representative_diagnostic_lab() -> LabResult<()> {
+    const CASES: [(FailoverDirection, usize); 2] = [
+        (FailoverDirection::ClientToServer, 0_usize),
+        (FailoverDirection::ServerToClient, 0_usize),
+    ];
+    run_failover_diagnostic_cases(
+        "benchmark-results/2026-07-12-ack-escape-representative-diagnostic.csv",
+        PtoRecovery::CrossPathRecoveryWithAckEscape,
+        "FlowWeave / 织流：A 组 ACK 逃生代表场诊断",
+        "使用完全相同的 ACK 逃生候选复跑正向与反向种子 1101；不改算法、不调门槛。",
+        &CASES,
+    )
+    .await
+}
+
+async fn run_failover_diagnostic_cases(
+    result_path: &str,
+    pto_recovery: PtoRecovery,
+    title: &str,
+    note: &str,
+    cases: &[(FailoverDirection, usize)],
+) -> LabResult<()> {
+    ensure_isolated_network_namespace()?;
+
+    let normal_line_one = LinkProfile::new("20ms", "0.1%", "20mbit");
+    let normal_line_two = LinkProfile::new("80ms", "1%", "20mbit");
+
+    println!();
+    println!("{title}");
+    println!("{note}");
+
+    let mut observations = Vec::with_capacity(cases.len());
+    write_formal_failover_csv(result_path, &observations)?;
+    for &(direction, seed_index) in cases {
+        let seeds = SEED_PAIRS[seed_index];
+        let round = seed_index + 1;
+        println!();
+        println!(
+            "诊断 {} 第 {round} 轮：线路一种子 {}，线路二种子 {}",
+            direction.description(),
+            seeds.line_one,
+            seeds.line_two,
+        );
+        apply_profiles(normal_line_one, normal_line_two, seeds)?;
+        let report = run_sustained_blackhole_failover(
+            SustainedFailoverConfig::new(
+                MultipathScheduler::NoqDefault,
+                pto_recovery,
+                direction,
+                FORMAL_FAILOVER_DURATION,
+                FORMAL_FAILOVER_AT,
+                FORMAL_FAILOVER_CHUNK_SIZE,
+                151_u8
+                    .wrapping_add(round as u8)
+                    .wrapping_add((direction as u8).wrapping_mul(17)),
+            ),
+            || {
+                replace_line_profile(
+                    "1:1",
+                    "10:",
+                    LinkProfile::new("20ms", "100%", "20mbit"),
+                    seeds.line_one,
+                )
+            },
+            || replace_line_profile("1:1", "10:", normal_line_one, seeds.line_one),
+        )
+        .await?;
+
+        let observation = FormalFailoverObservation {
+            direction,
+            round,
+            seeds,
+            pto_recovery,
+            report,
+        };
+        print_formal_failover_observation(&observation);
+        observations.push(observation);
+        write_formal_failover_csv(result_path, &observations)?;
+    }
+
+    println!();
+    println!("诊断原始数据已写入 {result_path}");
+    Ok(())
 }
 
 async fn run_seed_1103_failover_diagnostic(

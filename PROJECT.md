@@ -332,8 +332,9 @@ cargo test --all-targets
 ./scripts/run_netem_lab.sh diagnose-a
 ./scripts/run_netem_lab.sh diagnose-no-pto
 ./scripts/run_netem_lab.sh diagnose-abandon
+./scripts/run_netem_lab.sh diagnose-ack-escape-representative
 ./scripts/run_netem_lab.sh screen
 ./scripts/run_netem_lab.sh long
 ~~~
 
-默认 `smoke` 坏网络实验会运行约一分钟；`failover` 运行 A 组 30 场五种子短筛；`formal-a` 使用 release 构建运行 20 场、约 11 分钟的双向持续换网正式实验；`diagnose-a` 使用三个代表场景运行约 2 分钟的 A 组事件时间线；`diagnose-no-pto` 只复跑正向种子 1103 的 PTO-only 历史状态；`diagnose-abandon` 用相同种子验证 abandoned 即时对冲；两者都记录 RTT/PTO、在途包、包表、最后一次需确认发包和定时器状态；`screen` 运行 B 组五种子短流筛选；`long` 使用 release 构建，运行约 19 分钟的正式时长 B 组复赛。看到最终 `test result: ok` 表示实验基础设施成功完成；指标不好不代表测试程序失败，它可能正是在如实揭示协议短板。
+默认 `smoke` 坏网络实验会运行约一分钟；`failover` 运行 A 组 30 场五种子短筛；`formal-a` 使用 release 构建运行 20 场、约 11 分钟的双向持续换网正式实验；`diagnose-a` 使用三个代表场景运行约 2 分钟的 A 组事件时间线；`diagnose-no-pto` 只复跑正向种子 1103 的 PTO-only 历史状态；`diagnose-abandon` 用相同种子验证 abandoned 即时对冲；`diagnose-ack-escape-representative` 用当前 ACK 逃生候选复跑正向和反向种子 1101，不修改算法或门槛；这些诊断都会记录 RTT/PTO、在途包、包表、最后一次需确认发包和定时器状态；`screen` 运行 B 组五种子短流筛选；`long` 使用 release 构建，运行约 19 分钟的正式时长 B 组复赛。看到最终 `test result: ok` 表示实验基础设施成功完成；指标不好不代表测试程序失败，它可能正是在如实揭示协议短板。
