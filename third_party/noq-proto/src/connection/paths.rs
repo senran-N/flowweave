@@ -11,7 +11,7 @@ use super::{
     spaces::{PacketNumberSpace, SentPacket},
 };
 use crate::{
-    ConnectionId, Duration, FourTuple, Instant, TIMER_GRANULARITY, TransportConfig,
+    ConnectionId, Duration, FourTuple, Instant, StreamId, TIMER_GRANULARITY, TransportConfig,
     TransportErrorCode, VarInt,
     coding::{self, Decodable, Encodable},
     congestion,
@@ -256,6 +256,21 @@ pub(super) struct PathData {
     /// deliberately separate from QUIC's standard PTO send-time clock.
     pub(super) ack_progress_start: Option<Instant>,
 
+    /// Original full-recovery deadline retained after a bounded feedback probe has fired.
+    ///
+    /// ACKs elicited by the probe may advance the ordinary ACK-progress epoch, but must not move
+    /// this fallback. It is cleared when all STREAM data is acknowledged, the suspected path
+    /// proves itself alive, or any full recovery mechanism takes over.
+    pub(super) ack_progress_feedback_probe_full_deadline: Option<Instant>,
+
+    /// First packet number of the same-path liveness request paired with a bounded feedback
+    /// probe. ACKs below this boundary are stale and cannot cancel the staged full recovery.
+    pub(super) ack_progress_feedback_probe_liveness_start: Option<u64>,
+
+    /// STREAM retransmit gap whose stable identity is currently guarded by a delayed rescue
+    /// timer. ACKs for unrelated later packets do not change this identity.
+    pub(super) stream_gap_watch: Option<(StreamId, u64)>,
+
     /// STREAM frame entries retained by in-flight packets on this exact path generation.
     ///
     /// This keeps ACK-progress eligibility O(1); scanning the full sent-packet table on every ACK
@@ -363,6 +378,9 @@ impl PathData {
             pto_count: 0,
             pto_recovery_probe_start: None,
             ack_progress_start: None,
+            ack_progress_feedback_probe_full_deadline: None,
+            ack_progress_feedback_probe_liveness_start: None,
+            stream_gap_watch: None,
             stream_frames_in_flight: 0,
             idle_timeout: config.default_path_max_idle_timeout,
             keep_alive: config.default_path_keep_alive_interval,
@@ -414,6 +432,9 @@ impl PathData {
             pto_count: 0,
             pto_recovery_probe_start: None,
             ack_progress_start: None,
+            ack_progress_feedback_probe_full_deadline: None,
+            ack_progress_feedback_probe_liveness_start: None,
+            stream_gap_watch: None,
             stream_frames_in_flight: 0,
             idle_timeout: prev.idle_timeout,
             keep_alive: prev.keep_alive,

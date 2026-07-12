@@ -93,6 +93,11 @@ pub enum PtoRecovery {
     CrossPathRecovery,
     CrossPathRecoveryWithAckEscape,
     CrossPathRecoveryWithFeedbackHandoff,
+    CrossPathRecoveryWithFeedbackSnapshot,
+    CrossPathRecoveryWithFeedbackProbe,
+    CrossPathRecoveryWithFeedbackEvidence,
+    CrossPathRecoveryWithFeedbackEvidenceAndGapRescue,
+    CrossPathRecoveryWithFeedbackEvidenceAndGapWatch,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -136,6 +141,19 @@ impl PtoRecovery {
             Self::CrossPathRecovery => "FlowWeave PTO + abandoned + ACK 进展跨路径恢复",
             Self::CrossPathRecoveryWithAckEscape => "FlowWeave ACK 进展恢复 + 有界跨路径 ACK 逃生",
             Self::CrossPathRecoveryWithFeedbackHandoff => "FlowWeave ACK 逃生 + 关键反馈路径交接",
+            Self::CrossPathRecoveryWithFeedbackSnapshot => "FlowWeave 反馈交接 + 在途流控快照",
+            Self::CrossPathRecoveryWithFeedbackProbe => {
+                "FlowWeave 在途流控快照 + 预恢复单帧反馈探针"
+            }
+            Self::CrossPathRecoveryWithFeedbackEvidence => {
+                "FlowWeave 反馈探针 + 证据驱动选择性恢复"
+            }
+            Self::CrossPathRecoveryWithFeedbackEvidenceAndGapRescue => {
+                "FlowWeave 证据恢复 + 有界关键缺口探针"
+            }
+            Self::CrossPathRecoveryWithFeedbackEvidenceAndGapWatch => {
+                "FlowWeave 证据恢复 + 稳定缺口计时救援"
+            }
         }
     }
 
@@ -147,6 +165,11 @@ impl PtoRecovery {
                 | Self::CrossPathRecovery
                 | Self::CrossPathRecoveryWithAckEscape
                 | Self::CrossPathRecoveryWithFeedbackHandoff
+                | Self::CrossPathRecoveryWithFeedbackSnapshot
+                | Self::CrossPathRecoveryWithFeedbackProbe
+                | Self::CrossPathRecoveryWithFeedbackEvidence
+                | Self::CrossPathRecoveryWithFeedbackEvidenceAndGapRescue
+                | Self::CrossPathRecoveryWithFeedbackEvidenceAndGapWatch
         )
     }
 
@@ -157,6 +180,11 @@ impl PtoRecovery {
                 | Self::CrossPathRecovery
                 | Self::CrossPathRecoveryWithAckEscape
                 | Self::CrossPathRecoveryWithFeedbackHandoff
+                | Self::CrossPathRecoveryWithFeedbackSnapshot
+                | Self::CrossPathRecoveryWithFeedbackProbe
+                | Self::CrossPathRecoveryWithFeedbackEvidence
+                | Self::CrossPathRecoveryWithFeedbackEvidenceAndGapRescue
+                | Self::CrossPathRecoveryWithFeedbackEvidenceAndGapWatch
         )
     }
 
@@ -166,18 +194,78 @@ impl PtoRecovery {
             Self::CrossPathRecovery
                 | Self::CrossPathRecoveryWithAckEscape
                 | Self::CrossPathRecoveryWithFeedbackHandoff
+                | Self::CrossPathRecoveryWithFeedbackSnapshot
+                | Self::CrossPathRecoveryWithFeedbackProbe
+                | Self::CrossPathRecoveryWithFeedbackEvidence
+                | Self::CrossPathRecoveryWithFeedbackEvidenceAndGapRescue
+                | Self::CrossPathRecoveryWithFeedbackEvidenceAndGapWatch
         )
     }
 
     fn ack_escape_enabled(self) -> bool {
         matches!(
             self,
-            Self::CrossPathRecoveryWithAckEscape | Self::CrossPathRecoveryWithFeedbackHandoff
+            Self::CrossPathRecoveryWithAckEscape
+                | Self::CrossPathRecoveryWithFeedbackHandoff
+                | Self::CrossPathRecoveryWithFeedbackSnapshot
+                | Self::CrossPathRecoveryWithFeedbackProbe
+                | Self::CrossPathRecoveryWithFeedbackEvidence
+                | Self::CrossPathRecoveryWithFeedbackEvidenceAndGapRescue
+                | Self::CrossPathRecoveryWithFeedbackEvidenceAndGapWatch
         )
     }
 
     fn feedback_handoff_enabled(self) -> bool {
-        matches!(self, Self::CrossPathRecoveryWithFeedbackHandoff)
+        matches!(
+            self,
+            Self::CrossPathRecoveryWithFeedbackHandoff
+                | Self::CrossPathRecoveryWithFeedbackSnapshot
+                | Self::CrossPathRecoveryWithFeedbackProbe
+                | Self::CrossPathRecoveryWithFeedbackEvidence
+                | Self::CrossPathRecoveryWithFeedbackEvidenceAndGapRescue
+                | Self::CrossPathRecoveryWithFeedbackEvidenceAndGapWatch
+        )
+    }
+
+    fn feedback_credit_snapshot_enabled(self) -> bool {
+        matches!(
+            self,
+            Self::CrossPathRecoveryWithFeedbackSnapshot
+                | Self::CrossPathRecoveryWithFeedbackProbe
+                | Self::CrossPathRecoveryWithFeedbackEvidence
+                | Self::CrossPathRecoveryWithFeedbackEvidenceAndGapRescue
+                | Self::CrossPathRecoveryWithFeedbackEvidenceAndGapWatch
+        )
+    }
+
+    fn feedback_probe_enabled(self) -> bool {
+        matches!(
+            self,
+            Self::CrossPathRecoveryWithFeedbackProbe
+                | Self::CrossPathRecoveryWithFeedbackEvidence
+                | Self::CrossPathRecoveryWithFeedbackEvidenceAndGapRescue
+                | Self::CrossPathRecoveryWithFeedbackEvidenceAndGapWatch
+        )
+    }
+
+    fn feedback_evidence_reinjection_enabled(self) -> bool {
+        matches!(
+            self,
+            Self::CrossPathRecoveryWithFeedbackEvidence
+                | Self::CrossPathRecoveryWithFeedbackEvidenceAndGapRescue
+                | Self::CrossPathRecoveryWithFeedbackEvidenceAndGapWatch
+        )
+    }
+
+    fn stream_gap_rescue_enabled(self) -> bool {
+        matches!(
+            self,
+            Self::CrossPathRecoveryWithFeedbackEvidenceAndGapRescue
+        )
+    }
+
+    fn stream_gap_watch_rescue_enabled(self) -> bool {
+        matches!(self, Self::CrossPathRecoveryWithFeedbackEvidenceAndGapWatch)
     }
 }
 
@@ -296,6 +384,7 @@ pub struct SustainedFailoverConfig {
     pub chunk_size: usize,
     pub seed: u8,
     pub collect_stream_state_diagnostics: bool,
+    pub receiver_anchored_response_timeout: bool,
 }
 
 impl SustainedFailoverConfig {
@@ -317,11 +406,19 @@ impl SustainedFailoverConfig {
             chunk_size,
             seed,
             collect_stream_state_diagnostics: false,
+            receiver_anchored_response_timeout: false,
         }
     }
 
     pub fn with_stream_state_diagnostics(mut self) -> Self {
         self.collect_stream_state_diagnostics = true;
+        self
+    }
+
+    /// Starts the final-response timeout only after the receiver reports that all forward data
+    /// has arrived, so forward drain time cannot consume the reverse-path PTO budget.
+    pub fn with_receiver_anchored_response_timeout(mut self) -> Self {
+        self.receiver_anchored_response_timeout = true;
         self
     }
 
@@ -387,6 +484,11 @@ pub struct PathMeasurement {
     pub ack_progress_recovery_empty_attempts: u64,
     pub ack_progress_reinjections: u64,
     pub ack_progress_reinjected_bytes: u64,
+    pub ack_progress_feedback_probe_timeouts: u64,
+    pub ack_progress_feedback_probes: u64,
+    pub ack_progress_feedback_probe_bytes: u64,
+    pub stream_gap_rescue_probes: u64,
+    pub stream_gap_rescue_bytes: u64,
     pub ack_eliciting_packet_number_advance: u64,
     pub final_rtt: Duration,
     pub final_pto: Duration,
@@ -494,6 +596,7 @@ pub struct SustainedFailoverTimeline {
     pub first_primary_hedge: Option<Duration>,
     pub first_primary_ack_progress_timeout: Option<Duration>,
     pub first_primary_ack_progress_reinjection: Option<Duration>,
+    pub first_primary_ack_progress_feedback_probe: Option<Duration>,
     pub first_primary_ack_eliciting_send: Option<Duration>,
     pub last_primary_ack_eliciting_send: Option<Duration>,
     pub first_primary_udp_receive: Option<Duration>,
@@ -525,13 +628,66 @@ pub struct StreamStateSample {
     pub sender_unacknowledged_bytes: Option<u64>,
     pub sender_lowest_retransmit_offset: Option<u64>,
     pub sender_retransmit_bytes: Option<u64>,
+    pub sender_offset: Option<u64>,
+    pub sender_max_stream_data: Option<u64>,
+    pub sender_stream_flow_control_blocked: Option<bool>,
+    pub sender_connection_flow_control_blocked: Option<bool>,
+    pub sender_connection_data: u64,
+    pub sender_max_data: u64,
+    pub sender_max_data_blocked: bool,
     pub receiver_contiguous_offset: Option<u64>,
     pub receiver_highest_offset: Option<u64>,
+    pub receiver_sent_max_stream_data: Option<u64>,
+    pub receiver_current_max_stream_data: Option<u64>,
+    pub receiver_max_stream_data_pending: bool,
+    pub receiver_max_stream_data_in_flight_packets: u64,
+    pub receiver_data: u64,
+    pub receiver_max_data: u64,
+    pub receiver_sent_max_data: u64,
+    pub receiver_max_data_pending: bool,
+    pub receiver_max_data_in_flight_packets: u64,
+    pub response_sender_fully_acked_offset: Option<u64>,
+    pub response_sender_unacknowledged_bytes: Option<u64>,
+    pub response_sender_lowest_retransmit_offset: Option<u64>,
+    pub response_sender_retransmit_bytes: Option<u64>,
+    pub response_sender_offset: Option<u64>,
+    pub response_sender_max_stream_data: Option<u64>,
+    pub response_sender_flow_control_blocked: Option<bool>,
+    pub response_sender_connection_blocked: Option<bool>,
+    pub response_receiver_contiguous_offset: Option<u64>,
+    pub response_receiver_highest_offset: Option<u64>,
     pub secondary_lost_packets: u64,
     pub secondary_stream_retransmit_bytes: u64,
     pub secondary_pto_timeouts: u64,
+    pub secondary_stream_gap_rescue_probes: u64,
+    pub secondary_stream_gap_rescue_bytes: u64,
+    pub secondary_rtt: Duration,
+    pub secondary_pto: Duration,
     pub secondary_cwnd: u64,
     pub secondary_bytes_in_flight: u64,
+    pub secondary_ack_eliciting_packets_in_flight: u64,
+    pub secondary_tracked_sent_packets: u64,
+    pub secondary_tracked_ack_eliciting_packets: u64,
+    pub secondary_latest_ack_eliciting_packet_number: u64,
+    pub secondary_pto_count: u32,
+    pub secondary_loss_detection_timer_armed: bool,
+    pub receiver_primary_tracked_max_data_packets: u64,
+    pub receiver_primary_tracked_max_stream_data_packets: u64,
+    pub receiver_primary_pto_count: u32,
+    pub receiver_primary_loss_detection_timer_armed: bool,
+    pub receiver_primary_stream_fresh_bytes: u64,
+    pub receiver_secondary_tracked_max_data_packets: u64,
+    pub receiver_secondary_tracked_max_stream_data_packets: u64,
+    pub receiver_secondary_pto_count: u32,
+    pub receiver_secondary_loss_detection_timer_armed: bool,
+    pub receiver_secondary_stream_fresh_bytes: u64,
+    pub receiver_secondary_stream_retransmit_bytes: u64,
+    pub receiver_secondary_lost_packets: u64,
+    pub receiver_secondary_pto_timeouts: u64,
+    pub receiver_secondary_bytes_in_flight: u64,
+    pub receiver_secondary_ack_eliciting_packets_in_flight: u64,
+    pub receiver_secondary_tracked_sent_packets: u64,
+    pub receiver_secondary_tracked_ack_eliciting_packets: u64,
 }
 
 impl SustainedFailoverTimeline {
@@ -563,6 +719,7 @@ impl SustainedFailoverTimeline {
             first_primary_hedge: None,
             first_primary_ack_progress_timeout: None,
             first_primary_ack_progress_reinjection: None,
+            first_primary_ack_progress_feedback_probe: None,
             first_primary_ack_eliciting_send: None,
             last_primary_ack_eliciting_send: None,
             first_primary_udp_receive: None,
@@ -605,6 +762,7 @@ pub struct SustainedFailoverReport {
     pub direction: FailoverDirection,
     pub recovered: bool,
     pub data_intact: bool,
+    pub exchange_complete: bool,
     pub recovery_gap: Option<Duration>,
     pub transfer_duration: Option<Duration>,
     pub records_received: u64,
@@ -638,6 +796,11 @@ struct SustainedReceiveTrace {
     records: u64,
     bytes: u64,
     elapsed: Duration,
+}
+
+struct SustainedFlowOutcome {
+    trace: SustainedReceiveTrace,
+    exchange_failure: Option<String>,
 }
 
 struct RunningLab {
@@ -1198,7 +1361,11 @@ where
                 &sender_connection,
                 &receiver_connection,
                 &sender_secondary,
+                &receiver_primary,
+                &receiver_secondary,
                 secondary_at_blackhole,
+                receiver_primary_at_blackhole,
+                receiver_secondary_at_blackhole,
             );
         }
 
@@ -1231,7 +1398,11 @@ where
                                 &sender_connection,
                                 &receiver_connection,
                                 &sender_secondary,
+                                &receiver_primary,
+                                &receiver_secondary,
                                 secondary_at_blackhole,
+                                receiver_primary_at_blackhole,
+                                receiver_secondary_at_blackhole,
                             );
                         }
                     }
@@ -1273,7 +1444,11 @@ where
                 &sender_connection,
                 &receiver_connection,
                 &sender_secondary,
+                &receiver_primary,
+                &receiver_secondary,
                 secondary_at_blackhole,
+                receiver_primary_at_blackhole,
+                receiver_secondary_at_blackhole,
             );
         }
         let primary_before_delta = path_delta(primary_before, primary_at_blackhole);
@@ -1286,7 +1461,7 @@ where
             path_delta(receiver_secondary_at_blackhole, receiver_secondary_after);
 
         let (trace, flow_failure) = match flow_result {
-            Some(Ok(trace)) => (Some(trace), None),
+            Some(Ok(outcome)) => (Some(outcome.trace), outcome.exchange_failure),
             Some(Err(error)) => (None, Some(error.to_string())),
             None => (
                 None,
@@ -1301,6 +1476,7 @@ where
             .and_then(|trace| recovery_gap_trace_after_fault(&trace.received_at, failure_started));
         let recovery_gap = recovery_gap_trace.map(|gap| gap.duration);
         let data_intact = trace.is_some();
+        let exchange_complete = data_intact && flow_failure.is_none();
         let recovered = data_intact && recovery_gap.is_some();
         let failure_reason = flow_failure
             .or_else(|| (!recovered).then(|| "没有找到同时覆盖故障前后数据的恢复间隔".to_owned()));
@@ -1311,6 +1487,7 @@ where
             direction: config.direction,
             recovered,
             data_intact,
+            exchange_complete,
             recovery_gap,
             transfer_duration: trace.as_ref().map(|trace| trace.elapsed),
             records_received: trace.as_ref().map_or(0, |trace| trace.records),
@@ -1346,7 +1523,7 @@ async fn run_sustained_failover_flow(
     config: SustainedFailoverConfig,
     mut server_events: mpsc::UnboundedReceiver<SustainedServerEvent>,
     started_tx: oneshot::Sender<(Instant, StreamId)>,
-) -> LabResult<SustainedReceiveTrace> {
+) -> LabResult<SustainedFlowOutcome> {
     let (mut send, mut receive) = timeout(OPERATION_TIMEOUT, connection.open_bi())
         .await
         .map_err(|_| other_error("打开正式换网业务流超时"))??;
@@ -1372,6 +1549,7 @@ async fn run_sustained_failover_flow(
 
     match config.direction {
         FailoverDirection::ClientToServer => {
+            let (receiver_complete_tx, receiver_complete_rx) = oneshot::channel();
             let network = async {
                 let (sent_records, sent_bytes, _) = write_sustained_records(
                     &mut send,
@@ -1380,6 +1558,12 @@ async fn run_sustained_failover_flow(
                     config.seed,
                 )
                 .await?;
+                if config.receiver_anchored_response_timeout {
+                    timeout(SUSTAINED_FAILOVER_GRACE, receiver_complete_rx)
+                        .await
+                        .map_err(|_| other_error("等待正式换网服务端完整接收事件超时"))?
+                        .map_err(|_| other_error("正式换网服务端完整接收事件通道提前关闭"))?;
+                }
                 let response = timeout(OPERATION_TIMEOUT, receive.read_to_end(64))
                     .await
                     .map_err(|_| other_error("等待正式换网服务端校验结果超时"))??;
@@ -1390,15 +1574,38 @@ async fn run_sustained_failover_flow(
                 }
                 Ok::<(u64, u64), LabError>((sent_records, sent_bytes))
             };
-            let events = collect_sustained_server_trace(&mut server_events);
+            let events = async {
+                let trace = collect_sustained_server_trace(&mut server_events).await?;
+                let _ = receiver_complete_tx.send(());
+                Ok::<SustainedReceiveTrace, LabError>(trace)
+            };
             let (network, trace) = tokio::join!(network, events);
-            let (sent_records, sent_bytes) = network?;
-            let mut trace = trace?;
-            if (trace.records, trace.bytes) != (sent_records, sent_bytes) {
-                return Err(other_error("正式换网服务端事件统计与线上的校验结果不一致"));
-            }
+            let (mut trace, exchange_failure) = match (network, trace) {
+                (Ok((sent_records, sent_bytes)), Ok(trace)) => {
+                    if (trace.records, trace.bytes) != (sent_records, sent_bytes) {
+                        return Err(other_error("正式换网服务端事件统计与线上的校验结果不一致"));
+                    }
+                    (trace, None)
+                }
+                (Err(network_error), Ok(trace)) => {
+                    let failure = format!(
+                        "客户端未收到最终校验响应：{network_error}；服务端已完整校验 {} 条记录 / {} 字节",
+                        trace.records, trace.bytes
+                    );
+                    (trace, Some(failure))
+                }
+                (Err(network_error), Err(trace_error)) => {
+                    return Err(other_error(format!(
+                        "正式换网双端同时失败：客户端：{network_error}；服务端：{trace_error}"
+                    )));
+                }
+                (Ok(_), Err(error)) => return Err(error),
+            };
             trace.elapsed = started_at.elapsed();
-            Ok(trace)
+            Ok(SustainedFlowOutcome {
+                trace,
+                exchange_failure,
+            })
         }
         FailoverDirection::ServerToClient => {
             send.finish()?;
@@ -1406,7 +1613,10 @@ async fn run_sustained_failover_flow(
                 receive_sustained_records(&mut receive, config.chunk_size, config.seed, None)
                     .await?;
             trace.elapsed = started_at.elapsed();
-            Ok(trace)
+            Ok(SustainedFlowOutcome {
+                trace,
+                exchange_failure: None,
+            })
         }
     }
 }
@@ -1442,7 +1652,11 @@ async fn collect_sustained_server_trace(
                     elapsed: started.elapsed(),
                 });
             }
-            Some(SustainedServerEvent::Failed(reason)) => return Err(other_error(reason)),
+            Some(SustainedServerEvent::Failed(reason)) => {
+                return Err(other_error(format!(
+                    "{reason}；失败前已完整收到 {expected_sequence} 条记录"
+                )));
+            }
             None => return Err(other_error("持续换网服务端事件通道提前关闭")),
         }
     }
@@ -1538,6 +1752,11 @@ fn observe_sustained_failover_timeline(
         primary.ack_progress_reinjections > primary_at_blackhole.ack_progress_reinjections,
         elapsed,
     );
+    record_first_timeline_event(
+        &mut timeline.first_primary_ack_progress_feedback_probe,
+        primary.ack_progress_feedback_probes > primary_at_blackhole.ack_progress_feedback_probes,
+        elapsed,
+    );
     if primary.latest_ack_eliciting_packet_number
         > timeline.observed_primary_latest_ack_eliciting_packet_number
     {
@@ -1630,6 +1849,9 @@ fn observe_sustained_failover_timeline(
     );
 }
 
+// This diagnostic sampler deliberately receives both endpoint snapshots and their fault-time
+// baselines together so every derived counter is taken at one instant.
+#[allow(clippy::too_many_arguments)]
 fn observe_sustained_stream_state(
     samples: &mut Vec<StreamStateSample>,
     failure_started: Instant,
@@ -1637,7 +1859,11 @@ fn observe_sustained_stream_state(
     sender_connection: &Connection,
     receiver_connection: &Connection,
     sender_secondary: &Path,
+    receiver_primary: &Path,
+    receiver_secondary: &Path,
     secondary_at_blackhole: PathStats,
+    receiver_primary_at_blackhole: PathStats,
+    receiver_secondary_at_blackhole: PathStats,
 ) {
     let sender = sender_connection.stats();
     let receiver = receiver_connection.stats();
@@ -1647,6 +1873,8 @@ fn observe_sustained_stream_state(
         .iter()
         .find(|stream| stream.id == stream_id);
     let secondary = sender_secondary.stats();
+    let receiver_primary = receiver_primary.stats();
+    let receiver_secondary = receiver_secondary.stats();
 
     samples.push(StreamStateSample {
         elapsed_after_fault: failure_started.elapsed(),
@@ -1657,9 +1885,51 @@ fn observe_sustained_stream_state(
         sender_lowest_retransmit_offset: sender_stream
             .and_then(|stream| stream.send_lowest_retransmit_offset),
         sender_retransmit_bytes: sender_stream.and_then(|stream| stream.send_retransmit_bytes),
+        sender_offset: sender_stream.and_then(|stream| stream.send_offset),
+        sender_max_stream_data: sender_stream.and_then(|stream| stream.send_max_data),
+        sender_stream_flow_control_blocked: sender_stream
+            .and_then(|stream| stream.send_flow_control_blocked),
+        sender_connection_flow_control_blocked: sender_stream
+            .and_then(|stream| stream.send_connection_blocked),
+        sender_connection_data: sender.flow_control.send_data,
+        sender_max_data: sender.flow_control.send_max_data,
+        sender_max_data_blocked: sender.flow_control.send_blocked,
         receiver_contiguous_offset: receiver_stream
             .and_then(|stream| stream.receive_contiguous_offset),
         receiver_highest_offset: receiver_stream.and_then(|stream| stream.receive_highest_offset),
+        receiver_sent_max_stream_data: receiver_stream
+            .and_then(|stream| stream.receive_sent_max_stream_data),
+        receiver_current_max_stream_data: receiver_stream
+            .and_then(|stream| stream.receive_current_max_stream_data),
+        receiver_max_stream_data_pending: receiver_stream
+            .is_some_and(|stream| stream.receive_max_stream_data_pending),
+        receiver_max_stream_data_in_flight_packets: receiver_stream
+            .map_or(0, |stream| stream.receive_max_stream_data_in_flight_packets),
+        receiver_data: receiver.flow_control.receive_data,
+        receiver_max_data: receiver.flow_control.receive_max_data,
+        receiver_sent_max_data: receiver.flow_control.receive_sent_max_data,
+        receiver_max_data_pending: receiver.flow_control.receive_max_data_pending,
+        receiver_max_data_in_flight_packets: receiver
+            .flow_control
+            .receive_max_data_in_flight_packets,
+        response_sender_fully_acked_offset: receiver_stream
+            .and_then(|stream| stream.send_fully_acked_offset),
+        response_sender_unacknowledged_bytes: receiver_stream
+            .and_then(|stream| stream.send_unacknowledged_bytes),
+        response_sender_lowest_retransmit_offset: receiver_stream
+            .and_then(|stream| stream.send_lowest_retransmit_offset),
+        response_sender_retransmit_bytes: receiver_stream
+            .and_then(|stream| stream.send_retransmit_bytes),
+        response_sender_offset: receiver_stream.and_then(|stream| stream.send_offset),
+        response_sender_max_stream_data: receiver_stream.and_then(|stream| stream.send_max_data),
+        response_sender_flow_control_blocked: receiver_stream
+            .and_then(|stream| stream.send_flow_control_blocked),
+        response_sender_connection_blocked: receiver_stream
+            .and_then(|stream| stream.send_connection_blocked),
+        response_receiver_contiguous_offset: sender_stream
+            .and_then(|stream| stream.receive_contiguous_offset),
+        response_receiver_highest_offset: sender_stream
+            .and_then(|stream| stream.receive_highest_offset),
         secondary_lost_packets: secondary
             .lost_packets
             .saturating_sub(secondary_at_blackhole.lost_packets),
@@ -1670,8 +1940,61 @@ fn observe_sustained_stream_state(
         secondary_pto_timeouts: secondary
             .pto_timeouts
             .saturating_sub(secondary_at_blackhole.pto_timeouts),
+        secondary_stream_gap_rescue_probes: secondary
+            .stream_gap_rescue_probes
+            .saturating_sub(secondary_at_blackhole.stream_gap_rescue_probes),
+        secondary_stream_gap_rescue_bytes: secondary
+            .stream_gap_rescue_bytes
+            .saturating_sub(secondary_at_blackhole.stream_gap_rescue_bytes),
+        secondary_rtt: secondary.rtt,
+        secondary_pto: secondary.pto,
         secondary_cwnd: secondary.cwnd,
         secondary_bytes_in_flight: secondary.bytes_in_flight,
+        secondary_ack_eliciting_packets_in_flight: secondary.ack_eliciting_packets_in_flight,
+        secondary_tracked_sent_packets: secondary.tracked_sent_packets,
+        secondary_tracked_ack_eliciting_packets: secondary.tracked_ack_eliciting_packets,
+        secondary_latest_ack_eliciting_packet_number: secondary.latest_ack_eliciting_packet_number,
+        secondary_pto_count: secondary.pto_count,
+        secondary_loss_detection_timer_armed: secondary.loss_detection_timer_armed,
+        receiver_primary_tracked_max_data_packets: receiver_primary.tracked_max_data_packets,
+        receiver_primary_tracked_max_stream_data_packets: receiver_primary
+            .tracked_max_stream_data_packets,
+        receiver_primary_pto_count: receiver_primary.pto_count,
+        receiver_primary_loss_detection_timer_armed: receiver_primary.loss_detection_timer_armed,
+        receiver_primary_stream_fresh_bytes: receiver_primary
+            .frame_tx
+            .stream_fresh_bytes
+            .saturating_sub(receiver_primary_at_blackhole.frame_tx.stream_fresh_bytes),
+        receiver_secondary_tracked_max_data_packets: receiver_secondary.tracked_max_data_packets,
+        receiver_secondary_tracked_max_stream_data_packets: receiver_secondary
+            .tracked_max_stream_data_packets,
+        receiver_secondary_pto_count: receiver_secondary.pto_count,
+        receiver_secondary_loss_detection_timer_armed: receiver_secondary
+            .loss_detection_timer_armed,
+        receiver_secondary_stream_fresh_bytes: receiver_secondary
+            .frame_tx
+            .stream_fresh_bytes
+            .saturating_sub(receiver_secondary_at_blackhole.frame_tx.stream_fresh_bytes),
+        receiver_secondary_stream_retransmit_bytes: receiver_secondary
+            .frame_tx
+            .stream_retransmit_bytes
+            .saturating_sub(
+                receiver_secondary_at_blackhole
+                    .frame_tx
+                    .stream_retransmit_bytes,
+            ),
+        receiver_secondary_lost_packets: receiver_secondary
+            .lost_packets
+            .saturating_sub(receiver_secondary_at_blackhole.lost_packets),
+        receiver_secondary_pto_timeouts: receiver_secondary
+            .pto_timeouts
+            .saturating_sub(receiver_secondary_at_blackhole.pto_timeouts),
+        receiver_secondary_bytes_in_flight: receiver_secondary.bytes_in_flight,
+        receiver_secondary_ack_eliciting_packets_in_flight: receiver_secondary
+            .ack_eliciting_packets_in_flight,
+        receiver_secondary_tracked_sent_packets: receiver_secondary.tracked_sent_packets,
+        receiver_secondary_tracked_ack_eliciting_packets: receiver_secondary
+            .tracked_ack_eliciting_packets,
     });
 }
 
@@ -1796,8 +2119,15 @@ fn configure_transport(
         .cross_path_pto_reinjection(pto_recovery.pto_reinjection_enabled())
         .cross_path_abandon_reinjection(pto_recovery.abandon_reinjection_enabled())
         .cross_path_ack_progress_reinjection(pto_recovery.ack_progress_reinjection_enabled())
+        .cross_path_ack_progress_feedback_probe(pto_recovery.feedback_probe_enabled())
+        .cross_path_ack_progress_feedback_evidence_reinjection(
+            pto_recovery.feedback_evidence_reinjection_enabled(),
+        )
+        .stream_gap_rescue(pto_recovery.stream_gap_rescue_enabled())
+        .stream_gap_watch_rescue(pto_recovery.stream_gap_watch_rescue_enabled())
         .cross_path_ack_escape(pto_recovery.ack_escape_enabled())
         .cross_path_feedback_handoff(pto_recovery.feedback_handoff_enabled())
+        .cross_path_feedback_credit_snapshot(pto_recovery.feedback_credit_snapshot_enabled())
         .default_path_max_idle_timeout(path_idle_timeout)
         .default_path_keep_alive_interval(Some(Duration::from_millis(200)))
         .datagram_receive_buffer_size(Some(1024 * 1024))
@@ -2154,7 +2484,7 @@ async fn receive_sustained_records(
         }
         timeout(OPERATION_TIMEOUT, receive.read_exact(&mut payload))
             .await
-            .map_err(|_| other_error("等待持续换网记录载荷超时"))??;
+            .map_err(|_| other_error(format!("等待持续换网记录 {sequence} 载荷超时")))??;
         if !sustained_payload_is_valid(&payload, seed, sequence)
             || digest(&payload) != expected_digest
         {
@@ -2617,6 +2947,21 @@ fn path_delta(before: PathStats, after: PathStats) -> PathMeasurement {
         ack_progress_reinjected_bytes: after
             .ack_progress_reinjected_bytes
             .saturating_sub(before.ack_progress_reinjected_bytes),
+        ack_progress_feedback_probe_timeouts: after
+            .ack_progress_feedback_probe_timeouts
+            .saturating_sub(before.ack_progress_feedback_probe_timeouts),
+        ack_progress_feedback_probes: after
+            .ack_progress_feedback_probes
+            .saturating_sub(before.ack_progress_feedback_probes),
+        ack_progress_feedback_probe_bytes: after
+            .ack_progress_feedback_probe_bytes
+            .saturating_sub(before.ack_progress_feedback_probe_bytes),
+        stream_gap_rescue_probes: after
+            .stream_gap_rescue_probes
+            .saturating_sub(before.stream_gap_rescue_probes),
+        stream_gap_rescue_bytes: after
+            .stream_gap_rescue_bytes
+            .saturating_sub(before.stream_gap_rescue_bytes),
         ack_eliciting_packet_number_advance: after
             .latest_ack_eliciting_packet_number
             .saturating_sub(before.latest_ack_eliciting_packet_number),
@@ -2818,11 +3163,13 @@ mod tests {
                 .await
                 .expect("正式换网协议应报告开始")
                 .expect("正式换网协议开始通道不应关闭");
-            let trace = timeout(OPERATION_TIMEOUT, task)
+            let outcome = timeout(OPERATION_TIMEOUT, task)
                 .await
                 .expect("正式换网协议不应超时")
                 .expect("正式换网协议任务不应崩溃")
                 .expect("正式换网协议应完整校验");
+            assert!(outcome.exchange_failure.is_none());
+            let trace = outcome.trace;
 
             assert!(trace.records > 0);
             assert_eq!(trace.bytes, trace.records * config.chunk_size as u64);
@@ -2874,7 +3221,95 @@ mod tests {
         assert!(recovery.ack_progress_reinjection_enabled());
         assert!(recovery.ack_escape_enabled());
         assert!(recovery.feedback_handoff_enabled());
+        assert!(!recovery.feedback_credit_snapshot_enabled());
         assert!(!PtoRecovery::CrossPathRecoveryWithAckEscape.feedback_handoff_enabled());
+        assert!(!PtoRecovery::CANDIDATES.contains(&recovery));
+    }
+
+    #[test]
+    fn feedback_snapshot_variant_is_separate_and_default_off() {
+        let recovery = PtoRecovery::CrossPathRecoveryWithFeedbackSnapshot;
+        assert!(recovery.pto_reinjection_enabled());
+        assert!(recovery.abandon_reinjection_enabled());
+        assert!(recovery.ack_progress_reinjection_enabled());
+        assert!(recovery.ack_escape_enabled());
+        assert!(recovery.feedback_handoff_enabled());
+        assert!(recovery.feedback_credit_snapshot_enabled());
+        assert!(!recovery.feedback_probe_enabled());
+        assert!(
+            !PtoRecovery::CrossPathRecoveryWithFeedbackHandoff.feedback_credit_snapshot_enabled()
+        );
+        assert!(!PtoRecovery::CANDIDATES.contains(&recovery));
+    }
+
+    #[test]
+    fn feedback_probe_variant_composes_without_changing_snapshot_history() {
+        let recovery = PtoRecovery::CrossPathRecoveryWithFeedbackProbe;
+        assert!(recovery.pto_reinjection_enabled());
+        assert!(recovery.abandon_reinjection_enabled());
+        assert!(recovery.ack_progress_reinjection_enabled());
+        assert!(recovery.ack_escape_enabled());
+        assert!(recovery.feedback_handoff_enabled());
+        assert!(recovery.feedback_credit_snapshot_enabled());
+        assert!(recovery.feedback_probe_enabled());
+        assert!(!recovery.feedback_evidence_reinjection_enabled());
+        assert!(!PtoRecovery::CrossPathRecoveryWithFeedbackSnapshot.feedback_probe_enabled());
+        assert!(!PtoRecovery::CANDIDATES.contains(&recovery));
+    }
+
+    #[test]
+    fn feedback_evidence_variant_composes_without_changing_probe_history() {
+        let recovery = PtoRecovery::CrossPathRecoveryWithFeedbackEvidence;
+        assert!(recovery.pto_reinjection_enabled());
+        assert!(recovery.abandon_reinjection_enabled());
+        assert!(recovery.ack_progress_reinjection_enabled());
+        assert!(recovery.ack_escape_enabled());
+        assert!(recovery.feedback_handoff_enabled());
+        assert!(recovery.feedback_credit_snapshot_enabled());
+        assert!(recovery.feedback_probe_enabled());
+        assert!(recovery.feedback_evidence_reinjection_enabled());
+        assert!(!recovery.stream_gap_rescue_enabled());
+        assert!(
+            !PtoRecovery::CrossPathRecoveryWithFeedbackProbe
+                .feedback_evidence_reinjection_enabled()
+        );
+        assert!(!PtoRecovery::CANDIDATES.contains(&recovery));
+    }
+
+    #[test]
+    fn gap_rescue_variant_is_separate_from_evidence_history() {
+        let recovery = PtoRecovery::CrossPathRecoveryWithFeedbackEvidenceAndGapRescue;
+        assert!(recovery.pto_reinjection_enabled());
+        assert!(recovery.abandon_reinjection_enabled());
+        assert!(recovery.ack_progress_reinjection_enabled());
+        assert!(recovery.ack_escape_enabled());
+        assert!(recovery.feedback_handoff_enabled());
+        assert!(recovery.feedback_credit_snapshot_enabled());
+        assert!(recovery.feedback_probe_enabled());
+        assert!(recovery.feedback_evidence_reinjection_enabled());
+        assert!(recovery.stream_gap_rescue_enabled());
+        assert!(!recovery.stream_gap_watch_rescue_enabled());
+        assert!(!PtoRecovery::CrossPathRecoveryWithFeedbackEvidence.stream_gap_rescue_enabled());
+        assert!(!PtoRecovery::CANDIDATES.contains(&recovery));
+    }
+
+    #[test]
+    fn gap_watch_variant_is_separate_from_immediate_rescue_history() {
+        let recovery = PtoRecovery::CrossPathRecoveryWithFeedbackEvidenceAndGapWatch;
+        assert!(recovery.pto_reinjection_enabled());
+        assert!(recovery.abandon_reinjection_enabled());
+        assert!(recovery.ack_progress_reinjection_enabled());
+        assert!(recovery.ack_escape_enabled());
+        assert!(recovery.feedback_handoff_enabled());
+        assert!(recovery.feedback_credit_snapshot_enabled());
+        assert!(recovery.feedback_probe_enabled());
+        assert!(recovery.feedback_evidence_reinjection_enabled());
+        assert!(!recovery.stream_gap_rescue_enabled());
+        assert!(recovery.stream_gap_watch_rescue_enabled());
+        assert!(
+            !PtoRecovery::CrossPathRecoveryWithFeedbackEvidenceAndGapRescue
+                .stream_gap_watch_rescue_enabled()
+        );
         assert!(!PtoRecovery::CANDIDATES.contains(&recovery));
     }
 
@@ -2890,10 +3325,16 @@ mod tests {
             1,
         );
         assert!(!config.collect_stream_state_diagnostics);
+        assert!(!config.receiver_anchored_response_timeout);
         assert!(
             config
                 .with_stream_state_diagnostics()
                 .collect_stream_state_diagnostics
+        );
+        assert!(
+            config
+                .with_receiver_anchored_response_timeout()
+                .receiver_anchored_response_timeout
         );
     }
 

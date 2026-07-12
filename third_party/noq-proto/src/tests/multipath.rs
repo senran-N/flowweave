@@ -16,8 +16,7 @@ use crate::{
 };
 use crate::{
     ClosePathError, Dir, Event, PathAbandonReason, PathEvent, ReadError, StreamEvent,
-    TransportErrorCode,
-    n0_nat_traversal,
+    TransportErrorCode, n0_nat_traversal,
 };
 
 use super::util::{
@@ -52,7 +51,16 @@ fn recovery_pair(
     pto_reinjection: bool,
     abandon_reinjection: bool,
 ) -> TestResult<(ConnPair, PathId)> {
-    recovery_pair_with_ack_progress(pto_reinjection, abandon_reinjection, false, false, false)
+    recovery_pair_with_ack_progress(
+        pto_reinjection,
+        abandon_reinjection,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+    )
 }
 
 fn recovery_pair_with_ack_progress(
@@ -61,6 +69,9 @@ fn recovery_pair_with_ack_progress(
     ack_progress_reinjection: bool,
     ack_escape: bool,
     feedback_handoff: bool,
+    feedback_credit_snapshot: bool,
+    feedback_probe: bool,
+    feedback_evidence_reinjection: bool,
 ) -> TestResult<(ConnPair, PathId)> {
     let first_client_addr = Pair::CLIENT_ADDR;
     let first_server_addr = Pair::SERVER_ADDR;
@@ -80,16 +91,22 @@ fn recovery_pair_with_ack_progress(
         .cross_path_pto_reinjection(pto_reinjection)
         .cross_path_abandon_reinjection(abandon_reinjection)
         .cross_path_ack_progress_reinjection(ack_progress_reinjection)
+        .cross_path_ack_progress_feedback_probe(feedback_probe)
+        .cross_path_ack_progress_feedback_evidence_reinjection(feedback_evidence_reinjection)
         .cross_path_ack_escape(ack_escape)
         .cross_path_feedback_handoff(feedback_handoff)
+        .cross_path_feedback_credit_snapshot(feedback_credit_snapshot)
         .default_path_max_idle_timeout(Some(Duration::from_secs(60)));
     builder
         .server_transport_cfg
         .cross_path_pto_reinjection(pto_reinjection)
         .cross_path_abandon_reinjection(abandon_reinjection)
         .cross_path_ack_progress_reinjection(ack_progress_reinjection)
+        .cross_path_ack_progress_feedback_probe(feedback_probe)
+        .cross_path_ack_progress_feedback_evidence_reinjection(feedback_evidence_reinjection)
         .cross_path_ack_escape(ack_escape)
         .cross_path_feedback_handoff(feedback_handoff)
+        .cross_path_feedback_credit_snapshot(feedback_credit_snapshot)
         .default_path_max_idle_timeout(Some(Duration::from_secs(60)));
     let mut pair = builder.connect();
 
@@ -118,19 +135,35 @@ fn abandon_recovery_pair(enabled: bool) -> TestResult<(ConnPair, PathId)> {
 }
 
 fn ack_progress_recovery_pair(enabled: bool) -> TestResult<(ConnPair, PathId)> {
-    recovery_pair_with_ack_progress(false, false, enabled, false, false)
+    recovery_pair_with_ack_progress(false, false, enabled, false, false, false, false, false)
 }
 
 fn ack_escape_recovery_pair(enabled: bool) -> TestResult<(ConnPair, PathId)> {
-    recovery_pair_with_ack_progress(false, false, true, enabled, false)
+    recovery_pair_with_ack_progress(false, false, true, enabled, false, false, false, false)
 }
 
 fn feedback_handoff_recovery_pair() -> TestResult<(ConnPair, PathId)> {
-    recovery_pair_with_ack_progress(false, false, true, true, true)
+    recovery_pair_with_ack_progress(false, false, true, true, true, false, false, false)
+}
+
+fn full_feedback_handoff_recovery_pair() -> TestResult<(ConnPair, PathId)> {
+    recovery_pair_with_ack_progress(true, true, true, true, true, false, false, false)
+}
+
+fn full_feedback_snapshot_recovery_pair() -> TestResult<(ConnPair, PathId)> {
+    recovery_pair_with_ack_progress(true, true, true, true, true, true, false, false)
+}
+
+fn feedback_probe_recovery_pair() -> TestResult<(ConnPair, PathId)> {
+    recovery_pair_with_ack_progress(false, false, true, true, true, true, true, false)
+}
+
+fn feedback_evidence_recovery_pair() -> TestResult<(ConnPair, PathId)> {
+    recovery_pair_with_ack_progress(false, false, true, true, true, true, true, true)
 }
 
 fn pto_ack_escape_pair() -> TestResult<(ConnPair, PathId)> {
-    recovery_pair_with_ack_progress(true, false, false, true, false)
+    recovery_pair_with_ack_progress(true, false, false, true, false, false, false, false)
 }
 
 fn blackhole_primary_path(pair: &mut ConnPair) -> (SocketAddr, SocketAddr) {
@@ -161,6 +194,15 @@ fn advance_client_to_next_wakeup(pair: &mut ConnPair) {
     pair.drive_client();
 }
 
+fn advance_server_to_next_wakeup(pair: &mut ConnPair) {
+    let next = pair
+        .server
+        .next_wakeup()
+        .expect("server should retain a loss-detection wakeup");
+    pair.time = next;
+    pair.drive_server();
+}
+
 fn advance_client_until_hedge(pair: &mut ConnPair, path: PathId) {
     for _ in 0..32 {
         if pair.path_stats(Client, path).unwrap().pto_hedges > 0 {
@@ -184,6 +226,21 @@ fn advance_client_until_ack_progress_reinjection(pair: &mut ConnPair, path: Path
         advance_client_to_next_wakeup(pair);
     }
     panic!("ACK-progress reinjection did not fire within the deterministic step budget");
+}
+
+fn advance_client_until_feedback_probe(pair: &mut ConnPair, path: PathId) {
+    for _ in 0..32 {
+        if pair
+            .path_stats(Client, path)
+            .unwrap()
+            .ack_progress_feedback_probes
+            > 0
+        {
+            return;
+        }
+        advance_client_to_next_wakeup(pair);
+    }
+    panic!("ACK-progress feedback probe did not fire within the deterministic step budget");
 }
 
 fn advance_client_until_probe(
@@ -320,6 +377,13 @@ fn capture_primary_path_ack(pair: &mut ConnPair) -> TestResult<Vec<Inbound>> {
     Ok(ack)
 }
 
+fn set_feedback_probe_test_rtts(pair: &mut ConnPair, backup: PathId) {
+    pair.conn_mut(Client)
+        .set_test_path_rtt(PathId::ZERO, Duration::from_millis(200));
+    pair.conn_mut(Client)
+        .set_test_path_rtt(backup, Duration::from_millis(20));
+}
+
 fn deliver_primary_stream_and_drop_ack(
     pair: &mut ConnPair,
     data: &[u8],
@@ -347,6 +411,38 @@ fn deliver_primary_stream_and_drop_ack(
     assert!(
         !pair.client.inbound.is_empty(),
         "the server must generate a primary PATH_ACK before it is dropped"
+    );
+    pair.client.inbound.clear();
+    pair.server.inbound.clear();
+    Ok(stream)
+}
+
+fn deliver_primary_prefix_and_drop_ack(
+    pair: &mut ConnPair,
+    prefix: &[u8],
+) -> TestResult<crate::StreamId> {
+    let stream = pair.streams(Client).open(Dir::Uni).unwrap();
+    write_stream_data(pair, stream, prefix);
+    pair.drive_client();
+    assert!(
+        !pair.server.inbound.is_empty(),
+        "the known prefix must reach the server before the suffix is blackholed"
+    );
+
+    for _ in 0..8 {
+        pair.drive_server();
+        if !pair.client.inbound.is_empty() {
+            break;
+        }
+        let next = pair
+            .server
+            .next_wakeup()
+            .expect("server should retain an ACK wakeup for the known prefix");
+        pair.time = next;
+    }
+    assert!(
+        !pair.client.inbound.is_empty(),
+        "the server must acknowledge the known prefix before that ACK is dropped"
     );
     pair.client.inbound.clear();
     pair.server.inbound.clear();
@@ -569,6 +665,446 @@ fn recovery_feedback_handoff_routes_stream_credit_on_backup() -> TestResult {
     Ok(())
 }
 
+struct InFlightCreditHandoff {
+    pair: ConnPair,
+    backup: PathId,
+    stream: crate::StreamId,
+    backup_max_stream_data_before: u64,
+}
+
+fn prepare_in_flight_credit_handoff(snapshot: bool) -> TestResult<InFlightCreditHandoff> {
+    let (mut pair, backup) = if snapshot {
+        full_feedback_snapshot_recovery_pair()?
+    } else {
+        full_feedback_handoff_recovery_pair()?
+    };
+    let stream = pair.streams(Client).open(Dir::Uni).unwrap();
+    let first = vec![0x41; 200_000];
+    write_stream_data(&mut pair, stream, &first);
+    pair.drive();
+
+    const UNACKED_TAIL: &[u8] = b"keep one primary packet outstanding";
+    write_stream_data(&mut pair, stream, UNACKED_TAIL);
+    pair.drive_client();
+    assert!(
+        !pair.server.inbound.is_empty(),
+        "the primary must carry the initial stream range"
+    );
+    pair.drive_server();
+    pair.client.inbound.clear();
+
+    assert_matches!(pair.streams(Server).accept(Dir::Uni), Some(id) if id == stream);
+    let mut receive = pair.recv_stream(Server, stream);
+    let mut chunks = receive.read(false)?;
+    let mut read = 0usize;
+    loop {
+        match chunks.next(usize::MAX) {
+            Ok(Some(chunk)) => read += chunk.bytes.len(),
+            Err(ReadError::Blocked) => break,
+            Ok(None) => panic!("unfinished handoff stream unexpectedly reached FIN"),
+            Err(error) => panic!("failed reading pre-handoff stream credit: {error}"),
+        }
+    }
+    let update = chunks.finalize();
+    assert_eq!(read, first.len() + UNACKED_TAIL.len());
+    assert!(update.should_transmit());
+
+    let primary_before = pair.path_stats(Server, PathId::ZERO).unwrap();
+    let backup_before = pair.path_stats(Server, backup).unwrap();
+    pair.drive_server();
+    let primary_with_credit = pair.path_stats(Server, PathId::ZERO).unwrap();
+    assert!(
+        primary_with_credit.frame_tx.max_stream_data > primary_before.frame_tx.max_stream_data,
+        "the transition counterexample requires MAX_STREAM_DATA to be sent on the old primary"
+    );
+    assert!(primary_with_credit.tracked_max_stream_data_packets > 0);
+    assert_eq!(
+        pair.path_stats(Server, backup)
+            .unwrap()
+            .frame_tx
+            .max_stream_data,
+        backup_before.frame_tx.max_stream_data,
+    );
+    pair.client.inbound.clear();
+
+    blackhole_primary_path(&mut pair);
+    advance_client_until_hedge(&mut pair, PathId::ZERO);
+    pair.drive_server();
+    assert_eq!(pair.path_status(Server, PathId::ZERO)?, PathStatus::Backup);
+    assert_eq!(pair.path_status(Server, backup)?, PathStatus::Available);
+
+    Ok(InFlightCreditHandoff {
+        pair,
+        backup,
+        stream,
+        backup_max_stream_data_before: backup_before.frame_tx.max_stream_data,
+    })
+}
+
+#[test]
+fn historical_feedback_handoff_does_not_snapshot_in_flight_credit() -> TestResult {
+    let _guard = subscribe();
+    let mut prepared = prepare_in_flight_credit_handoff(false)?;
+    assert_eq!(
+        prepared
+            .pair
+            .path_stats(Server, prepared.backup)
+            .unwrap()
+            .frame_tx
+            .max_stream_data,
+        prepared.backup_max_stream_data_before,
+        "the earlier failed candidate must remain reproducible"
+    );
+    Ok(())
+}
+
+#[test]
+fn recovery_feedback_handoff_reissues_credit_already_in_flight_on_primary() -> TestResult {
+    let _guard = subscribe();
+    let InFlightCreditHandoff {
+        mut pair,
+        backup,
+        stream,
+        backup_max_stream_data_before,
+    } = prepare_in_flight_credit_handoff(true)?;
+
+    let backup_after_handoff = pair.path_stats(Server, backup).unwrap();
+    assert!(
+        backup_after_handoff.frame_tx.max_stream_data > backup_max_stream_data_before,
+        "feedback handoff must reissue credit already owned by a packet on the failed path"
+    );
+    pair.drive_client();
+
+    let second = vec![0x52; 1_200_000];
+    write_stream_data(&mut pair, stream, &second);
+    Ok(())
+}
+
+#[test]
+fn recovery_backup_pto_repairs_a_lost_stream_tail_after_primary_closes() -> TestResult {
+    let _guard = subscribe();
+    let (mut pair, backup) = full_feedback_handoff_recovery_pair()?;
+    let recovered_stream =
+        deliver_primary_stream_and_drop_ack(&mut pair, b"feedback handoff before tail loss")?;
+
+    blackhole_primary_path(&mut pair);
+    advance_client_until_hedge(&mut pair, PathId::ZERO);
+    pair.drive_server();
+    pair.drive_client();
+    assert_eq!(
+        read_all_stream_data(&mut pair, recovered_stream),
+        b"feedback handoff before tail loss"
+    );
+    pair.drive_server();
+    pair.drive_client();
+
+    pair.close_path(Client, PathId::ZERO, 0u8.into())?;
+    pair.drive_client();
+    pair.drive_server();
+    pair.drive_client();
+    assert_eq!(
+        pair.path_status(Client, backup)?,
+        PathStatus::Backup,
+        "NoQ reports the peer's PATH_STATUS separately; the sole remaining backup is still usable"
+    );
+
+    let stream = pair.streams(Client).open(Dir::Uni).unwrap();
+    const TAIL: &[u8] = b"the healthy backup must recover its own lost tail";
+    write_stream_data(&mut pair, stream, TAIL);
+    pair.send_stream(Client, stream).finish()?;
+    pair.drive_client();
+    assert!(
+        !pair.server.inbound.is_empty(),
+        "the backup must emit the tail packet before the test drops it"
+    );
+    pair.server.inbound.clear();
+
+    let armed = pair.path_stats(Client, backup).unwrap();
+    assert!(armed.ack_eliciting_packets_in_flight > 0);
+    assert!(armed.loss_detection_timer_armed);
+
+    let pto_before = pair.path_stats(Client, backup).unwrap().pto_timeouts;
+    pair.time += Duration::from_secs(1);
+    pair.drive_client();
+    assert!(
+        pair.path_stats(Client, backup).unwrap().pto_timeouts > pto_before,
+        "a lost tail on the sole healthy path must fire that path's PTO"
+    );
+
+    pair.drive_server();
+    pair.drive_client();
+    pair.drive_server();
+    pair.drive_client();
+    assert_eq!(read_all_stream_data(&mut pair, stream), TAIL);
+    Ok(())
+}
+
+#[test]
+fn recovery_backup_pto_repairs_a_lost_reverse_response_after_handoff() -> TestResult {
+    let _guard = subscribe();
+    let InFlightCreditHandoff {
+        mut pair, backup, ..
+    } = prepare_in_flight_credit_handoff(true)?;
+    pair.drive_client();
+
+    let stream = pair.streams(Client).open(Dir::Bi).unwrap();
+    const REQUEST: &[u8] = b"request after feedback handoff";
+    write_stream_data(&mut pair, stream, REQUEST);
+    pair.send_stream(Client, stream).finish()?;
+    pair.drive();
+
+    assert_matches!(pair.streams(Server).accept(Dir::Bi), Some(id) if id == stream);
+    let mut request = pair.recv_stream(Server, stream);
+    let mut chunks = request.read(true)?;
+    let mut received = Vec::new();
+    while let Some(chunk) = chunks.next(usize::MAX)? {
+        received.extend_from_slice(&chunk.bytes);
+    }
+    let _ = chunks.finalize();
+    assert_eq!(received, REQUEST);
+
+    const RESPONSE: &[u8] = b"small final validation response";
+    assert_eq!(
+        pair.send_stream(Server, stream).write(RESPONSE)?,
+        RESPONSE.len()
+    );
+    pair.send_stream(Server, stream).finish()?;
+    pair.drive_server();
+    assert!(
+        !pair.client.inbound.is_empty(),
+        "the promoted backup must emit the reverse response"
+    );
+    pair.client.inbound.clear();
+
+    let lost = pair.path_stats(Server, backup).unwrap();
+    assert!(lost.ack_eliciting_packets_in_flight > 0);
+    assert!(lost.loss_detection_timer_armed);
+    for _ in 0..32 {
+        if pair.path_stats(Server, backup).unwrap().pto_timeouts > lost.pto_timeouts {
+            break;
+        }
+        advance_server_to_next_wakeup(&mut pair);
+    }
+    assert!(
+        pair.path_stats(Server, backup).unwrap().pto_timeouts > lost.pto_timeouts,
+        "the backup must run PTO for a lost reverse response"
+    );
+
+    pair.drive_client();
+    pair.drive_server();
+    pair.drive_client();
+    let mut response = pair.recv_stream(Client, stream);
+    let mut chunks = response.read(true)?;
+    let mut received = Vec::new();
+    while let Some(chunk) = chunks.next(usize::MAX)? {
+        received.extend_from_slice(&chunk.bytes);
+    }
+    let _ = chunks.finalize();
+    assert_eq!(received, RESPONSE);
+    Ok(())
+}
+
+#[test]
+fn recovery_backup_pto_repairs_a_lost_reverse_only_fin_after_handoff() -> TestResult {
+    let _guard = subscribe();
+    let InFlightCreditHandoff {
+        mut pair, backup, ..
+    } = prepare_in_flight_credit_handoff(true)?;
+    pair.drive_client();
+
+    let stream = pair.streams(Client).open(Dir::Bi).unwrap();
+    write_stream_data(&mut pair, stream, b"request before split response");
+    pair.send_stream(Client, stream).finish()?;
+    pair.drive();
+    assert_matches!(pair.streams(Server).accept(Dir::Bi), Some(id) if id == stream);
+
+    const RESPONSE: &[u8] = b"response bytes arrive before FIN";
+    assert_eq!(
+        pair.send_stream(Server, stream).write(RESPONSE)?,
+        RESPONSE.len()
+    );
+    pair.drive_server();
+    pair.drive_client();
+    pair.drive_server();
+
+    pair.send_stream(Server, stream).finish()?;
+    pair.drive_server();
+    assert!(
+        !pair.client.inbound.is_empty(),
+        "finishing the reverse stream must emit a pure FIN packet"
+    );
+    pair.client.inbound.clear();
+    let lost_fin = pair.path_stats(Server, backup).unwrap();
+    assert!(lost_fin.loss_detection_timer_armed);
+
+    for _ in 0..32 {
+        if pair.path_stats(Server, backup).unwrap().pto_timeouts > lost_fin.pto_timeouts {
+            break;
+        }
+        advance_server_to_next_wakeup(&mut pair);
+    }
+    assert!(
+        pair.path_stats(Server, backup).unwrap().pto_timeouts > lost_fin.pto_timeouts,
+        "the backup must run PTO for a lost reverse FIN"
+    );
+    pair.drive_client();
+    pair.drive_server();
+    pair.drive_client();
+
+    let mut response = pair.recv_stream(Client, stream);
+    let mut chunks = response.read(true)?;
+    let mut received = Vec::new();
+    while let Some(chunk) = chunks.next(usize::MAX)? {
+        received.extend_from_slice(&chunk.bytes);
+    }
+    let _ = chunks.finalize();
+    assert_eq!(received, RESPONSE);
+    Ok(())
+}
+
+#[test]
+fn recovery_feedback_handoff_survives_multiple_stream_windows_after_primary_closes() -> TestResult {
+    let _guard = subscribe();
+    let (mut pair, backup) = feedback_handoff_recovery_pair()?;
+    let recovered_stream =
+        deliver_primary_stream_and_drop_ack(&mut pair, b"handoff before repeated credits")?;
+
+    blackhole_primary_path(&mut pair);
+    advance_client_until_ack_progress_reinjection(&mut pair, PathId::ZERO);
+    pair.drive_server();
+    pair.drive_client();
+    assert_eq!(
+        read_all_stream_data(&mut pair, recovered_stream),
+        b"handoff before repeated credits"
+    );
+    pair.drive_server();
+    pair.drive_client();
+
+    pair.close_path(Client, PathId::ZERO, 0u8.into())?;
+    pair.drive_client();
+    pair.drive_server();
+    pair.drive_client();
+
+    let primary_before = pair.path_stats(Server, PathId::ZERO).unwrap().frame_tx;
+    let backup_before = pair.path_stats(Server, backup).unwrap().frame_tx;
+    let stream = pair.streams(Client).open(Dir::Uni).unwrap();
+    let mut accepted = false;
+    let mut received = 0usize;
+    const ROUNDS: usize = 16;
+    const BLOCK_SIZE: usize = 200_000;
+
+    for round in 0..ROUNDS {
+        let block = vec![round as u8; BLOCK_SIZE];
+        write_stream_data(&mut pair, stream, &block);
+        pair.drive();
+
+        if !accepted {
+            assert_matches!(pair.streams(Server).accept(Dir::Uni), Some(id) if id == stream);
+            accepted = true;
+        }
+        let mut receive = pair.recv_stream(Server, stream);
+        let mut chunks = receive.read(false)?;
+        let mut read = 0usize;
+        loop {
+            match chunks.next(usize::MAX) {
+                Ok(Some(chunk)) => read += chunk.bytes.len(),
+                Err(ReadError::Blocked) => break,
+                Ok(None) => panic!("unfinished repeated-credit stream unexpectedly reached FIN"),
+                Err(error) => panic!("failed reading repeated-credit stream: {error}"),
+            }
+        }
+        let flow_control_update = chunks.finalize();
+        assert_eq!(read, BLOCK_SIZE);
+        assert!(flow_control_update.should_transmit());
+        received += read;
+        pair.drive();
+    }
+
+    assert_eq!(received, ROUNDS * BLOCK_SIZE);
+    let backup_after = pair.path_stats(Server, backup).unwrap().frame_tx;
+    if let Some(primary_after) = pair.path_stats(Server, PathId::ZERO) {
+        assert_eq!(
+            primary_after.frame_tx.max_stream_data, primary_before.max_stream_data,
+            "the closed primary must never consume a later stream-credit update"
+        );
+    }
+    assert!(
+        backup_after.max_stream_data >= backup_before.max_stream_data + ROUNDS as u64,
+        "every consumed block must refresh stream credit on the healthy backup"
+    );
+    Ok(())
+}
+
+#[test]
+fn recovery_backup_pto_retransmits_lost_stream_credit_after_primary_closes() -> TestResult {
+    let _guard = subscribe();
+    let (mut pair, backup) = full_feedback_handoff_recovery_pair()?;
+    let recovered_stream =
+        deliver_primary_stream_and_drop_ack(&mut pair, b"handoff before lost stream credit")?;
+
+    blackhole_primary_path(&mut pair);
+    advance_client_until_hedge(&mut pair, PathId::ZERO);
+    pair.drive_server();
+    pair.drive_client();
+    assert_eq!(
+        read_all_stream_data(&mut pair, recovered_stream),
+        b"handoff before lost stream credit"
+    );
+    pair.drive_server();
+    pair.drive_client();
+
+    pair.close_path(Client, PathId::ZERO, 0u8.into())?;
+    pair.drive_client();
+    pair.drive_server();
+    pair.drive_client();
+
+    let stream = pair.streams(Client).open(Dir::Uni).unwrap();
+    let first = vec![0x31; 200_000];
+    write_stream_data(&mut pair, stream, &first);
+    pair.drive();
+    assert_matches!(pair.streams(Server).accept(Dir::Uni), Some(id) if id == stream);
+
+    let mut receive = pair.recv_stream(Server, stream);
+    let mut chunks = receive.read(false)?;
+    let mut read = 0usize;
+    loop {
+        match chunks.next(usize::MAX) {
+            Ok(Some(chunk)) => read += chunk.bytes.len(),
+            Err(ReadError::Blocked) => break,
+            Ok(None) => panic!("unfinished lost-credit stream unexpectedly reached FIN"),
+            Err(error) => panic!("failed reading lost-credit stream: {error}"),
+        }
+    }
+    let update = chunks.finalize();
+    assert_eq!(read, first.len());
+    assert!(update.should_transmit());
+
+    let frames_before = pair.path_stats(Server, backup).unwrap().frame_tx;
+    pair.drive_server();
+    assert!(
+        !pair.client.inbound.is_empty(),
+        "the receiver must emit the stream-credit update before it is dropped"
+    );
+    pair.client.inbound.clear();
+    let lost_credit = pair.path_stats(Server, backup).unwrap();
+    assert!(lost_credit.loss_detection_timer_armed);
+
+    pair.time += Duration::from_secs(1);
+    pair.drive_server();
+    let after_pto = pair.path_stats(Server, backup).unwrap();
+    assert!(after_pto.pto_timeouts > lost_credit.pto_timeouts);
+    assert!(
+        after_pto.frame_tx.max_stream_data > frames_before.max_stream_data,
+        "PTO must retransmit MAX_STREAM_DATA on the healthy backup"
+    );
+    pair.drive_client();
+    pair.drive_server();
+
+    let second = vec![0x52; 1_200_000];
+    write_stream_data(&mut pair, stream, &second);
+    Ok(())
+}
+
 #[test]
 fn pto_recovery_also_requests_ack_escape_on_the_backup() -> TestResult {
     let _guard = subscribe();
@@ -637,6 +1173,249 @@ fn first_unacknowledged_stream_packet_arms_ack_progress_timer() -> TestResult {
         .expect("the first unacknowledged STREAM packet should arm recovery");
     assert!(primary.ack_progress_recovery_timer_armed);
     assert_eq!(deadline, sent_at + primary.pto);
+    Ok(())
+}
+
+#[test]
+fn feedback_probe_reserves_one_alternative_pto_before_full_recovery() -> TestResult {
+    let _guard = subscribe();
+    let (mut pair, backup) = feedback_probe_recovery_pair()?;
+    set_feedback_probe_test_rtts(&mut pair, backup);
+    let sent_at = pair.time;
+    let backup_before = pair.path_stats(Client, backup).unwrap();
+
+    let stream = pair.streams(Client).open(Dir::Uni).unwrap();
+    let payload = vec![0x7b; 64 * 1024];
+    write_stream_data(&mut pair, stream, &payload);
+    blackhole_primary_path(&mut pair);
+    pair.drive_client();
+
+    let primary_before = pair.path_stats(Client, PathId::ZERO).unwrap();
+    let full_deadline = sent_at + primary_before.pto;
+    let expected_probe_deadline = pair
+        .conn(Client)
+        .ack_progress_recovery_deadline(PathId::ZERO)
+        .expect("the bounded feedback probe should arm before full recovery");
+    assert!(expected_probe_deadline > sent_at);
+    assert!(expected_probe_deadline < full_deadline);
+    assert!(
+        full_deadline.duration_since(expected_probe_deadline) <= backup_before.pto,
+        "the probe must be no earlier than the alternative-PTO evidence budget requires"
+    );
+
+    pair.time = expected_probe_deadline;
+    pair.drive_client();
+    let primary_after_probe = pair.path_stats(Client, PathId::ZERO).unwrap();
+    let backup_after_probe = pair.path_stats(Client, backup).unwrap();
+    assert_eq!(primary_after_probe.ack_progress_feedback_probe_timeouts, 1);
+    assert_eq!(primary_after_probe.ack_progress_feedback_probes, 1);
+    assert!(primary_after_probe.ack_progress_feedback_probe_bytes > 0);
+    assert!(
+        primary_after_probe.ack_progress_feedback_probe_bytes
+            <= u64::from(primary_after_probe.current_mtu),
+        "the evidence-gathering phase must copy at most one previously sent STREAM frame"
+    );
+    assert_eq!(primary_after_probe.ack_progress_recovery_timeouts, 0);
+    assert_eq!(primary_after_probe.ack_progress_reinjections, 0);
+    assert!(
+        backup_after_probe.frame_tx.stream_retransmit_bytes
+            > backup_before.frame_tx.stream_retransmit_bytes
+    );
+    assert_eq!(
+        pair.conn(Client)
+            .ack_progress_recovery_deadline(PathId::ZERO),
+        Some(full_deadline),
+        "the bounded probe must preserve the original complete-recovery deadline"
+    );
+
+    // Drop the bounded probe. The original full recovery must still run, even though the
+    // suspected-path marker was installed by the earlier stage.
+    pair.server.inbound.clear();
+    pair.client.inbound.clear();
+    pair.time = full_deadline;
+    pair.drive_client();
+    let primary_after_fallback = pair.path_stats(Client, PathId::ZERO).unwrap();
+    assert_eq!(primary_after_fallback.ack_progress_recovery_timeouts, 1);
+    assert_eq!(primary_after_fallback.ack_progress_recovery_attempts, 1);
+    assert_eq!(primary_after_fallback.ack_progress_reinjections, 1);
+    Ok(())
+}
+
+#[test]
+fn feedback_probe_ack_cancels_full_snapshot_of_already_delivered_data() -> TestResult {
+    let _guard = subscribe();
+    let (mut pair, backup) = feedback_probe_recovery_pair()?;
+    set_feedback_probe_test_rtts(&mut pair, backup);
+    let stream = deliver_primary_stream_and_drop_ack(
+        &mut pair,
+        b"one bounded probe should recover cumulative feedback",
+    )?;
+
+    blackhole_primary_path(&mut pair);
+    advance_client_until_feedback_probe(&mut pair, PathId::ZERO);
+    let primary_after_probe = pair.path_stats(Client, PathId::ZERO).unwrap();
+    assert_eq!(primary_after_probe.ack_progress_feedback_probes, 1);
+    assert_eq!(primary_after_probe.ack_progress_reinjections, 0);
+
+    pair.drive_server();
+    assert_eq!(pair.path_status(Server, PathId::ZERO)?, PathStatus::Backup);
+    assert_eq!(pair.path_status(Server, backup)?, PathStatus::Available);
+    pair.drive_client();
+
+    assert_eq!(count_finished_events(&mut pair, stream), 1);
+    let primary_after_ack = pair.path_stats(Client, PathId::ZERO).unwrap();
+    assert_eq!(primary_after_ack.ack_progress_recovery_timeouts, 0);
+    assert_eq!(primary_after_ack.ack_progress_reinjections, 0);
+    assert!(
+        pair.conn(Client)
+            .ack_progress_recovery_deadline(PathId::ZERO)
+            .is_none(),
+        "cumulative feedback proving the data delivered must cancel the full fallback"
+    );
+    Ok(())
+}
+
+#[test]
+fn feedback_evidence_reinjects_remaining_ranges_before_full_deadline() -> TestResult {
+    let _guard = subscribe();
+    let (mut pair, backup) = feedback_evidence_recovery_pair()?;
+    set_feedback_probe_test_rtts(&mut pair, backup);
+    let epoch_started = pair.time;
+    let stream = deliver_primary_prefix_and_drop_ack(&mut pair, &[0x31; 4 * 1024])?;
+
+    write_stream_data(&mut pair, stream, &[0x52; 64 * 1024]);
+    pair.send_stream(Client, stream).finish()?;
+    blackhole_primary_path(&mut pair);
+    pair.drive_client();
+
+    let primary_before = pair.path_stats(Client, PathId::ZERO).unwrap();
+    let full_deadline = epoch_started + primary_before.pto;
+    advance_client_until_feedback_probe(&mut pair, PathId::ZERO);
+    assert!(pair.time < full_deadline);
+    let backup_after_probe = pair.path_stats(Client, backup).unwrap();
+    assert_eq!(
+        pair.conn(Client)
+            .ack_progress_recovery_deadline(PathId::ZERO),
+        Some(full_deadline)
+    );
+
+    pair.drive_server();
+    assert!(
+        !pair.client.inbound.is_empty(),
+        "the bounded probe must return cumulative primary-path evidence on the backup"
+    );
+    pair.drive_client();
+
+    let primary_after_evidence = pair.path_stats(Client, PathId::ZERO).unwrap();
+    let backup_after_evidence = pair.path_stats(Client, backup).unwrap();
+    assert!(pair.time < full_deadline);
+    assert_eq!(primary_after_evidence.ack_progress_recovery_timeouts, 0);
+    assert_eq!(primary_after_evidence.ack_progress_recovery_attempts, 1);
+    assert_eq!(primary_after_evidence.ack_progress_reinjections, 1);
+    assert!(primary_after_evidence.ack_progress_reinjected_bytes > 0);
+    assert!(
+        backup_after_evidence.frame_tx.stream_retransmit_bytes
+            > backup_after_probe.frame_tx.stream_retransmit_bytes,
+        "evidence processing must immediately send the suffix ranges still missing"
+    );
+    assert!(
+        pair.conn(Client)
+            .ack_progress_recovery_deadline(PathId::ZERO)
+            .is_none(),
+        "evidence-triggered selective recovery supersedes the original full deadline"
+    );
+    Ok(())
+}
+
+#[test]
+fn historical_feedback_probe_waits_for_full_deadline_after_partial_evidence() -> TestResult {
+    let _guard = subscribe();
+    let (mut pair, backup) = feedback_probe_recovery_pair()?;
+    set_feedback_probe_test_rtts(&mut pair, backup);
+    let epoch_started = pair.time;
+    let stream = deliver_primary_prefix_and_drop_ack(&mut pair, &[0x31; 4 * 1024])?;
+
+    write_stream_data(&mut pair, stream, &[0x52; 64 * 1024]);
+    pair.send_stream(Client, stream).finish()?;
+    blackhole_primary_path(&mut pair);
+    pair.drive_client();
+
+    let full_deadline = epoch_started + pair.path_stats(Client, PathId::ZERO).unwrap().pto;
+    advance_client_until_feedback_probe(&mut pair, PathId::ZERO);
+    pair.drive_server();
+    pair.drive_client();
+
+    let primary_after_evidence = pair.path_stats(Client, PathId::ZERO).unwrap();
+    assert_eq!(primary_after_evidence.ack_progress_recovery_timeouts, 0);
+    assert_eq!(primary_after_evidence.ack_progress_recovery_attempts, 0);
+    assert_eq!(primary_after_evidence.ack_progress_reinjections, 0);
+    assert_eq!(
+        pair.conn(Client)
+            .ack_progress_recovery_deadline(PathId::ZERO),
+        Some(full_deadline),
+        "the recorded feedback-probe variant must retain its historical fixed fallback"
+    );
+
+    pair.server.inbound.clear();
+    pair.client.inbound.clear();
+    pair.time = full_deadline;
+    pair.drive_client();
+    let primary_after_fallback = pair.path_stats(Client, PathId::ZERO).unwrap();
+    assert_eq!(primary_after_fallback.ack_progress_recovery_timeouts, 1);
+    assert_eq!(primary_after_fallback.ack_progress_recovery_attempts, 1);
+    assert_eq!(primary_after_fallback.ack_progress_reinjections, 1);
+    Ok(())
+}
+
+#[test]
+fn healthy_ack_progress_does_not_emit_feedback_probe() -> TestResult {
+    let _guard = subscribe();
+    let (mut pair, backup) = feedback_probe_recovery_pair()?;
+    let primary_before = pair.path_stats(Client, PathId::ZERO).unwrap();
+    let backup_before = pair.path_stats(Client, backup).unwrap();
+
+    let stream = pair.streams(Client).open(Dir::Uni).unwrap();
+    write_stream_data(
+        &mut pair,
+        stream,
+        b"ordinary ACK arrives before evidence guard",
+    );
+    pair.send_stream(Client, stream).finish()?;
+    pair.drive();
+
+    assert_eq!(count_finished_events(&mut pair, stream), 1);
+    let primary_after = pair.path_stats(Client, PathId::ZERO).unwrap();
+    let backup_after = pair.path_stats(Client, backup).unwrap();
+    assert_eq!(
+        primary_after.ack_progress_feedback_probes,
+        primary_before.ack_progress_feedback_probes
+    );
+    assert_eq!(
+        backup_after.frame_tx.stream_retransmit_bytes,
+        backup_before.frame_tx.stream_retransmit_bytes
+    );
+    Ok(())
+}
+
+#[test]
+fn historical_feedback_snapshot_does_not_enable_pre_recovery_probe() -> TestResult {
+    let _guard = subscribe();
+    let (mut pair, _backup) = full_feedback_snapshot_recovery_pair()?;
+    let sent_at = pair.time;
+
+    let stream = pair.streams(Client).open(Dir::Uni).unwrap();
+    write_stream_data(&mut pair, stream, b"historical snapshot deadline");
+    blackhole_primary_path(&mut pair);
+    pair.drive_client();
+
+    let primary = pair.path_stats(Client, PathId::ZERO).unwrap();
+    assert_eq!(
+        pair.conn(Client)
+            .ack_progress_recovery_deadline(PathId::ZERO),
+        Some(sent_at + primary.pto)
+    );
+    assert_eq!(primary.ack_progress_feedback_probe_timeouts, 0);
+    assert_eq!(primary.ack_progress_feedback_probes, 0);
     Ok(())
 }
 

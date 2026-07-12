@@ -66,8 +66,13 @@ pub struct TransportConfig {
     pub(crate) cross_path_pto_reinjection: bool,
     pub(crate) cross_path_abandon_reinjection: bool,
     pub(crate) cross_path_ack_progress_reinjection: bool,
+    pub(crate) cross_path_ack_progress_feedback_probe: bool,
+    pub(crate) cross_path_ack_progress_feedback_evidence_reinjection: bool,
+    pub(crate) stream_gap_rescue: bool,
+    pub(crate) stream_gap_watch_rescue: bool,
     pub(crate) cross_path_ack_escape: bool,
     pub(crate) cross_path_feedback_handoff: bool,
+    pub(crate) cross_path_feedback_credit_snapshot: bool,
 
     pub(crate) default_path_max_idle_timeout: Option<Duration>,
     pub(crate) default_path_keep_alive_interval: Option<Duration>,
@@ -444,6 +449,65 @@ impl TransportConfig {
         self
     }
 
+    /// Whether ACK-progress recovery may first send one bounded STREAM feedback probe on the
+    /// validated alternative path.
+    ///
+    /// The probe is scheduled one alternative-path PTO before the existing full recovery
+    /// deadline. Its purpose is to obtain cumulative PATH_ACK and other monotonic feedback before
+    /// the sender snapshots the whole uncertain STREAM set. If feedback does not arrive, the
+    /// existing full recovery still runs at its original deadline. This option has no effect
+    /// unless ACK-progress reinjection and cross-path ACK escape are also enabled.
+    ///
+    /// Disabled by default.
+    pub fn cross_path_ack_progress_feedback_probe(&mut self, enabled: bool) -> &mut Self {
+        self.cross_path_ack_progress_feedback_probe = enabled;
+        self
+    }
+
+    /// Whether a cumulative ACK returned on the feedback-probe path may immediately trigger
+    /// selective reinjection of the STREAM frames still retained on the suspected path.
+    ///
+    /// ACK processing first removes every range the peer proved delivered. The remaining
+    /// sent-packet metadata is therefore the current recovery obligation, so waiting until the
+    /// original full-recovery deadline only adds latency after uncertainty has already collapsed.
+    /// If no cross-path evidence arrives, the original deadline remains unchanged. This option
+    /// has no effect unless the bounded feedback probe is also enabled.
+    ///
+    /// Disabled by default.
+    pub fn cross_path_ack_progress_feedback_evidence_reinjection(
+        &mut self,
+        enabled: bool,
+    ) -> &mut Self {
+        self.cross_path_ack_progress_feedback_evidence_reinjection = enabled;
+        self
+    }
+
+    /// Whether loss detection may arm one congestion-exempt, pacing-limited STREAM rescue packet
+    /// per newly advanced ACK frontier when no other validated path is usable.
+    ///
+    /// This is a bounded analogue of RACK-TLP/PRR rescue transmission. It applies only after
+    /// STREAM data has already been declared lost and queued for retransmission, and only when the
+    /// next datagram would otherwise remain congestion-window blocked. Ordinary congestion-window
+    /// accounting and reduction are unchanged; the exemption covers at most one datagram for that
+    /// ACK frontier. Disabled by default.
+    pub fn stream_gap_rescue(&mut self, enabled: bool) -> &mut Self {
+        self.stream_gap_rescue = enabled;
+        self
+    }
+
+    /// Whether the sole usable path may watch a stable lowest STREAM retransmit offset and send
+    /// one paced, congestion-exempt rescue packet after that exact gap remains queued for one RTT
+    /// plus the peer's ACK delay.
+    ///
+    /// ACKs for later packets do not postpone this timer, but transmitting or acknowledging the
+    /// watched retransmit removes the gap and cancels the rescue. This targets persistent
+    /// application head-of-line blocking without applying a congestion exemption to every loss.
+    /// Disabled by default.
+    pub fn stream_gap_watch_rescue(&mut self, enabled: bool) -> &mut Self {
+        self.stream_gap_watch_rescue = enabled;
+        self
+    }
+
     /// Whether a cross-path recovery episode may request one cumulative PATH_ACK response on the
     /// same validated alternative path that carries the recovery data.
     ///
@@ -465,6 +529,17 @@ impl TransportConfig {
     /// abandon any path, shorten path timers, or bypass congestion control. Disabled by default.
     pub fn cross_path_feedback_handoff(&mut self, enabled: bool) -> &mut Self {
         self.cross_path_feedback_handoff = enabled;
+        self
+    }
+
+    /// Whether feedback handoff also snapshots monotonic flow-control frames which are still
+    /// retained in packets on non-preferred paths and queues their latest values for the promoted
+    /// path.
+    ///
+    /// This is intentionally separate from [`Self::cross_path_feedback_handoff`] so experiments
+    /// using the earlier handoff behavior remain reproducible. Disabled by default.
+    pub fn cross_path_feedback_credit_snapshot(&mut self, enabled: bool) -> &mut Self {
+        self.cross_path_feedback_credit_snapshot = enabled;
         self
     }
 
@@ -659,8 +734,13 @@ impl Default for TransportConfig {
             cross_path_pto_reinjection: false,
             cross_path_abandon_reinjection: false,
             cross_path_ack_progress_reinjection: false,
+            cross_path_ack_progress_feedback_probe: false,
+            cross_path_ack_progress_feedback_evidence_reinjection: false,
+            stream_gap_rescue: false,
+            stream_gap_watch_rescue: false,
             cross_path_ack_escape: false,
             cross_path_feedback_handoff: false,
+            cross_path_feedback_credit_snapshot: false,
             default_path_max_idle_timeout: None,
             default_path_keep_alive_interval: None,
 
@@ -708,8 +788,13 @@ impl fmt::Debug for TransportConfig {
             cross_path_pto_reinjection,
             cross_path_abandon_reinjection,
             cross_path_ack_progress_reinjection,
+            cross_path_ack_progress_feedback_probe,
+            cross_path_ack_progress_feedback_evidence_reinjection,
+            stream_gap_rescue,
+            stream_gap_watch_rescue,
             cross_path_ack_escape,
             cross_path_feedback_handoff,
+            cross_path_feedback_credit_snapshot,
             default_path_max_idle_timeout,
             default_path_keep_alive_interval,
             max_remote_nat_traversal_addresses,
@@ -763,10 +848,21 @@ impl fmt::Debug for TransportConfig {
                 "cross_path_ack_progress_reinjection",
                 cross_path_ack_progress_reinjection,
             )
-            .field("cross_path_ack_escape", cross_path_ack_escape)
             .field(
-                "cross_path_feedback_handoff",
-                cross_path_feedback_handoff,
+                "cross_path_ack_progress_feedback_probe",
+                cross_path_ack_progress_feedback_probe,
+            )
+            .field(
+                "cross_path_ack_progress_feedback_evidence_reinjection",
+                cross_path_ack_progress_feedback_evidence_reinjection,
+            )
+            .field("stream_gap_rescue", stream_gap_rescue)
+            .field("stream_gap_watch_rescue", stream_gap_watch_rescue)
+            .field("cross_path_ack_escape", cross_path_ack_escape)
+            .field("cross_path_feedback_handoff", cross_path_feedback_handoff)
+            .field(
+                "cross_path_feedback_credit_snapshot",
+                cross_path_feedback_credit_snapshot,
             )
             .field(
                 "default_path_max_idle_timeout",

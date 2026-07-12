@@ -258,6 +258,11 @@ pub struct PathStats {
     pub tracked_sent_packets: u64,
     /// Ack-eliciting packets still retained in this path's application-data sent-packet table.
     pub tracked_ack_eliciting_packets: u64,
+    /// Retained packets on this path which carry a retransmittable MAX_DATA frame.
+    pub tracked_max_data_packets: u64,
+    /// Retained packets on this path which carry at least one retransmittable MAX_STREAM_DATA
+    /// frame.
+    pub tracked_max_stream_data_packets: u64,
     /// Highest ack-eliciting application-data packet number sent on this path.
     pub latest_ack_eliciting_packet_number: u64,
     /// Current consecutive PTO count used for exponential backoff.
@@ -319,6 +324,17 @@ pub struct PathStats {
     pub ack_progress_reinjections: u64,
     /// STREAM payload bytes newly queued by ACK-progress cross-path reinjection.
     pub ack_progress_reinjected_bytes: u64,
+    /// Number of pre-recovery feedback-probe timer expirations on this path.
+    pub ack_progress_feedback_probe_timeouts: u64,
+    /// Number of bounded STREAM feedback probes queued on another validated path.
+    pub ack_progress_feedback_probes: u64,
+    /// STREAM payload bytes newly queued by bounded feedback probes.
+    pub ack_progress_feedback_probe_bytes: u64,
+    /// Number of one-datagram STREAM gap rescues armed while the sole usable path was
+    /// congestion-window blocked.
+    pub stream_gap_rescue_probes: u64,
+    /// Newly queued STREAM payload bytes whose loss triggered a bounded gap rescue.
+    pub stream_gap_rescue_bytes: u64,
     /// Whether the independent ACK-progress recovery timer is currently armed.
     pub ack_progress_recovery_timer_armed: bool,
     /// Largest UDP payload size the path currently supports.
@@ -344,11 +360,51 @@ pub struct StreamStats {
     pub send_lowest_retransmit_offset: Option<u64>,
     /// Total STREAM payload bytes currently waiting in the retransmission queue.
     pub send_retransmit_bytes: Option<u64>,
+    /// End offset written by the local application.
+    pub send_offset: Option<u64>,
+    /// Latest stream-level credit received from the peer.
+    pub send_max_data: Option<u64>,
+    /// Whether the stream has exhausted its stream-level credit.
+    pub send_flow_control_blocked: Option<bool>,
+    /// Whether the stream is currently registered as blocked by connection-level credit.
+    pub send_connection_blocked: Option<bool>,
     /// End of the contiguous prefix already consumed by the local application, when this endpoint
     /// receives on the stream.
     pub receive_contiguous_offset: Option<u64>,
     /// Highest stream offset observed from received STREAM frames.
     pub receive_highest_offset: Option<u64>,
+    /// Latest stream-level credit value queued into a transmitted MAX_STREAM_DATA frame.
+    pub receive_sent_max_stream_data: Option<u64>,
+    /// Credit value that would be advertised if a MAX_STREAM_DATA frame were generated now.
+    pub receive_current_max_stream_data: Option<u64>,
+    /// Whether a MAX_STREAM_DATA refresh for this stream is waiting in the connection-wide
+    /// retransmission queue.
+    pub receive_max_stream_data_pending: bool,
+    /// Number of retained sent packets which can retransmit MAX_STREAM_DATA for this stream if
+    /// declared lost.
+    pub receive_max_stream_data_in_flight_packets: u64,
+}
+
+/// Read-only connection-level flow-control state.
+#[derive(Debug, Default, Copy, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct FlowControlStats {
+    /// Total connection-level credit received from the peer.
+    pub send_max_data: u64,
+    /// Total stream offsets charged against connection-level credit.
+    pub send_data: u64,
+    /// Whether connection-level credit is fully exhausted.
+    pub send_blocked: bool,
+    /// Current receive-side connection limit.
+    pub receive_max_data: u64,
+    /// Latest receive-side limit queued into a transmitted MAX_DATA frame.
+    pub receive_sent_max_data: u64,
+    /// Highest aggregate incoming stream offsets observed.
+    pub receive_data: u64,
+    /// Whether a MAX_DATA refresh is waiting in the retransmission queue.
+    pub receive_max_data_pending: bool,
+    /// Number of retained sent packets which can retransmit MAX_DATA if declared lost.
+    pub receive_max_data_in_flight_packets: u64,
 }
 
 /// Connection statistics.
@@ -372,6 +428,8 @@ pub struct ConnectionStats {
     pub lost_bytes: u64,
     /// Current per-stream delivery gauges.
     pub streams: Vec<StreamStats>,
+    /// Current connection-level flow-control gauges.
+    pub flow_control: FlowControlStats,
 }
 
 impl std::ops::Add<PathStats> for ConnectionStats {
@@ -392,6 +450,8 @@ impl std::ops::Add<PathStats> for ConnectionStats {
             ack_eliciting_packets_in_flight: _,
             tracked_sent_packets: _,
             tracked_ack_eliciting_packets: _,
+            tracked_max_data_packets: _,
+            tracked_max_stream_data_packets: _,
             latest_ack_eliciting_packet_number: _,
             pto_count: _,
             loss_detection_timer_armed: _,
@@ -419,6 +479,11 @@ impl std::ops::Add<PathStats> for ConnectionStats {
             ack_progress_recovery_empty_attempts: _,
             ack_progress_reinjections: _,
             ack_progress_reinjected_bytes: _,
+            ack_progress_feedback_probe_timeouts: _,
+            ack_progress_feedback_probes: _,
+            ack_progress_feedback_probe_bytes: _,
+            stream_gap_rescue_probes: _,
+            stream_gap_rescue_bytes: _,
             ack_progress_recovery_timer_armed: _,
             current_mtu: _,
         } = rhs;
@@ -430,6 +495,7 @@ impl std::ops::Add<PathStats> for ConnectionStats {
             lost_packets: self.lost_packets + lost_packets,
             lost_bytes: self.lost_bytes + lost_bytes,
             streams: self.streams,
+            flow_control: self.flow_control,
         }
     }
 }
@@ -450,6 +516,8 @@ impl std::ops::AddAssign<PathStats> for ConnectionStats {
             ack_eliciting_packets_in_flight: _,
             tracked_sent_packets: _,
             tracked_ack_eliciting_packets: _,
+            tracked_max_data_packets: _,
+            tracked_max_stream_data_packets: _,
             latest_ack_eliciting_packet_number: _,
             pto_count: _,
             loss_detection_timer_armed: _,
@@ -477,6 +545,11 @@ impl std::ops::AddAssign<PathStats> for ConnectionStats {
             ack_progress_recovery_empty_attempts: _,
             ack_progress_reinjections: _,
             ack_progress_reinjected_bytes: _,
+            ack_progress_feedback_probe_timeouts: _,
+            ack_progress_feedback_probes: _,
+            ack_progress_feedback_probe_bytes: _,
+            stream_gap_rescue_probes: _,
+            stream_gap_rescue_bytes: _,
             ack_progress_recovery_timer_armed: _,
             current_mtu: _,
         } = rhs;
@@ -488,6 +561,7 @@ impl std::ops::AddAssign<PathStats> for ConnectionStats {
             lost_packets,
             lost_bytes,
             streams: _,
+            flow_control: _,
         } = self;
         *udp_tx += path_udp_tx;
         *udp_rx += path_udp_rx;

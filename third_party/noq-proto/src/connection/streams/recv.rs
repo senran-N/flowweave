@@ -134,6 +134,14 @@ impl Recv {
         }
     }
 
+    pub(super) fn sent_max_stream_data(&self) -> u64 {
+        self.sent_max_stream_data
+    }
+
+    pub(super) fn current_max_stream_data(&self, stream_receive_window: u64) -> u64 {
+        self.assembler.bytes_read() + stream_receive_window
+    }
+
     /// Whether the total amount of data that the peer will send on this stream is unknown
     ///
     /// True until we've received either a reset or the final frame.

@@ -79,10 +79,12 @@ pub(crate) enum PathTimer {
     PathDrained = 8,
     /// When a full data PTO has elapsed without newly acknowledged ack-eliciting data
     AckProgressRecovery = 9,
+    /// When one stable STREAM retransmit gap has remained pending for its evidence guard
+    StreamGapWatchRescue = 10,
 }
 
 impl PathTimer {
-    pub(super) const VALUES: [Self; 10] = [
+    pub(super) const VALUES: [Self; 11] = [
         Self::LossDetection,
         Self::PathIdle,
         Self::PathValidationFailed,
@@ -93,6 +95,7 @@ impl PathTimer {
         Self::MaxAckDelay,
         Self::PathDrained,
         Self::AckProgressRecovery,
+        Self::StreamGapWatchRescue,
     ];
 }
 

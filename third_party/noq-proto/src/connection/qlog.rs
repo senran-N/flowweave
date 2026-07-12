@@ -331,6 +331,9 @@ impl QlogSink {
                 PathTimer::MaxAckDelay => Some(QlogTimerType::Ack.into()),
                 PathTimer::PathDrained => Some(TimerType::custom("discard_path")),
                 PathTimer::AckProgressRecovery => Some(TimerType::custom("ack_progress_recovery")),
+                PathTimer::StreamGapWatchRescue => {
+                    Some(TimerType::custom("stream_gap_watch_rescue"))
+                }
             },
         };
 

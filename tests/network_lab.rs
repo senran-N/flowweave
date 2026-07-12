@@ -617,6 +617,304 @@ async fn failover_feedback_handoff_seed_1103_diagnostic_lab() -> LabResult<()> {
     .await
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "必须通过 scripts/run_netem_lab.sh diagnose-feedback-handoff-1104 在隔离网络命名空间中运行"]
+async fn failover_feedback_handoff_seed_1104_diagnostic_lab() -> LabResult<()> {
+    const CASES: [(FailoverDirection, usize); 1] = [(FailoverDirection::ClientToServer, 3_usize)];
+    run_failover_diagnostic_cases(
+        "benchmark-results/2026-07-12-feedback-handoff-1104-summary.csv",
+        PtoRecovery::CrossPathRecoveryWithFeedbackHandoff,
+        "FlowWeave / 织流：A 组正式失败种子 1104 状态诊断",
+        "只复跑一次正向种子 1104；不改变算法和门槛，用 R/H/A/Q 定位首次恢复后的再次死锁。",
+        &CASES,
+        Some("benchmark-results/2026-07-12-feedback-handoff-1104-timeline.csv"),
+    )
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "必须通过 scripts/run_netem_lab.sh diagnose-feedback-snapshot-1104 在隔离网络命名空间中运行"]
+async fn failover_feedback_snapshot_seed_1104_diagnostic_lab() -> LabResult<()> {
+    const CASES: [(FailoverDirection, usize); 1] = [(FailoverDirection::ClientToServer, 3_usize)];
+    run_failover_diagnostic_cases(
+        "benchmark-results/2026-07-12-feedback-snapshot-1104-summary.csv",
+        PtoRecovery::CrossPathRecoveryWithFeedbackSnapshot,
+        "FlowWeave / 织流：在途流控快照正向种子 1104 诊断",
+        "只运行一次正式失败种子 1104；验证交接瞬间已在故障路上的额度是否能由备用路接管。",
+        &CASES,
+        Some("benchmark-results/2026-07-12-feedback-snapshot-1104-timeline.csv"),
+    )
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "必须通过 scripts/run_netem_lab.sh diagnose-feedback-snapshot-stability 在隔离网络命名空间中运行"]
+async fn failover_feedback_snapshot_seed_1104_stability_lab() -> LabResult<()> {
+    run_feedback_snapshot_seed_1104_stability_matrix(
+        "benchmark-results/2026-07-12-feedback-snapshot-1104-stability-summary.csv",
+        "benchmark-results/2026-07-12-feedback-snapshot-1104-stability-timeline.csv",
+        "FlowWeave / 织流：在途流控快照正向 1104 预注册稳定性矩阵",
+        PtoRecovery::CrossPathRecoveryWithFeedbackSnapshot,
+        false,
+    )
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "必须通过 scripts/run_netem_lab.sh diagnose-feedback-snapshot-response-stability 在隔离网络命名空间中运行"]
+async fn failover_feedback_snapshot_seed_1104_response_stability_lab() -> LabResult<()> {
+    run_feedback_snapshot_seed_1104_stability_matrix(
+        "benchmark-results/2026-07-12-feedback-snapshot-1104-response-summary.csv",
+        "benchmark-results/2026-07-12-feedback-snapshot-1104-response-timeline.csv",
+        "FlowWeave / 织流：正向 1104 最终响应闭环诊断矩阵",
+        PtoRecovery::CrossPathRecoveryWithFeedbackSnapshot,
+        false,
+    )
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "必须通过 scripts/run_netem_lab.sh diagnose-feedback-probe-stability 在隔离网络命名空间中运行"]
+async fn failover_feedback_probe_seed_1104_stability_lab() -> LabResult<()> {
+    run_feedback_snapshot_seed_1104_stability_matrix(
+        "benchmark-results/2026-07-12-feedback-probe-1104-stability-summary.csv",
+        "benchmark-results/2026-07-12-feedback-probe-1104-stability-timeline.csv",
+        "FlowWeave / 织流：预恢复单帧反馈探针正向 1104 预注册稳定性矩阵",
+        PtoRecovery::CrossPathRecoveryWithFeedbackProbe,
+        false,
+    )
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "必须通过 scripts/run_netem_lab.sh diagnose-feedback-evidence-stability 在隔离网络命名空间中运行"]
+async fn failover_feedback_evidence_seed_1104_stability_lab() -> LabResult<()> {
+    run_feedback_snapshot_seed_1104_stability_matrix(
+        "benchmark-results/2026-07-12-feedback-evidence-1104-stability-summary.csv",
+        "benchmark-results/2026-07-12-feedback-evidence-1104-stability-timeline.csv",
+        "FlowWeave / 织流：跨路证据驱动选择性恢复正向 1104 预注册稳定性矩阵",
+        PtoRecovery::CrossPathRecoveryWithFeedbackEvidence,
+        false,
+    )
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "必须通过 scripts/run_netem_lab.sh diagnose-feedback-evidence-response-stability 在隔离网络命名空间中运行"]
+async fn failover_feedback_evidence_seed_1104_response_stability_lab() -> LabResult<()> {
+    run_feedback_snapshot_seed_1104_stability_matrix(
+        "benchmark-results/2026-07-12-feedback-evidence-1104-response-v2-summary.csv",
+        "benchmark-results/2026-07-12-feedback-evidence-1104-response-v2-timeline.csv",
+        "FlowWeave / 织流：接收完成锚定响应预算的证据恢复正向 1104 矩阵",
+        PtoRecovery::CrossPathRecoveryWithFeedbackEvidence,
+        true,
+    )
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "必须通过 scripts/run_netem_lab.sh diagnose-feedback-gap-rescue-stability 在隔离网络命名空间中运行"]
+async fn failover_feedback_gap_rescue_seed_1104_stability_lab() -> LabResult<()> {
+    run_feedback_snapshot_seed_1104_stability_matrix(
+        "benchmark-results/2026-07-12-feedback-gap-rescue-1104-response-v3-summary.csv",
+        "benchmark-results/2026-07-12-feedback-gap-rescue-1104-response-v3-timeline.csv",
+        "FlowWeave / 织流：证据恢复与有界关键缺口探针正向 1104 矩阵",
+        PtoRecovery::CrossPathRecoveryWithFeedbackEvidenceAndGapRescue,
+        true,
+    )
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "必须通过 scripts/run_netem_lab.sh diagnose-feedback-gap-watch-stability 在隔离网络命名空间中运行"]
+async fn failover_feedback_gap_watch_seed_1104_stability_lab() -> LabResult<()> {
+    run_feedback_snapshot_seed_1104_stability_matrix(
+        "benchmark-results/2026-07-12-feedback-gap-watch-1104-response-v4-summary.csv",
+        "benchmark-results/2026-07-12-feedback-gap-watch-1104-response-v4-timeline.csv",
+        "FlowWeave / 织流：证据恢复与稳定缺口计时救援正向 1104 矩阵",
+        PtoRecovery::CrossPathRecoveryWithFeedbackEvidenceAndGapWatch,
+        true,
+    )
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "必须通过 scripts/run_netem_lab.sh formal-gap-watch 在隔离网络命名空间中运行"]
+async fn failover_feedback_gap_watch_formal_bidirectional_lab() -> LabResult<()> {
+    const RESULT_PATH: &str =
+        "benchmark-results/2026-07-12-feedback-gap-watch-formal-v5-summary.csv";
+    const TIMELINE_PATH: &str =
+        "benchmark-results/2026-07-12-feedback-gap-watch-formal-v5-timeline.csv";
+    const REPETITIONS_PER_DIRECTION: usize = 10;
+    const CANDIDATE: PtoRecovery = PtoRecovery::CrossPathRecoveryWithFeedbackEvidenceAndGapWatch;
+
+    ensure_isolated_network_namespace()?;
+
+    let normal_line_one = LinkProfile::new("20ms", "0.1%", "20mbit");
+    let normal_line_two = LinkProfile::new("80ms", "1%", "20mbit");
+
+    println!();
+    println!("FlowWeave / 织流：证据恢复与稳定缺口计时救援正式双向矩阵");
+    println!(
+        "正反向各完整运行 {REPETITIONS_PER_DIRECTION} 场；五组线路种子依次循环两次，所有结果均保留。"
+    );
+    println!(
+        "预注册门槛：每个方向 10/10 数据完整、最终响应闭环、恢复，且每场断流严格小于 1000 ms。"
+    );
+    println!("响应预算从接收端确认完整收到请求时开始；15 秒上限和网络参数均不放宽。");
+
+    let mut observations =
+        Vec::with_capacity(FailoverDirection::ALL.len() * REPETITIONS_PER_DIRECTION);
+    write_formal_failover_csv(RESULT_PATH, &observations)?;
+    write_stream_state_csv(TIMELINE_PATH, &observations)?;
+
+    for (direction_index, direction) in FailoverDirection::ALL.into_iter().enumerate() {
+        println!();
+        println!("传输方向：{}", direction.description());
+
+        for repetition in 1..=REPETITIONS_PER_DIRECTION {
+            let seed_index = (repetition - 1) % SEED_PAIRS.len();
+            let seed_cycle = (repetition - 1) / SEED_PAIRS.len();
+            let seeds = SEED_PAIRS[seed_index];
+            let application_seed = 151_u8
+                .wrapping_add((seed_index + 1) as u8)
+                .wrapping_add((direction_index as u8).wrapping_mul(17))
+                .wrapping_add((seed_cycle as u8).wrapping_mul(31));
+
+            println!();
+            println!(
+                "正式重复 {repetition}/{REPETITIONS_PER_DIRECTION}：线路一种子 {}，线路二种子 {}，业务种子 {application_seed}",
+                seeds.line_one, seeds.line_two
+            );
+
+            apply_profiles(normal_line_one, normal_line_two, seeds)?;
+            let report = run_sustained_blackhole_failover(
+                SustainedFailoverConfig::new(
+                    MultipathScheduler::NoqDefault,
+                    CANDIDATE,
+                    direction,
+                    FORMAL_FAILOVER_DURATION,
+                    FORMAL_FAILOVER_AT,
+                    FORMAL_FAILOVER_CHUNK_SIZE,
+                    application_seed,
+                )
+                .with_stream_state_diagnostics()
+                .with_receiver_anchored_response_timeout(),
+                || {
+                    replace_line_profile(
+                        "1:1",
+                        "10:",
+                        LinkProfile::new("20ms", "100%", "20mbit"),
+                        seeds.line_one,
+                    )
+                },
+                || replace_line_profile("1:1", "10:", normal_line_one, seeds.line_one),
+            )
+            .await?;
+
+            let observation = FormalFailoverObservation {
+                direction,
+                round: repetition,
+                seeds,
+                pto_recovery: CANDIDATE,
+                report,
+            };
+            print_formal_failover_observation(&observation);
+            observations.push(observation);
+            write_formal_failover_csv(RESULT_PATH, &observations)?;
+            write_stream_state_csv(TIMELINE_PATH, &observations)?;
+        }
+    }
+
+    print_candidate_only_formal_failover_summary(
+        &observations,
+        CANDIDATE,
+        REPETITIONS_PER_DIRECTION,
+    );
+    println!();
+    println!("正式双向矩阵原始摘要已写入 {RESULT_PATH}");
+    println!("正式双向矩阵流控时间线已写入 {TIMELINE_PATH}");
+    Ok(())
+}
+
+async fn run_feedback_snapshot_seed_1104_stability_matrix(
+    result_path: &str,
+    timeline_path: &str,
+    title: &str,
+    pto_recovery: PtoRecovery,
+    receiver_anchored_response_timeout: bool,
+) -> LabResult<()> {
+    ensure_isolated_network_namespace()?;
+
+    const REPETITIONS: usize = 10;
+    const SEED_INDEX: usize = 3;
+    let direction = FailoverDirection::ClientToServer;
+    let seeds = SEED_PAIRS[SEED_INDEX];
+    let normal_line_one = LinkProfile::new("20ms", "0.1%", "20mbit");
+    let normal_line_two = LinkProfile::new("80ms", "1%", "20mbit");
+    let application_seed = 151_u8.wrapping_add((SEED_INDEX + 1) as u8);
+
+    println!();
+    println!("{title}");
+    println!("固定线路种子、业务种子、方向和算法，完整保留 {REPETITIONS} 次结果；不挑样本。");
+
+    let mut observations = Vec::with_capacity(REPETITIONS);
+    write_formal_failover_csv(result_path, &observations)?;
+    write_stream_state_csv(timeline_path, &observations)?;
+
+    for repetition in 1..=REPETITIONS {
+        println!();
+        println!(
+            "稳定性重复 {repetition}/{REPETITIONS}：线路一种子 {}，线路二种子 {}",
+            seeds.line_one, seeds.line_two
+        );
+        apply_profiles(normal_line_one, normal_line_two, seeds)?;
+        let mut config = SustainedFailoverConfig::new(
+            MultipathScheduler::NoqDefault,
+            pto_recovery,
+            direction,
+            FORMAL_FAILOVER_DURATION,
+            FORMAL_FAILOVER_AT,
+            FORMAL_FAILOVER_CHUNK_SIZE,
+            application_seed,
+        )
+        .with_stream_state_diagnostics();
+        if receiver_anchored_response_timeout {
+            config = config.with_receiver_anchored_response_timeout();
+        }
+        let report = run_sustained_blackhole_failover(
+            config,
+            || {
+                replace_line_profile(
+                    "1:1",
+                    "10:",
+                    LinkProfile::new("20ms", "100%", "20mbit"),
+                    seeds.line_one,
+                )
+            },
+            || replace_line_profile("1:1", "10:", normal_line_one, seeds.line_one),
+        )
+        .await?;
+
+        let observation = FormalFailoverObservation {
+            direction,
+            round: repetition,
+            seeds,
+            pto_recovery,
+            report,
+        };
+        print_formal_failover_observation(&observation);
+        observations.push(observation);
+        write_formal_failover_csv(result_path, &observations)?;
+        write_stream_state_csv(timeline_path, &observations)?;
+    }
+
+    println!();
+    println!("稳定性矩阵原始摘要已写入 {result_path}");
+    println!("稳定性矩阵流控时间线已写入 {timeline_path}");
+    Ok(())
+}
+
 async fn run_failover_diagnostic_cases(
     result_path: &str,
     pto_recovery: PtoRecovery,
@@ -1080,8 +1378,9 @@ fn print_formal_failover_observation(observation: &FormalFailoverObservation) {
 
     println!("- {}", observation.pto_recovery.description());
     println!(
-        "  完整 {}，恢复 {}，断流 {}，持续 {}，记录 {} 条 / {} 字节",
+        "  数据完整 {}，最终响应闭环 {}，恢复 {}，断流 {}，持续 {}，记录 {} 条 / {} 字节",
         yes_or_no(observation.report.data_intact),
+        yes_or_no(observation.report.exchange_complete),
         yes_or_no(observation.report.recovered),
         optional_milliseconds(observation.report.recovery_gap),
         optional_milliseconds(observation.report.transfer_duration),
@@ -1134,6 +1433,28 @@ fn print_formal_failover_observation(observation: &FormalFailoverObservation) {
         after_secondary.ack_progress_recovery_empty_attempts,
         after_secondary.ack_progress_reinjections,
         after_secondary.ack_progress_reinjected_bytes,
+    );
+    println!(
+        "  预恢复反馈探针：主路超时/探针/字节 {}/{}/{}；备用路 {}/{}/{}；首个主路探针 {}",
+        after_primary.ack_progress_feedback_probe_timeouts,
+        after_primary.ack_progress_feedback_probes,
+        after_primary.ack_progress_feedback_probe_bytes,
+        after_secondary.ack_progress_feedback_probe_timeouts,
+        after_secondary.ack_progress_feedback_probes,
+        after_secondary.ack_progress_feedback_probe_bytes,
+        optional_milliseconds(
+            observation
+                .report
+                .timeline
+                .first_primary_ack_progress_feedback_probe,
+        ),
+    );
+    println!(
+        "  关键缺口探针：主路探针/触发字节 {}/{}；备用路 {}/{}",
+        after_primary.stream_gap_rescue_probes,
+        after_primary.stream_gap_rescue_bytes,
+        after_secondary.stream_gap_rescue_probes,
+        after_secondary.stream_gap_rescue_bytes,
     );
     println!(
         "  接收端 PATH_ACK 同路/跨路：主路发送 {}/{}，备用路发送 {}/{}",
@@ -1295,6 +1616,10 @@ fn print_formal_failover_summary(observations: &[FormalFailoverObservation]) {
             .iter()
             .filter(|observation| observation.report.recovered)
             .count();
+        let exchange_complete = candidates
+            .iter()
+            .filter(|observation| observation.report.exchange_complete)
+            .count();
         let primary_used = candidates
             .iter()
             .filter(|observation| {
@@ -1313,6 +1638,7 @@ fn print_formal_failover_summary(observations: &[FormalFailoverObservation]) {
         let gap_summary = (!gaps.is_empty()).then(|| NumericSummary::from_samples(gaps));
         let pass = candidates.len() == SEED_PAIRS.len()
             && intact == SEED_PAIRS.len()
+            && exchange_complete == SEED_PAIRS.len()
             && recovered == SEED_PAIRS.len()
             && primary_used == SEED_PAIRS.len()
             && gap_summary
@@ -1338,7 +1664,7 @@ fn print_formal_failover_summary(observations: &[FormalFailoverObservation]) {
         let udp_summary = NumericSummary::from_samples(udp_ratios);
 
         println!(
-            "- {}：完整 {intact}/{total}，恢复 {recovered}/{total}，黑洞前主路承载数据 {primary_used}/{total}，P95 {}，黑洞后 UDP 相对基线中位 {:.2}%，门槛 {}",
+            "- {}：数据完整 {intact}/{total}，最终响应闭环 {exchange_complete}/{total}，恢复 {recovered}/{total}，黑洞前主路承载数据 {primary_used}/{total}，P95 {}，黑洞后 UDP 相对基线中位 {:.2}%，门槛 {}",
             direction.description(),
             gap_summary
                 .as_ref()
@@ -1352,6 +1678,126 @@ fn print_formal_failover_summary(observations: &[FormalFailoverObservation]) {
 
     println!(
         "- 正反两个方向是否都通过正式 A 组阶段门槛：{}",
+        yes_or_no(all_directions_pass),
+    );
+}
+
+fn print_candidate_only_formal_failover_summary(
+    observations: &[FormalFailoverObservation],
+    candidate: PtoRecovery,
+    expected_per_direction: usize,
+) {
+    println!();
+    println!("候选正式双向矩阵汇总：");
+
+    let mut all_directions_pass = true;
+    for direction in FailoverDirection::ALL {
+        let candidates: Vec<_> = observations
+            .iter()
+            .filter(|observation| {
+                observation.direction == direction && observation.pto_recovery == candidate
+            })
+            .collect();
+        let intact = candidates
+            .iter()
+            .filter(|observation| observation.report.data_intact)
+            .count();
+        let exchange_complete = candidates
+            .iter()
+            .filter(|observation| observation.report.exchange_complete)
+            .count();
+        let recovered = candidates
+            .iter()
+            .filter(|observation| observation.report.recovered)
+            .count();
+        let primary_used = candidates
+            .iter()
+            .filter(|observation| {
+                observation
+                    .report
+                    .sender_primary_before_blackhole
+                    .fresh_stream_bytes_sent
+                    > 0
+            })
+            .count();
+        let gaps: Vec<_> = candidates
+            .iter()
+            .filter_map(|observation| observation.report.recovery_gap)
+            .map(milliseconds)
+            .collect();
+        let strict_under_one_second = gaps.iter().filter(|&&gap| gap < 1_000.0).count();
+        let gap_summary = (!gaps.is_empty()).then(|| NumericSummary::from_samples(gaps));
+        let rescue_rounds = candidates
+            .iter()
+            .filter(|observation| {
+                observation
+                    .report
+                    .sender_primary_after_blackhole
+                    .stream_gap_rescue_probes
+                    .saturating_add(
+                        observation
+                            .report
+                            .sender_secondary_after_blackhole
+                            .stream_gap_rescue_probes,
+                    )
+                    > 0
+            })
+            .count();
+        let rescue_probes: u64 = candidates
+            .iter()
+            .map(|observation| {
+                observation
+                    .report
+                    .sender_primary_after_blackhole
+                    .stream_gap_rescue_probes
+                    .saturating_add(
+                        observation
+                            .report
+                            .sender_secondary_after_blackhole
+                            .stream_gap_rescue_probes,
+                    )
+            })
+            .sum();
+        let rescue_bytes: u64 = candidates
+            .iter()
+            .map(|observation| {
+                observation
+                    .report
+                    .sender_primary_after_blackhole
+                    .stream_gap_rescue_bytes
+                    .saturating_add(
+                        observation
+                            .report
+                            .sender_secondary_after_blackhole
+                            .stream_gap_rescue_bytes,
+                    )
+            })
+            .sum();
+        let pass = candidates.len() == expected_per_direction
+            && intact == expected_per_direction
+            && exchange_complete == expected_per_direction
+            && recovered == expected_per_direction
+            && primary_used == expected_per_direction
+            && strict_under_one_second == expected_per_direction;
+        all_directions_pass &= pass;
+
+        println!(
+            "- {}：数据完整 {intact}/{expected_per_direction}，最终响应闭环 {exchange_complete}/{expected_per_direction}，恢复 {recovered}/{expected_per_direction}，黑洞前主路承载数据 {primary_used}/{expected_per_direction}，严格 <1000 ms {strict_under_one_second}/{expected_per_direction}，中位 {}，P95/最差 {}，gap-watch 触发 {rescue_rounds} 场 / {rescue_probes} 包 / {rescue_bytes} 字节，门槛 {}",
+            direction.description(),
+            gap_summary
+                .as_ref()
+                .map(|summary| format!("{:.2} ms", summary.median))
+                .unwrap_or_else(|| "无有效样本".to_owned()),
+            gap_summary
+                .as_ref()
+                .map(|summary| format!("{:.2} / {:.2} ms", summary.p95, summary.maximum))
+                .unwrap_or_else(|| "无有效样本".to_owned()),
+            yes_or_no(pass),
+        );
+    }
+
+    println!(
+        "- 正反两个方向是否都满足逐场严格门槛：{}",
         yes_or_no(all_directions_pass),
     );
 }
@@ -2005,7 +2451,7 @@ fn write_formal_failover_csv(
     observations: &[FormalFailoverObservation],
 ) -> LabResult<()> {
     let mut csv = String::from(
-        "direction,round,line_one_seed,line_two_seed,recovery,recovered,data_intact,recovery_gap_ms,transfer_duration_ms,records_received,application_bytes_received,failure_reason,primary_fresh_bytes_before_blackhole,secondary_fresh_bytes_before_blackhole,primary_pto_hedges_before_blackhole,secondary_pto_hedges_before_blackhole,primary_pto_hedge_bytes_before_blackhole,secondary_pto_hedge_bytes_before_blackhole,primary_udp_bytes_after_blackhole,secondary_udp_bytes_after_blackhole,total_udp_bytes_after_blackhole,primary_lost_packets,secondary_lost_packets,pto_hedges_after_blackhole,pto_hedge_bytes_after_blackhole,primary_path_open,secondary_path_open,primary_loss_timeouts_after_blackhole,secondary_loss_timeouts_after_blackhole,primary_pto_timeouts_after_blackhole,secondary_pto_timeouts_after_blackhole,primary_pto_recovery_attempts_after_blackhole,primary_pto_recovery_empty_attempts_after_blackhole,primary_last_pto_unacked_bytes,primary_last_pto_stream_frames,secondary_pto_recovery_attempts_after_blackhole,secondary_pto_recovery_empty_attempts_after_blackhole,secondary_last_pto_unacked_bytes,secondary_last_pto_stream_frames,primary_final_cwnd,secondary_final_cwnd,receiver_primary_path_acks_same_path_after_blackhole,receiver_primary_path_acks_cross_path_after_blackhole,receiver_secondary_path_acks_same_path_after_blackhole,receiver_secondary_path_acks_cross_path_after_blackhole,primary_open_at_fault,secondary_open_at_fault,first_primary_loss_timeout_ms,first_primary_pto_ms,first_primary_recovery_attempt_ms,first_primary_hedge_ms,first_secondary_udp_send_ms,first_receiver_primary_cross_path_ack_ms,first_receiver_secondary_same_path_ack_ms,primary_closed_ms,secondary_closed_ms,recovery_gap_started_after_fault_ms,recovery_gap_ended_after_fault_ms,recovery_gap_next_sequence,primary_rtt_at_fault_ms,primary_pto_at_fault_ms,primary_cwnd_at_fault,primary_bytes_in_flight_at_fault,primary_ack_eliciting_in_flight_at_fault,primary_tracked_sent_packets_at_fault,primary_tracked_ack_eliciting_packets_at_fault,primary_latest_ack_eliciting_pn_at_fault,primary_pto_count_at_fault,primary_loss_timer_armed_at_fault,primary_ack_eliciting_pn_advance_after_fault,first_primary_ack_eliciting_send_ms,last_primary_ack_eliciting_send_ms,first_primary_udp_receive_ms,last_primary_udp_receive_ms,first_primary_loss_timer_unarmed_ms,first_primary_ack_eliciting_in_flight_zero_ms,first_primary_tracked_ack_eliciting_zero_ms,max_primary_bytes_in_flight_after_fault,max_primary_ack_eliciting_in_flight_after_fault,max_primary_tracked_sent_packets_after_fault,max_primary_tracked_ack_eliciting_after_fault,primary_final_rtt_ms,primary_final_pto_ms,primary_final_bytes_in_flight,primary_final_ack_eliciting_in_flight,primary_final_tracked_sent_packets,primary_final_tracked_ack_eliciting_packets,primary_final_loss_timer_armed,primary_abandon_recovery_attempts_after_blackhole,primary_abandon_recovery_empty_attempts_after_blackhole,primary_abandon_reinjections_after_blackhole,primary_abandon_reinjected_bytes_after_blackhole,secondary_abandon_recovery_attempts_after_blackhole,secondary_abandon_recovery_empty_attempts_after_blackhole,secondary_abandon_reinjections_after_blackhole,secondary_abandon_reinjected_bytes_after_blackhole,primary_ack_progress_recovery_timeouts_after_blackhole,primary_ack_progress_recovery_attempts_after_blackhole,primary_ack_progress_recovery_empty_attempts_after_blackhole,primary_ack_progress_reinjections_after_blackhole,primary_ack_progress_reinjected_bytes_after_blackhole,secondary_ack_progress_recovery_timeouts_after_blackhole,secondary_ack_progress_recovery_attempts_after_blackhole,secondary_ack_progress_recovery_empty_attempts_after_blackhole,secondary_ack_progress_reinjections_after_blackhole,secondary_ack_progress_reinjected_bytes_after_blackhole,first_primary_ack_progress_timeout_ms,first_primary_ack_progress_reinjection_ms,primary_final_ack_progress_timer_armed,first_secondary_stream_retransmit_ms,first_secondary_fresh_stream_ms,first_receiver_secondary_cross_path_ack_ms,primary_path_ack_escape_requests_after_blackhole,secondary_path_ack_escape_requests_after_blackhole,receiver_primary_path_ack_escape_acks_after_blackhole,receiver_secondary_path_ack_escape_acks_after_blackhole\n",
+        "direction,round,line_one_seed,line_two_seed,recovery,recovered,data_intact,exchange_complete,recovery_gap_ms,transfer_duration_ms,records_received,application_bytes_received,failure_reason,primary_fresh_bytes_before_blackhole,secondary_fresh_bytes_before_blackhole,primary_pto_hedges_before_blackhole,secondary_pto_hedges_before_blackhole,primary_pto_hedge_bytes_before_blackhole,secondary_pto_hedge_bytes_before_blackhole,primary_udp_bytes_after_blackhole,secondary_udp_bytes_after_blackhole,total_udp_bytes_after_blackhole,primary_lost_packets,secondary_lost_packets,pto_hedges_after_blackhole,pto_hedge_bytes_after_blackhole,primary_path_open,secondary_path_open,primary_loss_timeouts_after_blackhole,secondary_loss_timeouts_after_blackhole,primary_pto_timeouts_after_blackhole,secondary_pto_timeouts_after_blackhole,primary_pto_recovery_attempts_after_blackhole,primary_pto_recovery_empty_attempts_after_blackhole,primary_last_pto_unacked_bytes,primary_last_pto_stream_frames,secondary_pto_recovery_attempts_after_blackhole,secondary_pto_recovery_empty_attempts_after_blackhole,secondary_last_pto_unacked_bytes,secondary_last_pto_stream_frames,primary_final_cwnd,secondary_final_cwnd,receiver_primary_path_acks_same_path_after_blackhole,receiver_primary_path_acks_cross_path_after_blackhole,receiver_secondary_path_acks_same_path_after_blackhole,receiver_secondary_path_acks_cross_path_after_blackhole,primary_open_at_fault,secondary_open_at_fault,first_primary_loss_timeout_ms,first_primary_pto_ms,first_primary_recovery_attempt_ms,first_primary_hedge_ms,first_secondary_udp_send_ms,first_receiver_primary_cross_path_ack_ms,first_receiver_secondary_same_path_ack_ms,primary_closed_ms,secondary_closed_ms,recovery_gap_started_after_fault_ms,recovery_gap_ended_after_fault_ms,recovery_gap_next_sequence,primary_rtt_at_fault_ms,primary_pto_at_fault_ms,primary_cwnd_at_fault,primary_bytes_in_flight_at_fault,primary_ack_eliciting_in_flight_at_fault,primary_tracked_sent_packets_at_fault,primary_tracked_ack_eliciting_packets_at_fault,primary_latest_ack_eliciting_pn_at_fault,primary_pto_count_at_fault,primary_loss_timer_armed_at_fault,primary_ack_eliciting_pn_advance_after_fault,first_primary_ack_eliciting_send_ms,last_primary_ack_eliciting_send_ms,first_primary_udp_receive_ms,last_primary_udp_receive_ms,first_primary_loss_timer_unarmed_ms,first_primary_ack_eliciting_in_flight_zero_ms,first_primary_tracked_ack_eliciting_zero_ms,max_primary_bytes_in_flight_after_fault,max_primary_ack_eliciting_in_flight_after_fault,max_primary_tracked_sent_packets_after_fault,max_primary_tracked_ack_eliciting_after_fault,primary_final_rtt_ms,primary_final_pto_ms,primary_final_bytes_in_flight,primary_final_ack_eliciting_in_flight,primary_final_tracked_sent_packets,primary_final_tracked_ack_eliciting_packets,primary_final_loss_timer_armed,primary_abandon_recovery_attempts_after_blackhole,primary_abandon_recovery_empty_attempts_after_blackhole,primary_abandon_reinjections_after_blackhole,primary_abandon_reinjected_bytes_after_blackhole,secondary_abandon_recovery_attempts_after_blackhole,secondary_abandon_recovery_empty_attempts_after_blackhole,secondary_abandon_reinjections_after_blackhole,secondary_abandon_reinjected_bytes_after_blackhole,primary_ack_progress_recovery_timeouts_after_blackhole,primary_ack_progress_recovery_attempts_after_blackhole,primary_ack_progress_recovery_empty_attempts_after_blackhole,primary_ack_progress_reinjections_after_blackhole,primary_ack_progress_reinjected_bytes_after_blackhole,primary_ack_progress_feedback_probe_timeouts_after_blackhole,primary_ack_progress_feedback_probes_after_blackhole,primary_ack_progress_feedback_probe_bytes_after_blackhole,secondary_ack_progress_recovery_timeouts_after_blackhole,secondary_ack_progress_recovery_attempts_after_blackhole,secondary_ack_progress_recovery_empty_attempts_after_blackhole,secondary_ack_progress_reinjections_after_blackhole,secondary_ack_progress_reinjected_bytes_after_blackhole,secondary_ack_progress_feedback_probe_timeouts_after_blackhole,secondary_ack_progress_feedback_probes_after_blackhole,secondary_ack_progress_feedback_probe_bytes_after_blackhole,first_primary_ack_progress_timeout_ms,first_primary_ack_progress_reinjection_ms,first_primary_ack_progress_feedback_probe_ms,primary_final_ack_progress_timer_armed,first_secondary_stream_retransmit_ms,first_secondary_fresh_stream_ms,first_receiver_secondary_cross_path_ack_ms,primary_path_ack_escape_requests_after_blackhole,secondary_path_ack_escape_requests_after_blackhole,receiver_primary_path_ack_escape_acks_after_blackhole,receiver_secondary_path_ack_escape_acks_after_blackhole,primary_stream_gap_rescue_probes_after_blackhole,primary_stream_gap_rescue_bytes_after_blackhole,secondary_stream_gap_rescue_probes_after_blackhole,secondary_stream_gap_rescue_bytes_after_blackhole\n",
     );
 
     for observation in observations {
@@ -2044,7 +2490,7 @@ fn write_formal_failover_csv(
 
         write!(
             csv,
-            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
             observation.direction.description(),
             observation.round,
             observation.seeds.line_one,
@@ -2052,6 +2498,7 @@ fn write_formal_failover_csv(
             observation.pto_recovery.description(),
             observation.report.recovered,
             observation.report.data_intact,
+            observation.report.exchange_complete,
             recovery_gap_ms,
             transfer_duration_ms,
             observation.report.records_received,
@@ -2204,17 +2651,23 @@ fn write_formal_failover_csv(
         )?;
         write!(
             csv,
-            ",{},{},{},{},{},{},{},{},{},{},{},{},{}",
+            ",{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
             after_primary.ack_progress_recovery_timeouts,
             after_primary.ack_progress_recovery_attempts,
             after_primary.ack_progress_recovery_empty_attempts,
             after_primary.ack_progress_reinjections,
             after_primary.ack_progress_reinjected_bytes,
+            after_primary.ack_progress_feedback_probe_timeouts,
+            after_primary.ack_progress_feedback_probes,
+            after_primary.ack_progress_feedback_probe_bytes,
             after_secondary.ack_progress_recovery_timeouts,
             after_secondary.ack_progress_recovery_attempts,
             after_secondary.ack_progress_recovery_empty_attempts,
             after_secondary.ack_progress_reinjections,
             after_secondary.ack_progress_reinjected_bytes,
+            after_secondary.ack_progress_feedback_probe_timeouts,
+            after_secondary.ack_progress_feedback_probes,
+            after_secondary.ack_progress_feedback_probe_bytes,
             csv_optional_milliseconds(
                 observation
                     .report
@@ -2226,6 +2679,12 @@ fn write_formal_failover_csv(
                     .report
                     .timeline
                     .first_primary_ack_progress_reinjection,
+            ),
+            csv_optional_milliseconds(
+                observation
+                    .report
+                    .timeline
+                    .first_primary_ack_progress_feedback_probe,
             ),
             after_primary.final_ack_progress_recovery_timer_armed,
         )?;
@@ -2248,11 +2707,15 @@ fn write_formal_failover_csv(
         )?;
         writeln!(
             csv,
-            ",{},{},{},{}",
+            ",{},{},{},{},{},{},{},{}",
             after_primary.path_ack_escape_requests,
             after_secondary.path_ack_escape_requests,
             receiver_primary.path_ack_escape_acks,
             receiver_secondary.path_ack_escape_acks,
+            after_primary.stream_gap_rescue_probes,
+            after_primary.stream_gap_rescue_bytes,
+            after_secondary.stream_gap_rescue_probes,
+            after_secondary.stream_gap_rescue_bytes,
         )?;
     }
 
@@ -2263,7 +2726,7 @@ fn write_formal_failover_csv(
 
 fn write_stream_state_csv(path: &str, observations: &[FormalFailoverObservation]) -> LabResult<()> {
     let mut csv = String::from(
-        "direction,round,line_one_seed,line_two_seed,elapsed_after_fault_ms,stream_id,sender_fully_acked_offset,sender_unacknowledged_bytes,sender_lowest_retransmit_offset,sender_retransmit_bytes,receiver_contiguous_offset,receiver_highest_offset,receiver_buffered_after_gap_bytes,feedback_debt_bytes,retransmit_target_minus_receiver_bytes,secondary_lost_packets,secondary_stream_retransmit_bytes,secondary_pto_timeouts,secondary_cwnd,secondary_bytes_in_flight\n",
+        "direction,round,line_one_seed,line_two_seed,elapsed_after_fault_ms,stream_id,sender_fully_acked_offset,sender_unacknowledged_bytes,sender_lowest_retransmit_offset,sender_retransmit_bytes,sender_offset,sender_max_stream_data,sender_stream_flow_control_blocked,sender_connection_flow_control_blocked,sender_connection_data,sender_max_data,sender_max_data_blocked,receiver_contiguous_offset,receiver_highest_offset,receiver_buffered_after_gap_bytes,feedback_debt_bytes,retransmit_target_minus_receiver_bytes,receiver_sent_max_stream_data,receiver_current_max_stream_data,receiver_max_stream_data_pending,receiver_max_stream_data_in_flight_packets,receiver_data,receiver_max_data,receiver_sent_max_data,receiver_max_data_pending,receiver_max_data_in_flight_packets,response_sender_fully_acked_offset,response_sender_unacknowledged_bytes,response_sender_lowest_retransmit_offset,response_sender_retransmit_bytes,response_sender_offset,response_sender_max_stream_data,response_sender_flow_control_blocked,response_sender_connection_blocked,response_receiver_contiguous_offset,response_receiver_highest_offset,secondary_lost_packets,secondary_stream_retransmit_bytes,secondary_pto_timeouts,secondary_rtt_ms,secondary_pto_ms,secondary_cwnd,secondary_bytes_in_flight,secondary_ack_eliciting_in_flight,secondary_tracked_sent_packets,secondary_tracked_ack_eliciting_packets,secondary_latest_ack_eliciting_pn,secondary_pto_count,secondary_loss_timer_armed,receiver_primary_tracked_max_data_packets,receiver_primary_tracked_max_stream_data_packets,receiver_primary_pto_count,receiver_primary_loss_timer_armed,receiver_primary_stream_fresh_bytes,receiver_secondary_tracked_max_data_packets,receiver_secondary_tracked_max_stream_data_packets,receiver_secondary_pto_count,receiver_secondary_loss_timer_armed,receiver_secondary_stream_fresh_bytes,receiver_secondary_stream_retransmit_bytes,receiver_secondary_lost_packets,receiver_secondary_pto_timeouts,receiver_secondary_bytes_in_flight,receiver_secondary_ack_eliciting_in_flight,receiver_secondary_tracked_sent_packets,receiver_secondary_tracked_ack_eliciting_packets,secondary_stream_gap_rescue_probes,secondary_stream_gap_rescue_bytes\n",
     );
 
     for observation in observations {
@@ -2292,19 +2755,24 @@ fn write_stream_state_csv(path: &str, observations: &[FormalFailoverObservation]
                 _ => None,
             };
 
-            writeln!(
-                csv,
-                "{},{},{},{},{:.3},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
-                observation.direction.description(),
-                observation.round,
-                observation.seeds.line_one,
-                observation.seeds.line_two,
-                milliseconds(sample.elapsed_after_fault),
-                u64::from(sample.stream_id),
+            let fields = vec![
+                observation.direction.description().to_owned(),
+                observation.round.to_string(),
+                observation.seeds.line_one.to_string(),
+                observation.seeds.line_two.to_string(),
+                format!("{:.3}", milliseconds(sample.elapsed_after_fault)),
+                u64::from(sample.stream_id).to_string(),
                 csv_optional_u64(sample.sender_fully_acked_offset),
                 csv_optional_u64(sample.sender_unacknowledged_bytes),
                 csv_optional_u64(sample.sender_lowest_retransmit_offset),
                 csv_optional_u64(sample.sender_retransmit_bytes),
+                csv_optional_u64(sample.sender_offset),
+                csv_optional_u64(sample.sender_max_stream_data),
+                csv_optional_bool(sample.sender_stream_flow_control_blocked),
+                csv_optional_bool(sample.sender_connection_flow_control_blocked),
+                sample.sender_connection_data.to_string(),
+                sample.sender_max_data.to_string(),
+                sample.sender_max_data_blocked.to_string(),
                 csv_optional_u64(sample.receiver_contiguous_offset),
                 csv_optional_u64(sample.receiver_highest_offset),
                 csv_optional_u64(buffered_after_gap),
@@ -2312,12 +2780,79 @@ fn write_stream_state_csv(path: &str, observations: &[FormalFailoverObservation]
                 retransmit_target_delta
                     .map(|value| value.to_string())
                     .unwrap_or_default(),
-                sample.secondary_lost_packets,
-                sample.secondary_stream_retransmit_bytes,
-                sample.secondary_pto_timeouts,
-                sample.secondary_cwnd,
-                sample.secondary_bytes_in_flight,
-            )?;
+                csv_optional_u64(sample.receiver_sent_max_stream_data),
+                csv_optional_u64(sample.receiver_current_max_stream_data),
+                sample.receiver_max_stream_data_pending.to_string(),
+                sample
+                    .receiver_max_stream_data_in_flight_packets
+                    .to_string(),
+                sample.receiver_data.to_string(),
+                sample.receiver_max_data.to_string(),
+                sample.receiver_sent_max_data.to_string(),
+                sample.receiver_max_data_pending.to_string(),
+                sample.receiver_max_data_in_flight_packets.to_string(),
+                csv_optional_u64(sample.response_sender_fully_acked_offset),
+                csv_optional_u64(sample.response_sender_unacknowledged_bytes),
+                csv_optional_u64(sample.response_sender_lowest_retransmit_offset),
+                csv_optional_u64(sample.response_sender_retransmit_bytes),
+                csv_optional_u64(sample.response_sender_offset),
+                csv_optional_u64(sample.response_sender_max_stream_data),
+                csv_optional_bool(sample.response_sender_flow_control_blocked),
+                csv_optional_bool(sample.response_sender_connection_blocked),
+                csv_optional_u64(sample.response_receiver_contiguous_offset),
+                csv_optional_u64(sample.response_receiver_highest_offset),
+                sample.secondary_lost_packets.to_string(),
+                sample.secondary_stream_retransmit_bytes.to_string(),
+                sample.secondary_pto_timeouts.to_string(),
+                format!("{:.3}", milliseconds(sample.secondary_rtt)),
+                format!("{:.3}", milliseconds(sample.secondary_pto)),
+                sample.secondary_cwnd.to_string(),
+                sample.secondary_bytes_in_flight.to_string(),
+                sample.secondary_ack_eliciting_packets_in_flight.to_string(),
+                sample.secondary_tracked_sent_packets.to_string(),
+                sample.secondary_tracked_ack_eliciting_packets.to_string(),
+                sample
+                    .secondary_latest_ack_eliciting_packet_number
+                    .to_string(),
+                sample.secondary_pto_count.to_string(),
+                sample.secondary_loss_detection_timer_armed.to_string(),
+                sample.receiver_primary_tracked_max_data_packets.to_string(),
+                sample
+                    .receiver_primary_tracked_max_stream_data_packets
+                    .to_string(),
+                sample.receiver_primary_pto_count.to_string(),
+                sample
+                    .receiver_primary_loss_detection_timer_armed
+                    .to_string(),
+                sample.receiver_primary_stream_fresh_bytes.to_string(),
+                sample
+                    .receiver_secondary_tracked_max_data_packets
+                    .to_string(),
+                sample
+                    .receiver_secondary_tracked_max_stream_data_packets
+                    .to_string(),
+                sample.receiver_secondary_pto_count.to_string(),
+                sample
+                    .receiver_secondary_loss_detection_timer_armed
+                    .to_string(),
+                sample.receiver_secondary_stream_fresh_bytes.to_string(),
+                sample
+                    .receiver_secondary_stream_retransmit_bytes
+                    .to_string(),
+                sample.receiver_secondary_lost_packets.to_string(),
+                sample.receiver_secondary_pto_timeouts.to_string(),
+                sample.receiver_secondary_bytes_in_flight.to_string(),
+                sample
+                    .receiver_secondary_ack_eliciting_packets_in_flight
+                    .to_string(),
+                sample.receiver_secondary_tracked_sent_packets.to_string(),
+                sample
+                    .receiver_secondary_tracked_ack_eliciting_packets
+                    .to_string(),
+                sample.secondary_stream_gap_rescue_probes.to_string(),
+                sample.secondary_stream_gap_rescue_bytes.to_string(),
+            ];
+            writeln!(csv, "{}", fields.join(","))?;
         }
     }
 
@@ -2340,6 +2875,10 @@ fn csv_optional_milliseconds(duration: Option<Duration>) -> String {
 }
 
 fn csv_optional_u64(value: Option<u64>) -> String {
+    value.map(|value| value.to_string()).unwrap_or_default()
+}
+
+fn csv_optional_bool(value: Option<bool>) -> String {
     value.map(|value| value.to_string()).unwrap_or_default()
 }
 

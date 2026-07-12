@@ -15,6 +15,9 @@ case "$mode" in
     formal-a)
         test_name="failover_formal_bidirectional_lab"
         ;;
+    formal-gap-watch)
+        test_name="failover_feedback_gap_watch_formal_bidirectional_lab"
+        ;;
     diagnose-a)
         test_name="failover_timeline_diagnostic_lab"
         ;;
@@ -39,6 +42,33 @@ case "$mode" in
     diagnose-feedback-handoff-1103)
         test_name="failover_feedback_handoff_seed_1103_diagnostic_lab"
         ;;
+    diagnose-feedback-handoff-1104)
+        test_name="failover_feedback_handoff_seed_1104_diagnostic_lab"
+        ;;
+    diagnose-feedback-snapshot-1104)
+        test_name="failover_feedback_snapshot_seed_1104_diagnostic_lab"
+        ;;
+    diagnose-feedback-snapshot-stability)
+        test_name="failover_feedback_snapshot_seed_1104_stability_lab"
+        ;;
+    diagnose-feedback-snapshot-response-stability)
+        test_name="failover_feedback_snapshot_seed_1104_response_stability_lab"
+        ;;
+    diagnose-feedback-probe-stability)
+        test_name="failover_feedback_probe_seed_1104_stability_lab"
+        ;;
+    diagnose-feedback-evidence-stability)
+        test_name="failover_feedback_evidence_seed_1104_stability_lab"
+        ;;
+    diagnose-feedback-evidence-response-stability)
+        test_name="failover_feedback_evidence_seed_1104_response_stability_lab"
+        ;;
+    diagnose-feedback-gap-rescue-stability)
+        test_name="failover_feedback_gap_rescue_seed_1104_stability_lab"
+        ;;
+    diagnose-feedback-gap-watch-stability)
+        test_name="failover_feedback_gap_watch_seed_1104_stability_lab"
+        ;;
     screen)
         test_name="scheduler_five_seed_screening_lab"
         ;;
@@ -46,7 +76,7 @@ case "$mode" in
         test_name="scheduler_long_duration_benchmark_lab"
         ;;
     *)
-        echo "用法：$0 [smoke|failover|formal-a|diagnose-a|diagnose-no-pto|diagnose-abandon|diagnose-ack-progress|diagnose-ack-escape-representative|diagnose-second-gap|diagnose-feedback-handoff|diagnose-feedback-handoff-1103|screen|long]" >&2
+        echo "用法：$0 [smoke|failover|formal-a|formal-gap-watch|diagnose-a|diagnose-no-pto|diagnose-abandon|diagnose-ack-progress|diagnose-ack-escape-representative|diagnose-second-gap|diagnose-feedback-handoff|diagnose-feedback-handoff-1103|diagnose-feedback-handoff-1104|diagnose-feedback-snapshot-1104|diagnose-feedback-snapshot-stability|diagnose-feedback-snapshot-response-stability|diagnose-feedback-probe-stability|diagnose-feedback-evidence-stability|diagnose-feedback-evidence-response-stability|diagnose-feedback-gap-rescue-stability|diagnose-feedback-gap-watch-stability|screen|long]" >&2
         exit 2
         ;;
 esac
@@ -76,7 +106,7 @@ tc filter add dev lo protocol ip parent 1: prio 2 u32 match ip dst 127.0.0.2/32 
 tc filter add dev lo protocol ip parent 1: prio 3 u32 match u32 0 0 flowid 1:1
 
 export FLOWWEAVE_NETEM_LAB=1
-if [[ "$FLOWWEAVE_LAB_MODE" == "long" || "$FLOWWEAVE_LAB_MODE" == "formal-a" || "$FLOWWEAVE_LAB_MODE" == "diagnose-a" || "$FLOWWEAVE_LAB_MODE" == "diagnose-no-pto" || "$FLOWWEAVE_LAB_MODE" == "diagnose-abandon" || "$FLOWWEAVE_LAB_MODE" == "diagnose-ack-progress" || "$FLOWWEAVE_LAB_MODE" == "diagnose-ack-escape-representative" || "$FLOWWEAVE_LAB_MODE" == "diagnose-second-gap" || "$FLOWWEAVE_LAB_MODE" == "diagnose-feedback-handoff" || "$FLOWWEAVE_LAB_MODE" == "diagnose-feedback-handoff-1103" ]]; then
+if [[ "$FLOWWEAVE_LAB_MODE" == "long" || "$FLOWWEAVE_LAB_MODE" == "formal-a" || "$FLOWWEAVE_LAB_MODE" == "formal-gap-watch" || "$FLOWWEAVE_LAB_MODE" == "diagnose-a" || "$FLOWWEAVE_LAB_MODE" == "diagnose-no-pto" || "$FLOWWEAVE_LAB_MODE" == "diagnose-abandon" || "$FLOWWEAVE_LAB_MODE" == "diagnose-ack-progress" || "$FLOWWEAVE_LAB_MODE" == "diagnose-ack-escape-representative" || "$FLOWWEAVE_LAB_MODE" == "diagnose-second-gap" || "$FLOWWEAVE_LAB_MODE" == "diagnose-feedback-handoff" || "$FLOWWEAVE_LAB_MODE" == "diagnose-feedback-handoff-1103" || "$FLOWWEAVE_LAB_MODE" == "diagnose-feedback-handoff-1104" || "$FLOWWEAVE_LAB_MODE" == "diagnose-feedback-snapshot-1104" || "$FLOWWEAVE_LAB_MODE" == "diagnose-feedback-snapshot-stability" || "$FLOWWEAVE_LAB_MODE" == "diagnose-feedback-snapshot-response-stability" || "$FLOWWEAVE_LAB_MODE" == "diagnose-feedback-probe-stability" || "$FLOWWEAVE_LAB_MODE" == "diagnose-feedback-evidence-stability" || "$FLOWWEAVE_LAB_MODE" == "diagnose-feedback-evidence-response-stability" || "$FLOWWEAVE_LAB_MODE" == "diagnose-feedback-gap-rescue-stability" || "$FLOWWEAVE_LAB_MODE" == "diagnose-feedback-gap-watch-stability" ]]; then
     cargo test --release --test network_lab "$FLOWWEAVE_LAB_TEST" -- --ignored --nocapture --test-threads=1
 else
     cargo test --test network_lab "$FLOWWEAVE_LAB_TEST" -- --ignored --nocapture --test-threads=1

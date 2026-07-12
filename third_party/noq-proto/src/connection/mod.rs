@@ -12,7 +12,7 @@ use bytes::{Bytes, BytesMut};
 use frame::StreamMetaVec;
 
 use rand::{RngExt, SeedableRng, rngs::StdRng};
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use thiserror::Error;
 use tracing::{debug, error, trace, trace_span, warn};
 
@@ -91,7 +91,7 @@ pub(crate) use spaces::SpaceKind;
 use spaces::{OpenStatus, PacketSpace, SendableFrames, SentPacket, ThinRetransmits};
 
 mod stats;
-pub use stats::{ConnectionStats, FrameStats, PathStats, StreamStats, UdpStats};
+pub use stats::{ConnectionStats, FlowControlStats, FrameStats, PathStats, StreamStats, UdpStats};
 
 mod streams;
 #[cfg(fuzzing)]
@@ -128,6 +128,12 @@ enum StreamReinjectionTrigger {
 struct RecoveryFeedbackHandoff {
     preferred_path_id: PathId,
     previous_statuses: Vec<(PathId, PathStatus)>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct AckProgressFeedbackProbeRoute {
+    suspected_path_id: PathId,
+    target_path_id: PathId,
 }
 
 /// Protocol state and logic for a single QUIC connection
@@ -325,6 +331,9 @@ pub struct Connection {
     /// suspected path. A successful probe on another path restores the previous statuses.
     recovery_feedback_handoff: Option<RecoveryFeedbackHandoff>,
 
+    /// One-shot routing override for the next STREAM-bearing feedback probe packet.
+    ack_progress_feedback_probe_route: Option<AckProgressFeedbackProbeRoute>,
+
     /// State for n0's (<https://n0.computer>) nat traversal protocol.
     n0_nat_traversal: n0_nat_traversal::State,
     qlog: QlogSink,
@@ -450,6 +459,7 @@ impl Connection {
             max_path_id_with_cids: PathId::ZERO,
             abandoned_paths: Default::default(),
             recovery_feedback_handoff: None,
+            ack_progress_feedback_probe_route: None,
 
             n0_nat_traversal: Default::default(),
             qlog,
@@ -767,6 +777,8 @@ impl Connection {
                 // ACK-progress recovery is only meaningful while the path can still send a
                 // liveness probe and later return to normal scheduling.
                 PathTimer::AckProgressRecovery => false,
+                // A STREAM-gap rescue cannot be sent after this path is abandoned.
+                PathTimer::StreamGapWatchRescue => false,
                 // Sent packets still need to be identified as lost to trigger timely
                 // retransmission.
                 PathTimer::LossDetection => true,
@@ -1114,11 +1126,19 @@ impl Connection {
             }
 
             let info = self.scheduling_info(path_id);
+            let path_max_datagrams = if self
+                .ack_progress_feedback_probe_route
+                .is_some_and(|route| route.target_path_id == path_id)
+            {
+                NonZeroUsize::MIN
+            } else {
+                max_datagrams
+            };
             if let Some(transmit) = self.poll_transmit_on_path(
                 now,
                 buf,
                 path_id,
-                max_datagrams,
+                path_max_datagrams,
                 &info,
                 connection_close_pending,
             ) {
@@ -1173,6 +1193,9 @@ impl Connection {
     /// doc comment. Maybe that should change. Eventually we'll refactor things for this
     /// panic to go away.
     fn scheduling_info(&self, path_id: PathId) -> PathSchedulingInfo {
+        let feedback_probe_target = self
+            .ack_progress_feedback_probe_route
+            .map(|route| route.target_path_id);
         // Such a space is preferred for SpaceKind::Data frames.
         let have_validated_status_available_space = self.paths.iter().any(|(path_id, path)| {
             self.remote_cids.contains_key(path_id)
@@ -1225,6 +1248,8 @@ impl Connection {
                 //    path is to a previously-validated remote address and allow
                 //    sending data to such remotes immediately.
                 false
+            } else if let Some(target_path_id) = feedback_probe_target {
+                path_id == target_path_id
             } else if path_data.pto_recovery_probe_start.is_some()
                 && have_other_validated_unsuspected_space
             {
@@ -2670,6 +2695,9 @@ impl Connection {
                         PathTimer::AckProgressRecovery => {
                             self.on_ack_progress_recovery_timeout(now, path_id);
                         }
+                        PathTimer::StreamGapWatchRescue => {
+                            self.on_stream_gap_watch_rescue_timeout(now, path_id);
+                        }
                     }
                 }
             }
@@ -2737,6 +2765,39 @@ impl Connection {
         }
 
         stats.streams = self.streams.stream_stats();
+        stats.flow_control = self.streams.flow_control_stats();
+        stats.flow_control.receive_max_data_pending = self.spaces[SpaceId::Data].pending.max_data;
+
+        for stream in &mut stats.streams {
+            stream.receive_max_stream_data_pending = self.spaces[SpaceId::Data]
+                .pending
+                .max_stream_data
+                .contains(&stream.id);
+        }
+        for number_space in self.spaces[SpaceId::Data].number_spaces.values() {
+            for packet in number_space.sent_packets.values() {
+                let Some(retransmits) = packet.retransmits.get() else {
+                    continue;
+                };
+                if retransmits.max_data {
+                    stats.flow_control.receive_max_data_in_flight_packets = stats
+                        .flow_control
+                        .receive_max_data_in_flight_packets
+                        .saturating_add(1);
+                }
+                for stream_id in &retransmits.max_stream_data {
+                    if let Some(stream) = stats
+                        .streams
+                        .iter_mut()
+                        .find(|stream| stream.id == *stream_id)
+                    {
+                        stream.receive_max_stream_data_in_flight_packets = stream
+                            .receive_max_stream_data_in_flight_packets
+                            .saturating_add(1);
+                    }
+                }
+            }
+        }
 
         stats
     }
@@ -2751,10 +2812,25 @@ impl Connection {
         let ack_eliciting_packets_in_flight = path.in_flight.ack_eliciting;
         let pto_count = path.pto_count;
         let current_mtu = path.mtud.current_mtu();
-        let (tracked_sent_packets, tracked_ack_eliciting_packets, latest_packet_number) = self
-            .spaces[SpaceId::Data]
+        let (
+            tracked_sent_packets,
+            tracked_ack_eliciting_packets,
+            tracked_max_data_packets,
+            tracked_max_stream_data_packets,
+            latest_packet_number,
+        ) = self.spaces[SpaceId::Data]
             .path_space(path_id)
             .map(|space| {
+                let mut tracked_max_data_packets = 0_u64;
+                let mut tracked_max_stream_data_packets = 0_u64;
+                for packet in space.sent_packets.values() {
+                    let Some(retransmits) = packet.retransmits.get() else {
+                        continue;
+                    };
+                    tracked_max_data_packets += u64::from(retransmits.max_data);
+                    tracked_max_stream_data_packets +=
+                        u64::from(!retransmits.max_stream_data.is_empty());
+                }
                 (
                     space.sent_packets.iter().count() as u64,
                     space
@@ -2762,6 +2838,8 @@ impl Connection {
                         .values()
                         .filter(|packet| packet.ack_eliciting)
                         .count() as u64,
+                    tracked_max_data_packets,
+                    tracked_max_stream_data_packets,
                     space.largest_ack_eliciting_sent,
                 )
             })
@@ -2782,6 +2860,8 @@ impl Connection {
         stats.ack_eliciting_packets_in_flight = ack_eliciting_packets_in_flight;
         stats.tracked_sent_packets = tracked_sent_packets;
         stats.tracked_ack_eliciting_packets = tracked_ack_eliciting_packets;
+        stats.tracked_max_data_packets = tracked_max_data_packets;
+        stats.tracked_max_stream_data_packets = tracked_max_stream_data_packets;
         stats.latest_ack_eliciting_packet_number = latest_packet_number;
         stats.pto_count = pto_count;
         stats.loss_detection_timer_armed = loss_detection_timer_armed;
@@ -2909,6 +2989,15 @@ impl Connection {
         self.path(path_id).map(|d| d.rtt.get())
     }
 
+    /// Replaces one path's RTT estimator without generating packets or timers.
+    ///
+    /// Deterministic recovery tests use this to exercise timing-budget boundaries without
+    /// contaminating the connection with synthetic ACK, PTO, or IMMEDIATE_ACK state.
+    #[cfg(test)]
+    pub(crate) fn set_test_path_rtt(&mut self, path_id: PathId, rtt: Duration) {
+        self.path_mut(path_id).expect("known test path").rtt = paths::RttEstimator::new(rtt);
+    }
+
     /// Current state of this connection's congestion controller, for debugging purposes
     pub fn congestion_state(&self, path_id: PathId) -> Option<&dyn Controller> {
         self.path(path_id).map(|d| d.congestion.as_ref())
@@ -3005,21 +3094,27 @@ impl Connection {
         &mut self,
         now: Instant,
         space: SpaceId,
+        feedback_path: PathId,
         ack: frame::Ack,
     ) -> Result<(), TransportError> {
         // All ACKs are referencing path 0
         let path = PathId::ZERO;
-        self.inner_on_ack_received(now, space, path, ack)
+        self.inner_on_ack_received(now, space, path, ack)?;
+        self.maybe_reinject_stream_data_on_feedback_evidence(now, space, path, feedback_path);
+        Ok(())
     }
 
     fn on_path_ack_received(
         &mut self,
         now: Instant,
         space: SpaceId,
+        feedback_path: PathId,
         path_ack: frame::PathAck,
     ) -> Result<(), TransportError> {
         let (ack, path) = path_ack.into_ack();
-        self.inner_on_ack_received(now, space, path, ack)
+        self.inner_on_ack_received(now, space, path, ack)?;
+        self.maybe_reinject_stream_data_on_feedback_evidence(now, space, path, feedback_path);
+        Ok(())
     }
 
     /// Handles an ACK frame acknowledging packets sent on *path*.
@@ -3095,12 +3190,21 @@ impl Connection {
         let recovery_probe_start = (space == SpaceId::Data)
             .then(|| self.path_data(path).pto_recovery_probe_start)
             .flatten();
+        let feedback_probe_liveness_start = (space == SpaceId::Data)
+            .then(|| {
+                self.path_data(path)
+                    .ack_progress_feedback_probe_liveness_start
+            })
+            .flatten();
         let current_path_generation = self.path_data(path).generation();
         let mut recovery_probe_acked = false;
+        let mut feedback_probe_liveness_acked = false;
         let mut ack_eliciting_acked = false;
         let mut ack_progress_made = false;
         for packet in newly_acked.elts() {
             recovery_probe_acked |= recovery_probe_start.is_some_and(|start| packet >= start);
+            feedback_probe_liveness_acked |=
+                feedback_probe_liveness_start.is_some_and(|start| packet >= start);
             if let Some(info) = self.spaces[space].for_path(path).take(packet) {
                 for (acked_path_id, acked_pn) in info.largest_acked.iter() {
                     // Assume ACKs for all packets below the largest acknowledged in
@@ -3177,7 +3281,19 @@ impl Connection {
             path_data.pto_count = 0;
             if recovery_probe_acked {
                 path_data.pto_recovery_probe_start = None;
+                path_data.ack_progress_feedback_probe_full_deadline = None;
             }
+            if feedback_probe_liveness_acked {
+                path_data.ack_progress_feedback_probe_liveness_start = None;
+                path_data.ack_progress_feedback_probe_full_deadline = None;
+            }
+        }
+        if feedback_probe_liveness_acked
+            && self
+                .ack_progress_feedback_probe_route
+                .is_some_and(|route| route.suspected_path_id == path)
+        {
+            self.ack_progress_feedback_probe_route = None;
         }
 
         // Explicit congestion notification
@@ -3212,6 +3328,7 @@ impl Connection {
         }
 
         self.update_ack_progress_recovery_after_ack(now, space, path, ack_progress_made);
+        self.refresh_stream_gap_watch_rescue(now, space, path);
         self.set_loss_detection_timer(now, path);
         Ok(())
     }
@@ -3420,6 +3537,9 @@ impl Connection {
             preferred_path_id,
             previous_statuses,
         });
+        if self.config.cross_path_feedback_credit_snapshot {
+            self.requeue_in_flight_flow_control_for_handoff(preferred_path_id);
+        }
         self.spaces[SpaceId::Data]
             .pending
             .path_status
@@ -3427,6 +3547,58 @@ impl Connection {
         trace!(
             %preferred_path_id,
             "promoted recovery path for outbound feedback"
+        );
+    }
+
+    /// Copy monotonic flow-control state already owned by packets on old paths back into the
+    /// connection-wide pending queue when feedback routing changes.
+    ///
+    /// Changing PATH_STATUS only affects frames selected after the handoff. Without this snapshot,
+    /// a MAX_DATA, MAX_STREAM_DATA, or MAX_STREAMS frame sent immediately before the failure can
+    /// remain tied to the failed path until that packet is declared lost. The sender can exhaust
+    /// its previous credit before enough new data arrives to trigger another update, creating a
+    /// self-sustaining flow-control stall. These frames carry absolute, monotonic values, so one
+    /// bounded duplicate on the preferred path is safe and will encode the newest local value.
+    fn requeue_in_flight_flow_control_for_handoff(&mut self, preferred_path_id: PathId) {
+        let mut max_data = false;
+        let mut max_stream_id = [false; 2];
+        let mut max_stream_data = FxHashSet::default();
+
+        for (&path_id, number_space) in &self.spaces[SpaceId::Data].number_spaces {
+            if path_id == preferred_path_id {
+                continue;
+            }
+            for packet in number_space.sent_packets.values() {
+                let Some(retransmits) = packet.retransmits.get() else {
+                    continue;
+                };
+                max_data |= retransmits.max_data;
+                for dir in Dir::iter() {
+                    max_stream_id[dir as usize] |= retransmits.max_stream_id[dir as usize];
+                }
+                max_stream_data.extend(retransmits.max_stream_data.iter().copied());
+            }
+        }
+
+        if !max_data && !max_stream_id.iter().any(|pending| *pending) && max_stream_data.is_empty()
+        {
+            return;
+        }
+
+        let pending = &mut self.spaces[SpaceId::Data].pending;
+        pending.max_data |= max_data;
+        for dir in Dir::iter() {
+            pending.max_stream_id[dir as usize] |= max_stream_id[dir as usize];
+        }
+        let stream_count = max_stream_data.len();
+        pending.max_stream_data.extend(max_stream_data);
+        trace!(
+            %preferred_path_id,
+            max_data,
+            max_streams_bidi = max_stream_id[Dir::Bi as usize],
+            max_streams_uni = max_stream_id[Dir::Uni as usize],
+            max_stream_data = stream_count,
+            "requeued in-flight flow-control state for feedback handoff"
         );
     }
 
@@ -3477,10 +3649,14 @@ impl Connection {
                 self.config.cross_path_ack_progress_reinjection
             }
         };
-        if !enabled
-            || space != SpaceId::Data
-            || self.path_data(path_id).pto_recovery_probe_start.is_some()
-        {
+        let staged_feedback_probe = self
+            .path_data(path_id)
+            .ack_progress_feedback_probe_full_deadline
+            .is_some();
+        if !enabled || space != SpaceId::Data {
+            return false;
+        }
+        if self.path_data(path_id).pto_recovery_probe_start.is_some() && !staged_feedback_probe {
             return false;
         }
 
@@ -3517,6 +3693,15 @@ impl Connection {
             }
         }
         if stream_frames.is_empty() {
+            let path = self.path_data_mut(path_id);
+            path.ack_progress_feedback_probe_full_deadline = None;
+            path.ack_progress_feedback_probe_liveness_start = None;
+            if self
+                .ack_progress_feedback_probe_route
+                .is_some_and(|route| route.suspected_path_id == path_id)
+            {
+                self.ack_progress_feedback_probe_route = None;
+            }
             let stats = self.path_stats.for_path(path_id);
             match trigger {
                 StreamReinjectionTrigger::Pto => {
@@ -3533,6 +3718,20 @@ impl Connection {
                 }
             }
             return false;
+        }
+
+        // Any complete recovery mechanism supersedes the earlier bounded feedback probe while
+        // retaining the ordinary suspected-path marker until that path proves itself alive.
+        {
+            let path = self.path_data_mut(path_id);
+            path.ack_progress_feedback_probe_full_deadline = None;
+            path.ack_progress_feedback_probe_liveness_start = None;
+        }
+        if self
+            .ack_progress_feedback_probe_route
+            .is_some_and(|route| route.suspected_path_id == path_id)
+        {
+            self.ack_progress_feedback_probe_route = None;
         }
 
         let mut newly_queued_bytes = 0u64;
@@ -3577,6 +3776,97 @@ impl Connection {
         true
     }
 
+    /// Queue one earliest retained STREAM frame on a validated alternative path so cumulative
+    /// PATH_ACK and monotonic feedback can arrive before the full ACK-progress recovery deadline.
+    ///
+    /// This deliberately snapshots one frame rather than the entire uncertain byte set. The
+    /// original full recovery remains armed as a fallback, and ordinary congestion control and
+    /// pacing still govern the alternative path.
+    fn maybe_queue_ack_progress_feedback_probe(
+        &mut self,
+        path_id: PathId,
+        full_recovery_deadline: Instant,
+    ) -> bool {
+        if !self.config.cross_path_ack_progress_feedback_probe
+            || !self.config.cross_path_ack_escape
+            || !self.peer_supports_ack_frequency()
+        {
+            return false;
+        }
+        let Some(alternative) = self.cross_path_recovery_alternative(path_id) else {
+            return false;
+        };
+
+        let path_generation = self.path_data(path_id).generation();
+        let mut stream_frames = self.spaces[SpaceId::Data]
+            .for_path(path_id)
+            .sent_packets
+            .values()
+            .filter(|packet| packet.path_generation == path_generation)
+            .flat_map(|packet| packet.stream_frames.iter().cloned())
+            .collect::<Vec<_>>();
+        stream_frames.sort_by_key(|frame| {
+            (
+                frame.offsets.start,
+                u64::from(frame.id),
+                frame.offsets.end,
+                frame.fin,
+            )
+        });
+
+        let mut queued = None;
+        for frame in stream_frames {
+            let fin = frame.fin;
+            let id = frame.id;
+            let offsets = frame.offsets.clone();
+            let newly_queued_bytes = self.streams.retransmit(frame);
+            if newly_queued_bytes > 0 || fin {
+                queued = Some((id, offsets, fin, newly_queued_bytes));
+                break;
+            }
+        }
+        let Some((stream_id, offsets, fin, newly_queued_bytes)) = queued else {
+            return false;
+        };
+
+        let liveness_probe_start = self.spaces[SpaceId::Data]
+            .for_path(path_id)
+            .next_packet_number;
+        {
+            let path = self.path_data_mut(path_id);
+            path.ack_progress_feedback_probe_full_deadline = Some(full_recovery_deadline);
+            path.ack_progress_feedback_probe_liveness_start = Some(liveness_probe_start);
+        }
+        self.ack_progress_feedback_probe_route = Some(AckProgressFeedbackProbeRoute {
+            suspected_path_id: path_id,
+            target_path_id: alternative,
+        });
+        let stats = self.path_stats.for_path(path_id);
+        stats.ack_progress_feedback_probes = stats.ack_progress_feedback_probes.saturating_add(1);
+        stats.ack_progress_feedback_probe_bytes = stats
+            .ack_progress_feedback_probe_bytes
+            .saturating_add(newly_queued_bytes);
+
+        self.request_cross_path_ack_escape(path_id);
+        let request_immediate_ack = self.peer_supports_ack_frequency();
+        let path_space = self.spaces[SpaceId::Data].for_path(path_id);
+        path_space.pending_ping = true;
+        path_space.pending_immediate_ack |= request_immediate_ack;
+        trace!(
+            %path_id,
+            %alternative,
+            %stream_id,
+            offset_start = offsets.start,
+            offset_end = offsets.end,
+            fin,
+            newly_queued_bytes,
+            liveness_probe_start,
+            ?full_recovery_deadline,
+            "queued bounded cross-path feedback probe"
+        );
+        true
+    }
+
     fn maybe_reinject_stream_data_on_pto(&mut self, path_id: PathId, space: SpaceId) -> bool {
         self.maybe_reinject_stream_data(path_id, space, StreamReinjectionTrigger::Pto)
     }
@@ -3597,6 +3887,51 @@ impl Connection {
         )
     }
 
+    /// Once cumulative ACK evidence returns on the alternative path, immediately recover only
+    /// the STREAM metadata which ACK processing left outstanding on the suspected path.
+    ///
+    /// The bounded probe already paid the uncertainty-reduction cost. Retaining the original full
+    /// deadline after that point would add pure waiting time, while reinjecting before processing
+    /// the ACK would duplicate ranges the peer has just proved delivered.
+    fn maybe_reinject_stream_data_on_feedback_evidence(
+        &mut self,
+        now: Instant,
+        space: SpaceId,
+        acknowledged_path: PathId,
+        feedback_path: PathId,
+    ) {
+        if !self
+            .config
+            .cross_path_ack_progress_feedback_evidence_reinjection
+            || !self.config.cross_path_ack_progress_feedback_probe
+            || space != SpaceId::Data
+            || acknowledged_path == feedback_path
+            || !self.paths.contains_key(&acknowledged_path)
+            || self.abandoned_paths.contains(&acknowledged_path)
+            || self
+                .path_data(acknowledged_path)
+                .ack_progress_feedback_probe_full_deadline
+                .is_none()
+        {
+            return;
+        }
+
+        let reinjected = self.maybe_reinject_stream_data_on_ack_progress(acknowledged_path);
+        if reinjected {
+            let request_immediate_ack = self.peer_supports_ack_frequency();
+            let path_space = self.spaces[SpaceId::Data].for_path(acknowledged_path);
+            path_space.pending_ping = true;
+            path_space.pending_immediate_ack |= request_immediate_ack;
+        }
+        self.set_ack_progress_recovery_timer(now, acknowledged_path);
+        trace!(
+            %acknowledged_path,
+            %feedback_path,
+            reinjected,
+            "used cross-path feedback evidence for immediate selective recovery"
+        );
+    }
+
     /// Record an ack-eliciting application-data transmission without moving an existing
     /// ACK-progress deadline.
     fn on_ack_progress_packet_sent(
@@ -3607,6 +3942,17 @@ impl Connection {
         ack_eliciting: bool,
         contains_stream: bool,
     ) {
+        if space == SpaceId::Data
+            && ack_eliciting
+            && contains_stream
+            && self
+                .ack_progress_feedback_probe_route
+                .is_some_and(|route| route.target_path_id == path_id)
+        {
+            self.ack_progress_feedback_probe_route = None;
+            return;
+        }
+
         if !self.config.cross_path_ack_progress_reinjection
             || space != SpaceId::Data
             || !ack_eliciting
@@ -3641,7 +3987,16 @@ impl Connection {
         }
 
         if self.path_data(path_id).stream_frames_in_flight == 0 {
-            self.path_data_mut(path_id).ack_progress_start = None;
+            let path = self.path_data_mut(path_id);
+            path.ack_progress_start = None;
+            path.ack_progress_feedback_probe_full_deadline = None;
+            path.ack_progress_feedback_probe_liveness_start = None;
+            if self
+                .ack_progress_feedback_probe_route
+                .is_some_and(|route| route.suspected_path_id == path_id)
+            {
+                self.ack_progress_feedback_probe_route = None;
+            }
         } else if ack_progress_made {
             self.path_data_mut(path_id).ack_progress_start = Some(now);
         }
@@ -3655,7 +4010,16 @@ impl Connection {
         }
 
         if self.path_data(path_id).stream_frames_in_flight == 0 {
-            self.path_data_mut(path_id).ack_progress_start = None;
+            let path = self.path_data_mut(path_id);
+            path.ack_progress_start = None;
+            path.ack_progress_feedback_probe_full_deadline = None;
+            path.ack_progress_feedback_probe_liveness_start = None;
+            if self
+                .ack_progress_feedback_probe_route
+                .is_some_and(|route| route.suspected_path_id == path_id)
+            {
+                self.ack_progress_feedback_probe_route = None;
+            }
         }
         self.set_ack_progress_recovery_timer(now, path_id);
     }
@@ -3663,19 +4027,51 @@ impl Connection {
     /// Arm or stop the recovery timer from the current ACK-progress epoch.
     fn set_ack_progress_recovery_timer(&mut self, now: Instant, path_id: PathId) {
         let timer = Timer::PerPath(path_id, PathTimer::AckProgressRecovery);
+        let staged_feedback_deadline = self
+            .path_data(path_id)
+            .ack_progress_feedback_probe_full_deadline;
         let eligible = self.config.cross_path_ack_progress_reinjection
             && !self.state.is_closed()
             && self.is_handshake_confirmed()
             && self.paths.contains_key(&path_id)
             && !self.abandoned_paths.contains(&path_id)
-            && self.path_data(path_id).pto_recovery_probe_start.is_none()
+            && (self.path_data(path_id).pto_recovery_probe_start.is_none()
+                || staged_feedback_deadline.is_some())
             && self.has_cross_path_recovery_alternative(path_id)
             && self.path_data(path_id).stream_frames_in_flight > 0;
 
         let deadline = eligible
-            .then(|| self.path_data(path_id).ack_progress_start)
-            .flatten()
-            .map(|start| start + self.pto(SpaceKind::Data, path_id));
+            .then(|| {
+                if let Some(deadline) = staged_feedback_deadline {
+                    return Some(deadline);
+                }
+
+                let start = self.path_data(path_id).ack_progress_start?;
+                let full_deadline = start + self.pto(SpaceKind::Data, path_id);
+                if !self.config.cross_path_ack_progress_feedback_probe
+                    || !self.config.cross_path_ack_escape
+                    || !self.peer_supports_ack_frequency()
+                {
+                    return Some(full_deadline);
+                }
+
+                let alternative = self.cross_path_recovery_alternative(path_id)?;
+                let feedback_budget = self.pto(SpaceKind::Data, alternative);
+                let budget_deadline = full_deadline
+                    .checked_sub(feedback_budget)
+                    .unwrap_or(start)
+                    .max(start);
+                // A healthy primary normally returns feedback within its propagation floor plus the
+                // peer's advertised ACK delay. Waiting through that interval avoids turning every
+                // ordinary ACK epoch into a speculative duplicate, while the alternative-PTO budget
+                // still moves the probe earlier when the full recovery clock has enough room.
+                let evidence_floor = start
+                    + self.path_data(path_id).rtt.min()
+                    + self.ack_frequency.peer_max_ack_delay
+                    + TIMER_GRANULARITY;
+                Some(budget_deadline.max(evidence_floor).min(full_deadline))
+            })
+            .flatten();
 
         if let Some(deadline) = deadline {
             self.timers.set(timer, deadline, self.qlog.with_time(now));
@@ -3690,6 +4086,34 @@ impl Connection {
         if !self.paths.contains_key(&path_id) {
             return;
         }
+
+        let staged_feedback_deadline = self
+            .path_data(path_id)
+            .ack_progress_feedback_probe_full_deadline;
+        if self.config.cross_path_ack_progress_feedback_probe
+            && self.config.cross_path_ack_escape
+            && self.peer_supports_ack_frequency()
+            && staged_feedback_deadline.is_none()
+            && self.path_data(path_id).pto_recovery_probe_start.is_none()
+        {
+            let Some(start) = self.path_data(path_id).ack_progress_start else {
+                self.set_ack_progress_recovery_timer(now, path_id);
+                return;
+            };
+            let full_recovery_deadline = start + self.pto(SpaceKind::Data, path_id);
+            let stats = self.path_stats.for_path(path_id);
+            stats.ack_progress_feedback_probe_timeouts =
+                stats.ack_progress_feedback_probe_timeouts.saturating_add(1);
+
+            // Record the fixed fallback even when no frame can be queued, preventing a deadline
+            // already in the past from spinning. The full recovery attempt remains observable.
+            self.path_data_mut(path_id)
+                .ack_progress_feedback_probe_full_deadline = Some(full_recovery_deadline);
+            self.maybe_queue_ack_progress_feedback_probe(path_id, full_recovery_deadline);
+            self.set_ack_progress_recovery_timer(now, path_id);
+            return;
+        }
+
         let stats = self.path_stats.for_path(path_id);
         stats.ack_progress_recovery_timeouts =
             stats.ack_progress_recovery_timeouts.saturating_add(1);
@@ -3946,6 +4370,8 @@ impl Connection {
         debug_assert!(lost_packets.is_sorted(), "lost_packets must be sorted");
 
         self.drain_lost_packets(now, pn_space, path_id);
+        let mut newly_queued_stream_bytes = 0u64;
+        let mut newly_queued_stream_obligation = false;
 
         // OnPacketsLost
         if let Some(largest_lost) = lost_packets.last().cloned() {
@@ -3978,7 +4404,10 @@ impl Connection {
                     .remove_in_flight(&info);
 
                 for frame in info.stream_frames {
-                    self.streams.retransmit(frame);
+                    let fin = frame.fin;
+                    let bytes = self.streams.retransmit(frame);
+                    newly_queued_stream_bytes = newly_queued_stream_bytes.saturating_add(bytes);
+                    newly_queued_stream_obligation |= bytes > 0 || fin;
                 }
                 self.spaces[pn_space].pending |= info.retransmits;
                 let path = self.path_data_mut(path_id);
@@ -4024,6 +4453,14 @@ impl Connection {
             }
         }
 
+        self.maybe_arm_stream_gap_rescue(
+            pn_space,
+            path_id,
+            newly_queued_stream_obligation,
+            newly_queued_stream_bytes,
+        );
+        self.refresh_stream_gap_watch_rescue(now, pn_space, path_id);
+
         // Handle a lost MTU probe
         if let Some(packet) = lost_mtu_probe {
             let info = self.spaces[SpaceId::Data]
@@ -4038,6 +4475,170 @@ impl Connection {
             self.path_data_mut(path_id).mtud.on_probe_lost();
             self.path_stats.for_path(path_id).lost_plpmtud_probes += 1;
         }
+    }
+
+    /// Arm one paced, congestion-exempt packet when a newly detected STREAM gap would otherwise
+    /// remain behind a full congestion window on the sole usable path.
+    fn maybe_arm_stream_gap_rescue(
+        &mut self,
+        pn_space: SpaceId,
+        path_id: PathId,
+        newly_queued_stream_obligation: bool,
+        newly_queued_stream_bytes: u64,
+    ) {
+        if pn_space != SpaceId::Data || !self.paths.contains_key(&path_id) {
+            return;
+        }
+
+        let path = self.path_data(path_id);
+        let in_flight = path.in_flight.bytes;
+        let congestion_window = path.congestion.window();
+        let datagram_size = u64::from(path.mtud.current_mtu());
+        let no_other_usable_path = !self.has_cross_path_recovery_alternative(path_id);
+        let pns = self.spaces[pn_space].for_path(path_id);
+        let largest_acked = pns.largest_acked_packet_pn;
+        let last_rescue_largest_acked = pns.stream_gap_rescue_largest_acked;
+        let pending_loss_probes = pns.loss_probes;
+
+        if !should_arm_stream_gap_rescue(
+            self.config.stream_gap_rescue,
+            newly_queued_stream_obligation,
+            no_other_usable_path,
+            in_flight,
+            congestion_window,
+            datagram_size,
+            pending_loss_probes,
+            largest_acked,
+            last_rescue_largest_acked,
+        ) {
+            return;
+        }
+
+        let largest_acked = largest_acked.expect("rescue decision requires an ACK frontier");
+        let pns = self.spaces[pn_space].for_path(path_id);
+        pns.loss_probes = pns.loss_probes.saturating_add(1);
+        pns.stream_gap_rescue_largest_acked = Some(largest_acked);
+        let stats = self.path_stats.for_path(path_id);
+        stats.stream_gap_rescue_probes = stats.stream_gap_rescue_probes.saturating_add(1);
+        stats.stream_gap_rescue_bytes = stats
+            .stream_gap_rescue_bytes
+            .saturating_add(newly_queued_stream_bytes);
+        trace!(
+            %path_id,
+            largest_acked,
+            newly_queued_stream_bytes,
+            in_flight,
+            congestion_window,
+            "armed paced congestion-limited STREAM gap rescue"
+        );
+    }
+
+    /// Start or cancel a timer tied to the identity of the lowest queued STREAM retransmit.
+    /// ACKs for later packet numbers do not move an existing deadline.
+    fn refresh_stream_gap_watch_rescue(
+        &mut self,
+        now: Instant,
+        pn_space: SpaceId,
+        path_id: PathId,
+    ) {
+        let timer = Timer::PerPath(path_id, PathTimer::StreamGapWatchRescue);
+        let eligible = self.config.stream_gap_watch_rescue
+            && pn_space == SpaceId::Data
+            && self.paths.contains_key(&path_id)
+            && !self.abandoned_paths.contains(&path_id)
+            && !self.has_cross_path_recovery_alternative(path_id);
+        let Some((stream_id, offset, _)) = eligible
+            .then(|| self.streams.first_retransmit_gap())
+            .flatten()
+        else {
+            if let Some(path) = self.paths.get_mut(&path_id) {
+                path.data.stream_gap_watch = None;
+            }
+            self.timers.stop(timer, self.qlog.with_time(now));
+            return;
+        };
+
+        let gap = (stream_id, offset);
+        if self.path_data(path_id).stream_gap_watch == Some(gap) && self.timers.get(timer).is_some()
+        {
+            return;
+        }
+
+        let (congestion_blocked, guard) = {
+            let path = self.path_data(path_id);
+            (
+                path.in_flight
+                    .bytes
+                    .saturating_add(u64::from(path.mtud.current_mtu()))
+                    >= path.congestion.window(),
+                path.rtt.conservative() + self.ack_frequency.peer_max_ack_delay + TIMER_GRANULARITY,
+            )
+        };
+        if !congestion_blocked || self.spaces[pn_space].for_path(path_id).loss_probes > 0 {
+            self.path_data_mut(path_id).stream_gap_watch = None;
+            self.timers.stop(timer, self.qlog.with_time(now));
+            return;
+        }
+
+        self.path_data_mut(path_id).stream_gap_watch = Some(gap);
+        self.timers
+            .set(timer, now + guard, self.qlog.with_time(now));
+        trace!(
+            %path_id,
+            %stream_id,
+            offset,
+            ?guard,
+            "watching stable STREAM retransmit gap"
+        );
+    }
+
+    fn on_stream_gap_watch_rescue_timeout(&mut self, now: Instant, path_id: PathId) {
+        if !self.config.stream_gap_watch_rescue
+            || !self.paths.contains_key(&path_id)
+            || self.abandoned_paths.contains(&path_id)
+        {
+            return;
+        }
+        let Some(watched_gap) = self.path_data(path_id).stream_gap_watch else {
+            return;
+        };
+        let Some((stream_id, offset, retransmit_bytes)) = self.streams.first_retransmit_gap()
+        else {
+            self.path_data_mut(path_id).stream_gap_watch = None;
+            return;
+        };
+        if (stream_id, offset) != watched_gap {
+            self.path_data_mut(path_id).stream_gap_watch = None;
+            self.refresh_stream_gap_watch_rescue(now, SpaceId::Data, path_id);
+            return;
+        }
+
+        let path = self.path_data(path_id);
+        let datagram_size = u64::from(path.mtud.current_mtu());
+        let congestion_blocked =
+            path.in_flight.bytes.saturating_add(datagram_size) >= path.congestion.window();
+        if !congestion_blocked
+            || self.has_cross_path_recovery_alternative(path_id)
+            || self.spaces[SpaceId::Data].for_path(path_id).loss_probes > 0
+        {
+            self.path_data_mut(path_id).stream_gap_watch = None;
+            return;
+        }
+
+        self.spaces[SpaceId::Data].for_path(path_id).loss_probes = 1;
+        self.path_data_mut(path_id).stream_gap_watch = None;
+        let stats = self.path_stats.for_path(path_id);
+        stats.stream_gap_rescue_probes = stats.stream_gap_rescue_probes.saturating_add(1);
+        stats.stream_gap_rescue_bytes = stats
+            .stream_gap_rescue_bytes
+            .saturating_add(retransmit_bytes.min(datagram_size));
+        trace!(
+            %path_id,
+            %stream_id,
+            offset,
+            retransmit_bytes,
+            "armed delayed STREAM gap rescue probe"
+        );
     }
 
     /// Returns the earliest time packets should be declared lost for all spaces on a path.
@@ -5374,12 +5975,12 @@ impl Connection {
                     self.read_crypto(packet.header.space().into(), &frame, payload_len)?;
                 }
                 Frame::Ack(ack) => {
-                    self.on_ack_received(now, packet.header.space().into(), ack)?;
+                    self.on_ack_received(now, packet.header.space().into(), path_id, ack)?;
                 }
                 Frame::PathAck(ack) => {
                     span.as_ref()
                         .map(|span| span.record("path", tracing::field::display(&ack.path_id)));
-                    self.on_path_ack_received(now, packet.header.space().into(), ack)?;
+                    self.on_path_ack_received(now, packet.header.space().into(), path_id, ack)?;
                 }
                 Frame::Close(reason) => {
                     self.state.move_to_draining(Some(reason.into()));
@@ -5498,7 +6099,7 @@ impl Connection {
                     }
                 }
                 Frame::Ack(ack) => {
-                    self.on_ack_received(now, SpaceId::Data, ack)?;
+                    self.on_ack_received(now, SpaceId::Data, path_id, ack)?;
                 }
                 Frame::PathAck(ack) => {
                     if !self.is_multipath_negotiated() {
@@ -5507,7 +6108,7 @@ impl Connection {
                         ));
                     }
                     span.record("path", tracing::field::display(&ack.path_id));
-                    self.on_path_ack_received(now, SpaceId::Data, ack)?;
+                    self.on_path_ack_received(now, SpaceId::Data, path_id, ack)?;
                 }
                 Frame::Padding | Frame::Ping => {}
                 Frame::Close(reason) => {
@@ -8330,6 +8931,26 @@ impl SentFrames {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn should_arm_stream_gap_rescue(
+    enabled: bool,
+    newly_queued_stream_obligation: bool,
+    no_other_usable_path: bool,
+    in_flight: u64,
+    congestion_window: u64,
+    datagram_size: u64,
+    pending_loss_probes: u32,
+    largest_acked: Option<u64>,
+    last_rescue_largest_acked: Option<u64>,
+) -> bool {
+    enabled
+        && newly_queued_stream_obligation
+        && no_other_usable_path
+        && pending_loss_probes == 0
+        && in_flight.saturating_add(datagram_size) >= congestion_window
+        && largest_acked.is_some_and(|frontier| Some(frontier) != last_rescue_largest_acked)
+}
+
 /// Compute the negotiated idle timeout based on local and remote max_idle_timeout transport parameters.
 ///
 /// According to the definition of max_idle_timeout, a value of `0` means the timeout is disabled; see <https://www.rfc-editor.org/rfc/rfc9000#section-18.2-4.4.1.>
@@ -8406,5 +9027,57 @@ mod tests {
         assert!(t.contains(&PathId(2)));
         assert!(t.contains(&PathId(3)));
         assert_eq!(t.max(), Some(PathId(3)));
+    }
+
+    #[test]
+    fn stream_gap_rescue_is_bounded_to_one_cwnd_blocked_probe_per_ack_frontier() {
+        let eligible =
+            should_arm_stream_gap_rescue(true, true, true, 8_712, 8_244, 1_452, 0, Some(100), None);
+        assert!(eligible);
+
+        assert!(!should_arm_stream_gap_rescue(
+            true,
+            true,
+            true,
+            8_712,
+            8_244,
+            1_452,
+            0,
+            Some(100),
+            Some(100),
+        ));
+        assert!(!should_arm_stream_gap_rescue(
+            true,
+            true,
+            true,
+            8_712,
+            8_244,
+            1_452,
+            1,
+            Some(101),
+            Some(100),
+        ));
+        assert!(!should_arm_stream_gap_rescue(
+            true,
+            true,
+            false,
+            8_712,
+            8_244,
+            1_452,
+            0,
+            Some(101),
+            Some(100),
+        ));
+        assert!(!should_arm_stream_gap_rescue(
+            true,
+            true,
+            true,
+            4_000,
+            8_244,
+            1_452,
+            0,
+            Some(101),
+            Some(100),
+        ));
     }
 }

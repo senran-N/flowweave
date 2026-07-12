@@ -13,7 +13,10 @@ use super::{
 };
 use crate::{
     Dir, MAX_STREAM_COUNT, Side, StreamId, TransportError, VarInt,
-    connection::{PacketBuilder, stats::{FrameStats, StreamStats}},
+    connection::{
+        PacketBuilder,
+        stats::{FlowControlStats, FrameStats, StreamStats},
+    },
     frame::{self, FrameStruct},
     transport_parameters::TransportParameters,
 };
@@ -189,6 +192,19 @@ impl StreamsState {
         self.unacked_data
     }
 
+    pub(crate) fn flow_control_stats(&self) -> FlowControlStats {
+        FlowControlStats {
+            send_max_data: self.max_data,
+            send_data: self.data_sent,
+            send_blocked: self.data_sent == self.max_data,
+            receive_max_data: self.local_max_data,
+            receive_sent_max_data: self.sent_max_data.into_inner(),
+            receive_data: self.data_recvd,
+            receive_max_data_pending: false,
+            receive_max_data_in_flight_packets: 0,
+        }
+    }
+
     pub(crate) fn stream_stats(&self) -> Vec<StreamStats> {
         let mut ids = self
             .send
@@ -209,19 +225,39 @@ impl StreamsState {
                     .and_then(StreamRecv::as_open_recv);
                 StreamStats {
                     id,
-                    send_fully_acked_offset: send
-                        .map(|stream| stream.pending.fully_acked_offset()),
+                    send_fully_acked_offset: send.map(|stream| stream.pending.fully_acked_offset()),
                     send_unacknowledged_bytes: send.map(|stream| stream.pending.unacked()),
                     send_lowest_retransmit_offset: send
                         .and_then(|stream| stream.pending.lowest_retransmit_offset()),
-                    send_retransmit_bytes: send
-                        .map(|stream| stream.pending.retransmit_bytes()),
-                    receive_contiguous_offset: receive
-                        .map(|stream| stream.assembler.bytes_read()),
+                    send_retransmit_bytes: send.map(|stream| stream.pending.retransmit_bytes()),
+                    send_offset: send.map(|stream| stream.offset()),
+                    send_max_data: send.map(|stream| stream.max_data),
+                    send_flow_control_blocked: send
+                        .map(|stream| stream.is_writable() && stream.offset() == stream.max_data),
+                    send_connection_blocked: send.map(|stream| stream.connection_blocked),
+                    receive_contiguous_offset: receive.map(|stream| stream.assembler.bytes_read()),
                     receive_highest_offset: receive.map(|stream| stream.end),
+                    receive_sent_max_stream_data: receive
+                        .map(|stream| stream.sent_max_stream_data()),
+                    receive_current_max_stream_data: receive
+                        .map(|stream| stream.current_max_stream_data(self.stream_receive_window)),
+                    receive_max_stream_data_pending: false,
+                    receive_max_stream_data_in_flight_packets: 0,
                 }
             })
             .collect()
+    }
+
+    /// Deterministic identity of the first STREAM retransmission gap still waiting to be sent.
+    pub(crate) fn first_retransmit_gap(&self) -> Option<(StreamId, u64, u64)> {
+        self.send
+            .iter()
+            .filter_map(|(&id, send)| {
+                let stream = send.as_deref()?;
+                let offset = stream.pending.lowest_retransmit_offset()?;
+                Some((id, offset, stream.pending.retransmit_bytes()))
+            })
+            .min_by_key(|(id, offset, _)| (u64::from(*id), *offset))
     }
 
     pub(crate) fn set_params(&mut self, params: &TransportParameters) {

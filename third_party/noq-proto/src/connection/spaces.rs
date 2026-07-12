@@ -294,6 +294,8 @@ pub(super) struct PacketNumberSpace {
     pub(super) loss_time: Option<Instant>,
     /// Number of tail loss probes to send
     pub(super) loss_probes: u32,
+    /// Largest ACK frontier for which a congestion-limited STREAM gap rescue was armed.
+    pub(super) stream_gap_rescue_largest_acked: Option<u64>,
 
     /// Packet numbers to skip, only used in the data package space.
     pn_filter: Option<PacketNumberFilter>,
@@ -325,6 +327,7 @@ impl PacketNumberSpace {
             time_of_last_ack_eliciting_packet: None,
             loss_time: None,
             loss_probes: 0,
+            stream_gap_rescue_largest_acked: None,
             pn_filter,
         }
     }
@@ -355,6 +358,7 @@ impl PacketNumberSpace {
             time_of_last_ack_eliciting_packet: None,
             loss_time: None,
             loss_probes: 0,
+            stream_gap_rescue_largest_acked: None,
             pn_filter,
         }
     }
