@@ -17,6 +17,9 @@ const LONG_CHUNK_SIZE: usize = 512 * KIB;
 const FORMAL_FAILOVER_DURATION: Duration = Duration::from_secs(30);
 const FORMAL_FAILOVER_AT: Duration = Duration::from_secs(10);
 const FORMAL_FAILOVER_CHUNK_SIZE: usize = 16 * KIB;
+const FORMAL_FAILOVER_CANDIDATE: PtoRecovery = PtoRecovery::CrossPathRecoveryWithFeedbackHandoff;
+const FORMAL_FAILOVER_PARTICIPANTS: [PtoRecovery; 2] =
+    [PtoRecovery::Disabled, FORMAL_FAILOVER_CANDIDATE];
 
 #[derive(Clone, Copy)]
 struct LinkProfile {
@@ -412,17 +415,17 @@ async fn failover_five_seed_screening_lab() -> LabResult<()> {
 async fn failover_formal_bidirectional_lab() -> LabResult<()> {
     ensure_isolated_network_namespace()?;
 
-    const RESULT_PATH: &str = "benchmark-results/2026-07-12-pto-hedge-formal-a-v2.csv";
+    const RESULT_PATH: &str = "benchmark-results/2026-07-12-feedback-handoff-formal-a.csv";
     let normal_line_one = LinkProfile::new("20ms", "0.1%", "20mbit");
     let normal_line_two = LinkProfile::new("80ms", "1%", "20mbit");
 
     println!();
-    println!("FlowWeave / 织流：正式 A 组双向持续换网实验");
+    println!("FlowWeave / 织流：关键反馈路径交接正式 A 组双向持续换网实验");
     println!("每场在同一条 QUIC 业务流上持续发送 30 秒，第 10 秒把主路改为 100% 丢包。");
     println!("接收端逐条校验序号和内容，并以故障后的最大相邻到达间隔衡量断流。");
 
     let mut observations = Vec::with_capacity(
-        FailoverDirection::ALL.len() * SEED_PAIRS.len() * PtoRecovery::CANDIDATES.len(),
+        FailoverDirection::ALL.len() * SEED_PAIRS.len() * FORMAL_FAILOVER_PARTICIPANTS.len(),
     );
     write_formal_failover_csv(RESULT_PATH, &observations)?;
 
@@ -431,7 +434,10 @@ async fn failover_formal_bidirectional_lab() -> LabResult<()> {
         println!("传输方向：{}", direction.description());
         for (round_index, seeds) in SEED_PAIRS.iter().copied().enumerate() {
             let round = round_index + 1;
-            let order = recovery_screening_order(round_index + direction_index);
+            let mut order = FORMAL_FAILOVER_PARTICIPANTS.to_vec();
+            if (round_index + direction_index) % 2 == 1 {
+                order.reverse();
+            }
             println!();
             println!(
                 "第 {round} 轮：线路一种子 {}，线路二种子 {}；顺序 {}",
@@ -1278,7 +1284,7 @@ fn print_formal_failover_summary(observations: &[FormalFailoverObservation]) {
             .iter()
             .filter(|observation| {
                 observation.direction == direction
-                    && observation.pto_recovery == PtoRecovery::CrossPathHedge
+                    && observation.pto_recovery == FORMAL_FAILOVER_CANDIDATE
             })
             .collect();
         let intact = candidates
