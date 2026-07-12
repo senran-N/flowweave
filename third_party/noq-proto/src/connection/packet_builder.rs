@@ -280,6 +280,7 @@ impl<'a, 'b> PacketBuilder<'a, 'b> {
         let packet_number = self.packet_number;
         let space_id = self.space;
         let (size, padded, sent) = self.finish(conn, now);
+        let contains_stream = !sent.stream_frames.is_empty();
 
         let size = match padded || ack_eliciting {
             true => size as u16,
@@ -317,6 +318,13 @@ impl<'a, 'b> PacketBuilder<'a, 'b> {
                     .on_packet_sent(now, size, packet_number)
             }
             conn.set_loss_detection_timer(now, path_id);
+            conn.on_ack_progress_packet_sent(
+                now,
+                path_id,
+                space_id,
+                ack_eliciting,
+                contains_stream,
+            );
             conn.path_data_mut(path_id).pacing.on_transmit(size);
         }
     }

@@ -121,6 +121,7 @@ use state::StateType;
 enum StreamReinjectionTrigger {
     Pto,
     PathAbandon,
+    AckProgress,
 }
 
 /// Protocol state and logic for a single QUIC connection
@@ -685,6 +686,7 @@ impl Connection {
         // Retain the packet-number space for the normal 3-PTO drain period, but do not make
         // application data wait for final path-state deletion before it can use another path.
         self.maybe_reinject_stream_data_on_path_abandon(path_id);
+        self.path_data_mut(path_id).ack_progress_start = None;
 
         let pending_space = &mut self.spaces[SpaceId::Data].pending;
         // Send PATH_ABANDON
@@ -744,6 +746,9 @@ impl Connection {
                 // This timer should not be set, for completeness it's not kept as it's set when
                 // the PATH_ABANDON frame is sent.
                 PathTimer::PathDrained => false,
+                // ACK-progress recovery is only meaningful while the path can still send a
+                // liveness probe and later return to normal scheduling.
+                PathTimer::AckProgressRecovery => false,
                 // Sent packets still need to be identified as lost to trigger timely
                 // retransmission.
                 PathTimer::LossDetection => true,
@@ -2631,6 +2636,9 @@ impl Connection {
                             }
                             self.discard_path(path_id, now);
                         }
+                        PathTimer::AckProgressRecovery => {
+                            self.on_ack_progress_recovery_timeout(now, path_id);
+                        }
                     }
                 }
             }
@@ -2729,6 +2737,10 @@ impl Connection {
             .timers
             .get(Timer::PerPath(path_id, PathTimer::LossDetection))
             .is_some();
+        let ack_progress_recovery_timer_armed = self
+            .timers
+            .get(Timer::PerPath(path_id, PathTimer::AckProgressRecovery))
+            .is_some();
         let stats = self.path_stats.for_path(path_id);
         stats.rtt = rtt;
         stats.pto = pto;
@@ -2740,6 +2752,7 @@ impl Connection {
         stats.latest_ack_eliciting_packet_number = latest_packet_number;
         stats.pto_count = pto_count;
         stats.loss_detection_timer_armed = loss_detection_timer_armed;
+        stats.ack_progress_recovery_timer_armed = ack_progress_recovery_timer_armed;
         stats.current_mtu = current_mtu;
         Some(*stats)
     }
@@ -3049,8 +3062,10 @@ impl Connection {
         let recovery_probe_start = (space == SpaceId::Data)
             .then(|| self.path_data(path).pto_recovery_probe_start)
             .flatten();
+        let current_path_generation = self.path_data(path).generation();
         let mut recovery_probe_acked = false;
         let mut ack_eliciting_acked = false;
+        let mut ack_progress_made = false;
         for packet in newly_acked.elts() {
             recovery_probe_acked |= recovery_probe_start.is_some_and(|start| packet >= start);
             if let Some(info) = self.spaces[space].for_path(path).take(packet) {
@@ -3065,6 +3080,8 @@ impl Connection {
                     }
                 }
                 ack_eliciting_acked |= info.ack_eliciting;
+                ack_progress_made |=
+                    info.ack_eliciting && info.path_generation == current_path_generation;
 
                 // Notify MTU discovery that a packet was acked, because it might be an MTU probe
                 let path_data = self.path_data_mut(path);
@@ -3161,6 +3178,7 @@ impl Connection {
             }
         }
 
+        self.update_ack_progress_recovery_after_ack(now, space, path, ack_progress_made);
         self.set_loss_detection_timer(now, path);
         Ok(())
     }
@@ -3288,6 +3306,17 @@ impl Connection {
         );
     }
 
+    /// Whether another path can safely carry a cross-path recovery copy.
+    fn has_cross_path_recovery_alternative(&self, path_id: PathId) -> bool {
+        self.paths.iter().any(|(other_path_id, path)| {
+            *other_path_id != path_id
+                && self.remote_cids.contains_key(other_path_id)
+                && !self.abandoned_paths.contains(other_path_id)
+                && path.data.validated
+                && path.data.pto_recovery_probe_start.is_none()
+        })
+    }
+
     /// Queue outstanding STREAM data from one path for another validated path.
     ///
     /// Returns whether a reinjection episode was started. This is deliberately limited to one
@@ -3302,6 +3331,9 @@ impl Connection {
         let enabled = match trigger {
             StreamReinjectionTrigger::Pto => self.config.cross_path_pto_reinjection,
             StreamReinjectionTrigger::PathAbandon => self.config.cross_path_abandon_reinjection,
+            StreamReinjectionTrigger::AckProgress => {
+                self.config.cross_path_ack_progress_reinjection
+            }
         };
         if !enabled
             || space != SpaceId::Data
@@ -3310,14 +3342,7 @@ impl Connection {
             return false;
         }
 
-        let have_alternative = self.paths.iter().any(|(other_path_id, path)| {
-            *other_path_id != path_id
-                && self.remote_cids.contains_key(other_path_id)
-                && !self.abandoned_paths.contains(other_path_id)
-                && path.data.validated
-                && path.data.pto_recovery_probe_start.is_none()
-        });
-        if !have_alternative {
+        if !self.has_cross_path_recovery_alternative(path_id) {
             return false;
         }
 
@@ -3343,6 +3368,11 @@ impl Connection {
                 stats.path_abandon_recovery_attempts =
                     stats.path_abandon_recovery_attempts.saturating_add(1);
             }
+            StreamReinjectionTrigger::AckProgress => {
+                let stats = self.path_stats.for_path(path_id);
+                stats.ack_progress_recovery_attempts =
+                    stats.ack_progress_recovery_attempts.saturating_add(1);
+            }
         }
         if stream_frames.is_empty() {
             let stats = self.path_stats.for_path(path_id);
@@ -3354,6 +3384,10 @@ impl Connection {
                 StreamReinjectionTrigger::PathAbandon => {
                     stats.path_abandon_recovery_empty_attempts =
                         stats.path_abandon_recovery_empty_attempts.saturating_add(1);
+                }
+                StreamReinjectionTrigger::AckProgress => {
+                    stats.ack_progress_recovery_empty_attempts =
+                        stats.ack_progress_recovery_empty_attempts.saturating_add(1);
                 }
             }
             return false;
@@ -3376,6 +3410,12 @@ impl Connection {
                 stats.path_abandon_reinjections = stats.path_abandon_reinjections.saturating_add(1);
                 stats.path_abandon_reinjected_bytes = stats
                     .path_abandon_reinjected_bytes
+                    .saturating_add(newly_queued_bytes);
+            }
+            StreamReinjectionTrigger::AckProgress => {
+                stats.ack_progress_reinjections = stats.ack_progress_reinjections.saturating_add(1);
+                stats.ack_progress_reinjected_bytes = stats
+                    .ack_progress_reinjected_bytes
                     .saturating_add(newly_queued_bytes);
             }
         }
@@ -3401,6 +3441,123 @@ impl Connection {
         )
     }
 
+    fn maybe_reinject_stream_data_on_ack_progress(&mut self, path_id: PathId) -> bool {
+        self.maybe_reinject_stream_data(
+            path_id,
+            SpaceId::Data,
+            StreamReinjectionTrigger::AckProgress,
+        )
+    }
+
+    /// Record an ack-eliciting application-data transmission without moving an existing
+    /// ACK-progress deadline.
+    fn on_ack_progress_packet_sent(
+        &mut self,
+        now: Instant,
+        path_id: PathId,
+        space: SpaceId,
+        ack_eliciting: bool,
+        contains_stream: bool,
+    ) {
+        if !self.config.cross_path_ack_progress_reinjection
+            || space != SpaceId::Data
+            || !ack_eliciting
+            || !contains_stream
+        {
+            return;
+        }
+
+        if self.path_data(path_id).ack_progress_start.is_none() {
+            self.path_data_mut(path_id).ack_progress_start = Some(now);
+        }
+
+        // The timer can only produce useful work once STREAM data is retained. If it is already
+        // armed, later STREAM packets must not move its deadline.
+        let timer = Timer::PerPath(path_id, PathTimer::AckProgressRecovery);
+        if contains_stream && self.timers.get(timer).is_none() {
+            self.set_ack_progress_recovery_timer(now, path_id);
+        }
+    }
+
+    /// Update the ACK-progress epoch after processing all newly acknowledged and newly lost
+    /// packets from one ACK frame.
+    fn update_ack_progress_recovery_after_ack(
+        &mut self,
+        now: Instant,
+        space: SpaceId,
+        path_id: PathId,
+        ack_progress_made: bool,
+    ) {
+        if !self.config.cross_path_ack_progress_reinjection || space != SpaceId::Data {
+            return;
+        }
+
+        if self.path_data(path_id).stream_frames_in_flight == 0 {
+            self.path_data_mut(path_id).ack_progress_start = None;
+        } else if ack_progress_made {
+            self.path_data_mut(path_id).ack_progress_start = Some(now);
+        }
+        self.set_ack_progress_recovery_timer(now, path_id);
+    }
+
+    /// Re-evaluate the independent recovery timer after ordinary time-threshold loss detection.
+    fn update_ack_progress_recovery_after_loss(&mut self, now: Instant, path_id: PathId) {
+        if !self.config.cross_path_ack_progress_reinjection {
+            return;
+        }
+
+        if self.path_data(path_id).stream_frames_in_flight == 0 {
+            self.path_data_mut(path_id).ack_progress_start = None;
+        }
+        self.set_ack_progress_recovery_timer(now, path_id);
+    }
+
+    /// Arm or stop the recovery timer from the current ACK-progress epoch.
+    fn set_ack_progress_recovery_timer(&mut self, now: Instant, path_id: PathId) {
+        let timer = Timer::PerPath(path_id, PathTimer::AckProgressRecovery);
+        let eligible = self.config.cross_path_ack_progress_reinjection
+            && !self.state.is_closed()
+            && self.is_handshake_confirmed()
+            && self.paths.contains_key(&path_id)
+            && !self.abandoned_paths.contains(&path_id)
+            && self.path_data(path_id).pto_recovery_probe_start.is_none()
+            && self.has_cross_path_recovery_alternative(path_id)
+            && self.path_data(path_id).stream_frames_in_flight > 0;
+
+        let deadline = eligible
+            .then(|| self.path_data(path_id).ack_progress_start)
+            .flatten()
+            .map(|start| start + self.pto(SpaceKind::Data, path_id));
+
+        if let Some(deadline) = deadline {
+            self.timers.set(timer, deadline, self.qlog.with_time(now));
+        } else {
+            self.timers.stop(timer, self.qlog.with_time(now));
+        }
+    }
+
+    /// Trigger one bounded cross-path recovery episode without changing standard QUIC loss or
+    /// peer-visible path state.
+    fn on_ack_progress_recovery_timeout(&mut self, now: Instant, path_id: PathId) {
+        if !self.paths.contains_key(&path_id) {
+            return;
+        }
+        let stats = self.path_stats.for_path(path_id);
+        stats.ack_progress_recovery_timeouts =
+            stats.ack_progress_recovery_timeouts.saturating_add(1);
+
+        if self.maybe_reinject_stream_data_on_ack_progress(path_id) {
+            let request_immediate_ack = self.peer_supports_ack_frequency();
+            let path_space = self.spaces[SpaceId::Data].for_path(path_id);
+            path_space.pending_ping = true;
+            path_space.pending_immediate_ack |= request_immediate_ack;
+        }
+
+        // A successful reinjection set the recovery-probe boundary, while an unsuccessful one
+        // should not spin on a deadline that is already in the past.
+        self.set_ack_progress_recovery_timer(now, path_id);
+    }
+
     /// Handle a [`PathTimer::LossDetection`] timeout.
     ///
     /// This timer expires for two reasons:
@@ -3419,6 +3576,7 @@ impl Connection {
             let stats = self.path_stats.for_path(path_id);
             stats.loss_detection_timeouts = stats.loss_detection_timeouts.saturating_add(1);
             self.detect_lost_packets(now, pn_space, path_id, false);
+            self.update_ack_progress_recovery_after_loss(now, path_id);
             self.set_loss_detection_timer(now, path_id);
             return;
         }
@@ -3452,6 +3610,7 @@ impl Connection {
         self.maybe_reinject_stream_data_on_pto(path_id, space);
         let path_data = self.path_data_mut(path_id);
         path_data.pto_count = path_data.pto_count.saturating_add(1);
+        self.update_ack_progress_recovery_after_loss(now, path_id);
         self.set_loss_detection_timer(now, path_id);
     }
 
@@ -7068,6 +7227,12 @@ impl Connection {
         path.congestion
             .window()
             .saturating_sub(path.in_flight.bytes)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn ack_progress_recovery_deadline(&self, path_id: PathId) -> Option<Instant> {
+        self.timers
+            .get(Timer::PerPath(path_id, PathTimer::AckProgressRecovery))
     }
 
     /// Whether no timers but keepalive, idle, rtt, pushnewcid, and key discard are running

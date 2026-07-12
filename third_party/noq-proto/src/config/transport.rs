@@ -65,6 +65,7 @@ pub struct TransportConfig {
 
     pub(crate) cross_path_pto_reinjection: bool,
     pub(crate) cross_path_abandon_reinjection: bool,
+    pub(crate) cross_path_ack_progress_reinjection: bool,
 
     pub(crate) default_path_max_idle_timeout: Option<Duration>,
     pub(crate) default_path_keep_alive_interval: Option<Duration>,
@@ -427,6 +428,20 @@ impl TransportConfig {
         self
     }
 
+    /// Whether a multipath path with outstanding STREAM data may start one cross-path recovery
+    /// episode after a full PTO interval without any newly acknowledged ack-eliciting packet.
+    ///
+    /// Unlike the standard QUIC PTO timer, the recovery deadline is anchored to the start of the
+    /// current ACK-progress epoch and is not postponed by sending more packets. Standard loss
+    /// detection and final path abandonment are unchanged. Reinjected data remains subject to the
+    /// destination path's congestion window and pacing.
+    ///
+    /// Disabled by default.
+    pub fn cross_path_ack_progress_reinjection(&mut self, enabled: bool) -> &mut Self {
+        self.cross_path_ack_progress_reinjection = enabled;
+        self
+    }
+
     /// Sets a default per-path maximum idle timeout
     ///
     /// If the path is idle for this long the path will be abandoned. Bear in mind this will
@@ -617,6 +632,7 @@ impl Default for TransportConfig {
             max_concurrent_multipath_paths: None,
             cross_path_pto_reinjection: false,
             cross_path_abandon_reinjection: false,
+            cross_path_ack_progress_reinjection: false,
             default_path_max_idle_timeout: None,
             default_path_keep_alive_interval: None,
 
@@ -663,6 +679,7 @@ impl fmt::Debug for TransportConfig {
             max_concurrent_multipath_paths,
             cross_path_pto_reinjection,
             cross_path_abandon_reinjection,
+            cross_path_ack_progress_reinjection,
             default_path_max_idle_timeout,
             default_path_keep_alive_interval,
             max_remote_nat_traversal_addresses,
@@ -711,6 +728,10 @@ impl fmt::Debug for TransportConfig {
             .field(
                 "cross_path_abandon_reinjection",
                 cross_path_abandon_reinjection,
+            )
+            .field(
+                "cross_path_ack_progress_reinjection",
+                cross_path_ack_progress_reinjection,
             )
             .field(
                 "default_path_max_idle_timeout",

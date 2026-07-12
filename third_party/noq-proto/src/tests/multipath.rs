@@ -51,6 +51,14 @@ fn recovery_pair(
     pto_reinjection: bool,
     abandon_reinjection: bool,
 ) -> TestResult<(ConnPair, PathId)> {
+    recovery_pair_with_ack_progress(pto_reinjection, abandon_reinjection, false)
+}
+
+fn recovery_pair_with_ack_progress(
+    pto_reinjection: bool,
+    abandon_reinjection: bool,
+    ack_progress_reinjection: bool,
+) -> TestResult<(ConnPair, PathId)> {
     let first_client_addr = Pair::CLIENT_ADDR;
     let first_server_addr = Pair::SERVER_ADDR;
     let second_client_addr = with_port_offset(first_client_addr, 1);
@@ -68,11 +76,13 @@ fn recovery_pair(
         .client_transport_cfg
         .cross_path_pto_reinjection(pto_reinjection)
         .cross_path_abandon_reinjection(abandon_reinjection)
+        .cross_path_ack_progress_reinjection(ack_progress_reinjection)
         .default_path_max_idle_timeout(Some(Duration::from_secs(60)));
     builder
         .server_transport_cfg
         .cross_path_pto_reinjection(pto_reinjection)
         .cross_path_abandon_reinjection(abandon_reinjection)
+        .cross_path_ack_progress_reinjection(ack_progress_reinjection)
         .default_path_max_idle_timeout(Some(Duration::from_secs(60)));
     let mut pair = builder.connect();
 
@@ -98,6 +108,10 @@ fn pto_hedge_pair(enabled: bool) -> TestResult<(ConnPair, PathId)> {
 
 fn abandon_recovery_pair(enabled: bool) -> TestResult<(ConnPair, PathId)> {
     recovery_pair(false, enabled)
+}
+
+fn ack_progress_recovery_pair(enabled: bool) -> TestResult<(ConnPair, PathId)> {
+    recovery_pair_with_ack_progress(false, false, enabled)
 }
 
 fn blackhole_primary_path(pair: &mut ConnPair) -> (SocketAddr, SocketAddr) {
@@ -136,6 +150,21 @@ fn advance_client_until_hedge(pair: &mut ConnPair, path: PathId) {
         advance_client_to_next_wakeup(pair);
     }
     panic!("PTO hedge did not fire within the deterministic step budget");
+}
+
+fn advance_client_until_ack_progress_reinjection(pair: &mut ConnPair, path: PathId) {
+    for _ in 0..32 {
+        if pair
+            .path_stats(Client, path)
+            .unwrap()
+            .ack_progress_reinjections
+            > 0
+        {
+            return;
+        }
+        advance_client_to_next_wakeup(pair);
+    }
+    panic!("ACK-progress reinjection did not fire within the deterministic step budget");
 }
 
 fn advance_client_until_probe(
@@ -299,6 +328,224 @@ fn cross_path_pto_reinjection_is_disabled_by_default() -> TestResult {
         backup_after.frame_tx.stream_retransmit_bytes,
         backup_before.frame_tx.stream_retransmit_bytes
     );
+    Ok(())
+}
+
+#[test]
+fn cross_path_ack_progress_reinjection_is_disabled_by_default() -> TestResult {
+    let _guard = subscribe();
+    let (mut pair, backup) = ack_progress_recovery_pair(false)?;
+    let backup_before = pair.path_stats(Client, backup).unwrap();
+
+    let stream = pair.streams(Client).open(Dir::Uni).unwrap();
+    write_stream_data(&mut pair, stream, b"ACK progress default off");
+    pair.send_stream(Client, stream).finish()?;
+    blackhole_primary_path(&mut pair);
+    pair.drive_client();
+
+    assert!(
+        pair.conn(Client)
+            .ack_progress_recovery_deadline(PathId::ZERO)
+            .is_none()
+    );
+    let primary = pair.path_stats(Client, PathId::ZERO).unwrap();
+    let backup_after = pair.path_stats(Client, backup).unwrap();
+    assert!(!primary.ack_progress_recovery_timer_armed);
+    assert_eq!(primary.ack_progress_recovery_timeouts, 0);
+    assert_eq!(primary.ack_progress_reinjections, 0);
+    assert_eq!(
+        backup_after.frame_tx.stream_retransmit_bytes,
+        backup_before.frame_tx.stream_retransmit_bytes
+    );
+    Ok(())
+}
+
+#[test]
+fn ack_progress_recovery_requires_an_alternative_path() -> TestResult {
+    let _guard = subscribe();
+    let mut builder = ConnPair::builder()
+        .enable_multipath()
+        .disable_mtud_discovery();
+    builder
+        .client_transport_cfg
+        .cross_path_ack_progress_reinjection(true)
+        .default_path_max_idle_timeout(Some(Duration::from_secs(60)));
+    let mut pair = builder.connect();
+
+    let stream = pair.streams(Client).open(Dir::Uni).unwrap();
+    write_stream_data(&mut pair, stream, b"single path");
+    pair.drive_client();
+    pair.server.inbound.clear();
+
+    let primary = pair.path_stats(Client, PathId::ZERO).unwrap();
+    assert!(!primary.ack_progress_recovery_timer_armed);
+    assert!(
+        pair.conn(Client)
+            .ack_progress_recovery_deadline(PathId::ZERO)
+            .is_none()
+    );
+    assert_eq!(primary.ack_progress_recovery_timeouts, 0);
+    assert_eq!(primary.ack_progress_reinjections, 0);
+    Ok(())
+}
+
+#[test]
+fn first_unacknowledged_stream_packet_arms_ack_progress_timer() -> TestResult {
+    let _guard = subscribe();
+    let (mut pair, _backup) = ack_progress_recovery_pair(true)?;
+    let sent_at = pair.time;
+
+    let stream = pair.streams(Client).open(Dir::Uni).unwrap();
+    write_stream_data(&mut pair, stream, b"start ACK progress epoch");
+    blackhole_primary_path(&mut pair);
+    pair.drive_client();
+
+    let primary = pair.path_stats(Client, PathId::ZERO).unwrap();
+    let deadline = pair
+        .conn(Client)
+        .ack_progress_recovery_deadline(PathId::ZERO)
+        .expect("the first unacknowledged STREAM packet should arm recovery");
+    assert!(primary.ack_progress_recovery_timer_armed);
+    assert_eq!(deadline, sent_at + primary.pto);
+    Ok(())
+}
+
+#[test]
+fn later_sends_do_not_postpone_ack_progress_recovery() -> TestResult {
+    let _guard = subscribe();
+    let (mut pair, backup) = ack_progress_recovery_pair(true)?;
+    let backup_before = pair.path_stats(Client, backup).unwrap();
+
+    let first = pair.streams(Client).open(Dir::Uni).unwrap();
+    write_stream_data(&mut pair, first, b"first blocked range");
+    blackhole_primary_path(&mut pair);
+    pair.drive_client();
+
+    let first_deadline = pair
+        .conn(Client)
+        .ack_progress_recovery_deadline(PathId::ZERO)
+        .unwrap();
+    let pto = pair.path_stats(Client, PathId::ZERO).unwrap().pto;
+    pair.time += pto / 2;
+
+    let second = pair.streams(Client).open(Dir::Uni).unwrap();
+    write_stream_data(&mut pair, second, b"later send must not slide deadline");
+    pair.drive_client();
+    let deadline_after_later_send = pair
+        .conn(Client)
+        .ack_progress_recovery_deadline(PathId::ZERO)
+        .unwrap();
+    assert_eq!(deadline_after_later_send, first_deadline);
+
+    pair.time = first_deadline;
+    pair.drive_client();
+
+    let primary = pair.path_stats(Client, PathId::ZERO).unwrap();
+    let backup_after = pair.path_stats(Client, backup).unwrap();
+    assert_eq!(primary.pto_timeouts, 0);
+    assert_eq!(primary.ack_progress_recovery_timeouts, 1);
+    assert_eq!(primary.ack_progress_recovery_attempts, 1);
+    assert_eq!(primary.ack_progress_recovery_empty_attempts, 0);
+    assert_eq!(primary.ack_progress_reinjections, 1);
+    assert!(primary.ack_progress_reinjected_bytes > 0);
+    assert!(
+        backup_after.frame_tx.stream_retransmit_bytes
+            > backup_before.frame_tx.stream_retransmit_bytes
+    );
+    Ok(())
+}
+
+#[test]
+fn new_ack_progress_resets_the_recovery_deadline() -> TestResult {
+    let _guard = subscribe();
+    let (mut pair, _backup) = ack_progress_recovery_pair(true)?;
+
+    let first = pair.streams(Client).open(Dir::Uni).unwrap();
+    write_stream_data(&mut pair, first, b"ack this packet");
+    pair.drive_client();
+    let first_packets = pair.server.inbound.drain(..).collect::<Vec<_>>();
+    assert!(!first_packets.is_empty());
+    let first_deadline = pair
+        .conn(Client)
+        .ack_progress_recovery_deadline(PathId::ZERO)
+        .unwrap();
+
+    let pto = pair.path_stats(Client, PathId::ZERO).unwrap().pto;
+    pair.time += pto / 4;
+    let second = pair.streams(Client).open(Dir::Uni).unwrap();
+    write_stream_data(&mut pair, second, b"leave this packet outstanding");
+    pair.drive_client();
+    let held_second_packets = pair.server.inbound.drain(..).collect::<Vec<_>>();
+    assert!(!held_second_packets.is_empty());
+    assert_eq!(
+        pair.conn(Client)
+            .ack_progress_recovery_deadline(PathId::ZERO),
+        Some(first_deadline)
+    );
+
+    deliver_inbound_group(&mut pair, first_packets);
+    let reset_deadline = pair
+        .conn(Client)
+        .ack_progress_recovery_deadline(PathId::ZERO)
+        .expect("the remaining packet should keep the timer armed");
+    assert!(reset_deadline > first_deadline);
+    assert_eq!(
+        reset_deadline,
+        pair.time + pair.path_stats(Client, PathId::ZERO).unwrap().pto
+    );
+    Ok(())
+}
+
+#[test]
+fn one_no_progress_epoch_cannot_amplify_repeatedly() -> TestResult {
+    let _guard = subscribe();
+    let (mut pair, _backup) = ack_progress_recovery_pair(true)?;
+    let payload = vec![42; 128 * 1024];
+
+    let stream = pair.streams(Client).open(Dir::Uni).unwrap();
+    assert_eq!(
+        pair.send_stream(Client, stream).write(&payload)?,
+        payload.len()
+    );
+    blackhole_primary_path(&mut pair);
+    pair.drive_client();
+    advance_client_until_ack_progress_reinjection(&mut pair, PathId::ZERO);
+    let after_first = pair.path_stats(Client, PathId::ZERO).unwrap();
+
+    for _ in 0..8 {
+        advance_client_to_next_wakeup(&mut pair);
+        pair.server.inbound.clear();
+        pair.client.inbound.clear();
+    }
+
+    let after_retries = pair.path_stats(Client, PathId::ZERO).unwrap();
+    assert_eq!(after_retries.ack_progress_recovery_timeouts, 1);
+    assert_eq!(after_retries.ack_progress_recovery_attempts, 1);
+    assert_eq!(after_retries.ack_progress_reinjections, 1);
+    assert_eq!(
+        after_retries.ack_progress_reinjected_bytes,
+        after_first.ack_progress_reinjected_bytes
+    );
+    Ok(())
+}
+
+#[test]
+fn control_only_flight_does_not_arm_ack_progress_recovery() -> TestResult {
+    let _guard = subscribe();
+    let (mut pair, _backup) = ack_progress_recovery_pair(true)?;
+
+    pair.ping_path(Client, PathId::ZERO)?;
+    blackhole_primary_path(&mut pair);
+    pair.drive_client();
+
+    let primary = pair.path_stats(Client, PathId::ZERO).unwrap();
+    assert!(!primary.ack_progress_recovery_timer_armed);
+    assert!(
+        pair.conn(Client)
+            .ack_progress_recovery_deadline(PathId::ZERO)
+            .is_none()
+    );
+    assert_eq!(primary.ack_progress_recovery_timeouts, 0);
     Ok(())
 }
 
@@ -543,6 +790,87 @@ fn stale_pre_hedge_ack_does_not_reactivate_suspected_path() -> TestResult {
 }
 
 #[test]
+fn stale_pre_ack_progress_ack_does_not_reactivate_suspected_path() -> TestResult {
+    let _guard = subscribe();
+    let (mut pair, backup) = ack_progress_recovery_pair(true)?;
+    let stale_primary_ack = capture_primary_path_ack(&mut pair)?;
+
+    let first = pair.streams(Client).open(Dir::Uni).unwrap();
+    write_stream_data(&mut pair, first, b"trigger ACK-progress recovery");
+    pair.send_stream(Client, first).finish()?;
+    let (client_addr, server_addr) = blackhole_primary_path(&mut pair);
+    pair.drive_client();
+    advance_client_until_ack_progress_reinjection(&mut pair, PathId::ZERO);
+    let reinjected_packets = pair.server.inbound.drain(..).collect::<Vec<_>>();
+    assert!(!reinjected_packets.is_empty());
+
+    restore_primary_path(&mut pair, client_addr, server_addr);
+    deliver_inbound_group(&mut pair, reinjected_packets);
+    assert_eq!(count_finished_events(&mut pair, first), 1);
+    let _ = blackhole_primary_path(&mut pair);
+
+    pair.client.inbound.extend(stale_primary_ack);
+    pair.drive_client();
+    pair.server.inbound.clear();
+
+    let primary_before = pair.path_stats(Client, PathId::ZERO).unwrap();
+    let backup_before = pair.path_stats(Client, backup).unwrap();
+    let second = pair.streams(Client).open(Dir::Uni).unwrap();
+    write_stream_data(&mut pair, second, b"remain on backup after stale ACK");
+    pair.drive_client();
+
+    let primary_after = pair.path_stats(Client, PathId::ZERO).unwrap();
+    let backup_after = pair.path_stats(Client, backup).unwrap();
+    assert_eq!(
+        primary_after.frame_tx.stream_fresh_bytes, primary_before.frame_tx.stream_fresh_bytes,
+        "an ACK below the recovery-probe boundary must not reactivate the primary path"
+    );
+    assert!(backup_after.frame_tx.stream_fresh_bytes > backup_before.frame_tx.stream_fresh_bytes);
+    Ok(())
+}
+
+#[test]
+fn acknowledged_ack_progress_probe_resumes_normal_data_scheduling() -> TestResult {
+    let _guard = subscribe();
+    let (mut pair, backup) = ack_progress_recovery_pair(true)?;
+
+    let first = pair.streams(Client).open(Dir::Uni).unwrap();
+    write_stream_data(&mut pair, first, b"before ACK-progress recovery");
+    pair.send_stream(Client, first).finish()?;
+    let (client_addr, server_addr) = blackhole_primary_path(&mut pair);
+    pair.drive_client();
+    advance_client_until_ack_progress_reinjection(&mut pair, PathId::ZERO);
+
+    restore_primary_path(&mut pair, client_addr, server_addr);
+    pair.ping_path(Client, PathId::ZERO)?;
+    pair.drive();
+    assert_eq!(
+        read_all_stream_data(&mut pair, first),
+        b"before ACK-progress recovery"
+    );
+
+    let primary_before = pair.path_stats(Client, PathId::ZERO).unwrap();
+    let backup_before = pair.path_stats(Client, backup).unwrap();
+    let second = pair.streams(Client).open(Dir::Uni).unwrap();
+    write_stream_data(&mut pair, second, b"after ACK-progress recovery");
+    pair.send_stream(Client, second).finish()?;
+    pair.drive();
+
+    let primary_after = pair.path_stats(Client, PathId::ZERO).unwrap();
+    let backup_after = pair.path_stats(Client, backup).unwrap();
+    assert!(primary_after.frame_tx.stream_fresh_bytes > primary_before.frame_tx.stream_fresh_bytes);
+    assert_eq!(
+        backup_after.frame_tx.stream_fresh_bytes,
+        backup_before.frame_tx.stream_fresh_bytes
+    );
+    assert_eq!(
+        read_all_stream_data(&mut pair, second),
+        b"after ACK-progress recovery"
+    );
+    Ok(())
+}
+
+#[test]
 fn pto_reinjection_respects_backup_congestion_window() -> TestResult {
     let _guard = subscribe();
     let (mut pair, backup) = pto_hedge_pair(true)?;
@@ -557,6 +885,37 @@ fn pto_reinjection_respects_backup_congestion_window() -> TestResult {
     blackhole_primary_path(&mut pair);
     pair.drive_client();
     advance_client_until_hedge(&mut pair, PathId::ZERO);
+
+    let backup_after = pair.path_stats(Client, backup).unwrap();
+    let fresh =
+        backup_after.frame_tx.stream_fresh_bytes - backup_before.frame_tx.stream_fresh_bytes;
+    let retransmitted = backup_after.frame_tx.stream_retransmit_bytes
+        - backup_before.frame_tx.stream_retransmit_bytes;
+    assert!(fresh + retransmitted > 0);
+    assert!(
+        fresh + retransmitted <= backup_before.cwnd,
+        "backup sent {} STREAM bytes with a {} byte congestion window",
+        fresh + retransmitted,
+        backup_before.cwnd
+    );
+    Ok(())
+}
+
+#[test]
+fn ack_progress_reinjection_respects_backup_congestion_window() -> TestResult {
+    let _guard = subscribe();
+    let (mut pair, backup) = ack_progress_recovery_pair(true)?;
+    let backup_before = pair.path_stats(Client, backup).unwrap();
+    let payload = vec![42; 1024 * 1024];
+
+    let stream = pair.streams(Client).open(Dir::Uni).unwrap();
+    assert_eq!(
+        pair.send_stream(Client, stream).write(&payload)?,
+        payload.len()
+    );
+    blackhole_primary_path(&mut pair);
+    pair.drive_client();
+    advance_client_until_ack_progress_reinjection(&mut pair, PathId::ZERO);
 
     let backup_after = pair.path_stats(Client, backup).unwrap();
     let fresh =
@@ -589,6 +948,34 @@ fn fin_only_pto_reinjection_is_not_mistaken_for_zero_benefit() -> TestResult {
     let backup_after = pair.path_stats(Client, backup).unwrap();
     assert_eq!(primary_after.pto_hedges, 1);
     assert_eq!(primary_after.pto_hedge_bytes, 0);
+    assert!(
+        backup_after.frame_tx.stream > backup_before.frame_tx.stream,
+        "the FIN-only STREAM frame must still be sent on the backup path"
+    );
+
+    restore_primary_path(&mut pair, client_addr, server_addr);
+    pair.drive();
+    assert!(read_all_stream_data(&mut pair, stream).is_empty());
+    assert_eq!(count_finished_events(&mut pair, stream), 1);
+    Ok(())
+}
+
+#[test]
+fn fin_only_ack_progress_reinjection_is_not_mistaken_for_zero_benefit() -> TestResult {
+    let _guard = subscribe();
+    let (mut pair, backup) = ack_progress_recovery_pair(true)?;
+    let backup_before = pair.path_stats(Client, backup).unwrap();
+
+    let stream = pair.streams(Client).open(Dir::Uni).unwrap();
+    pair.send_stream(Client, stream).finish()?;
+    let (client_addr, server_addr) = blackhole_primary_path(&mut pair);
+    pair.drive_client();
+    advance_client_until_ack_progress_reinjection(&mut pair, PathId::ZERO);
+
+    let primary_after = pair.path_stats(Client, PathId::ZERO).unwrap();
+    let backup_after = pair.path_stats(Client, backup).unwrap();
+    assert_eq!(primary_after.ack_progress_reinjections, 1);
+    assert_eq!(primary_after.ack_progress_reinjected_bytes, 0);
     assert!(
         backup_after.frame_tx.stream > backup_before.frame_tx.stream,
         "the FIN-only STREAM frame must still be sent on the backup path"

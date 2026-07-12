@@ -300,6 +300,18 @@ pub struct PathStats {
     pub path_abandon_reinjections: u64,
     /// STREAM payload bytes newly queued when a path was abandoned.
     pub path_abandon_reinjected_bytes: u64,
+    /// Number of ACK-progress recovery timer expirations on this path.
+    pub ack_progress_recovery_timeouts: u64,
+    /// Number of ACK-progress recovery attempts made while another validated path was available.
+    pub ack_progress_recovery_attempts: u64,
+    /// ACK-progress recovery attempts that found no STREAM frame left in the path's packet table.
+    pub ack_progress_recovery_empty_attempts: u64,
+    /// Number of ACK-progress episodes that queued outstanding STREAM data on another path.
+    pub ack_progress_reinjections: u64,
+    /// STREAM payload bytes newly queued by ACK-progress cross-path reinjection.
+    pub ack_progress_reinjected_bytes: u64,
+    /// Whether the independent ACK-progress recovery timer is currently armed.
+    pub ack_progress_recovery_timer_armed: bool,
     /// Largest UDP payload size the path currently supports.
     pub current_mtu: u16,
 }
@@ -365,6 +377,12 @@ impl std::ops::Add<PathStats> for ConnectionStats {
             path_abandon_recovery_empty_attempts: _,
             path_abandon_reinjections: _,
             path_abandon_reinjected_bytes: _,
+            ack_progress_recovery_timeouts: _,
+            ack_progress_recovery_attempts: _,
+            ack_progress_recovery_empty_attempts: _,
+            ack_progress_reinjections: _,
+            ack_progress_reinjected_bytes: _,
+            ack_progress_recovery_timer_armed: _,
             current_mtu: _,
         } = rhs;
         Self {
@@ -416,6 +434,12 @@ impl std::ops::AddAssign<PathStats> for ConnectionStats {
             path_abandon_recovery_empty_attempts: _,
             path_abandon_reinjections: _,
             path_abandon_reinjected_bytes: _,
+            ack_progress_recovery_timeouts: _,
+            ack_progress_recovery_attempts: _,
+            ack_progress_recovery_empty_attempts: _,
+            ack_progress_reinjections: _,
+            ack_progress_reinjected_bytes: _,
+            ack_progress_recovery_timer_armed: _,
             current_mtu: _,
         } = rhs;
         let Self {

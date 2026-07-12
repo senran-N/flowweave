@@ -248,6 +248,20 @@ pub(super) struct PathData {
     /// handling remains responsible for eventual abandonment.
     pub(super) pto_recovery_probe_start: Option<u64>,
 
+    /// Start of the current application-data ACK-progress epoch.
+    ///
+    /// The first ack-eliciting packet retaining STREAM metadata while no such epoch exists starts
+    /// it. Sending more packets does not move it. A newly acknowledged ack-eliciting packet resets
+    /// it while STREAM data remains in flight, and the final STREAM removal clears it. This is
+    /// deliberately separate from QUIC's standard PTO send-time clock.
+    pub(super) ack_progress_start: Option<Instant>,
+
+    /// STREAM frame entries retained by in-flight packets on this exact path generation.
+    ///
+    /// This keeps ACK-progress eligibility O(1); scanning the full sent-packet table on every ACK
+    /// would become quadratic on large sustained flights.
+    pub(super) stream_frames_in_flight: u64,
+
     //
     // Per-path idle & keep alive
     //
@@ -348,6 +362,8 @@ impl PathData {
             first_packet: None,
             pto_count: 0,
             pto_recovery_probe_start: None,
+            ack_progress_start: None,
+            stream_frames_in_flight: 0,
             idle_timeout: config.default_path_max_idle_timeout,
             keep_alive: config.default_path_keep_alive_interval,
             permit_idle_reset: true,
@@ -397,6 +413,8 @@ impl PathData {
             first_packet: None,
             pto_count: 0,
             pto_recovery_probe_start: None,
+            ack_progress_start: None,
+            stream_frames_in_flight: 0,
             idle_timeout: prev.idle_timeout,
             keep_alive: prev.keep_alive,
             permit_idle_reset: true,
@@ -425,6 +443,7 @@ impl PathData {
 
     /// Account for transmission of `packet` with number `pn` in `space`
     pub(super) fn sent(&mut self, pn: u64, packet: SentPacket, space: &mut PacketNumberSpace) {
+        self.stream_frames_in_flight += packet.stream_frames.len() as u64;
         self.in_flight.insert(&packet);
         if self.first_packet.is_none() {
             self.first_packet = Some(pn);
@@ -454,6 +473,7 @@ impl PathData {
         if packet.path_generation != self.generation {
             return false;
         }
+        self.stream_frames_in_flight -= packet.stream_frames.len() as u64;
         self.in_flight.remove(packet);
         true
     }

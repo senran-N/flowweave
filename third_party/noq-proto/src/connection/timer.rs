@@ -77,10 +77,12 @@ pub(crate) enum PathTimer {
     MaxAckDelay = 7,
     /// When to clean up state for an abandoned path
     PathDrained = 8,
+    /// When a full data PTO has elapsed without newly acknowledged ack-eliciting data
+    AckProgressRecovery = 9,
 }
 
 impl PathTimer {
-    pub(super) const VALUES: [Self; 9] = [
+    pub(super) const VALUES: [Self; 10] = [
         Self::LossDetection,
         Self::PathIdle,
         Self::PathValidationFailed,
@@ -90,6 +92,7 @@ impl PathTimer {
         Self::Pacing,
         Self::MaxAckDelay,
         Self::PathDrained,
+        Self::AckProgressRecovery,
     ];
 }
 

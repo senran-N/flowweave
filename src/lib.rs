@@ -90,6 +90,7 @@ pub enum PtoRecovery {
     Disabled,
     CrossPathHedge,
     CrossPathHedgeAndAbandon,
+    CrossPathRecovery,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -130,15 +131,26 @@ impl PtoRecovery {
             Self::Disabled => "NoQ 默认恢复",
             Self::CrossPathHedge => "FlowWeave PTO 跨路径对冲",
             Self::CrossPathHedgeAndAbandon => "FlowWeave PTO + abandoned 即时对冲",
+            Self::CrossPathRecovery => "FlowWeave PTO + abandoned + ACK 进展跨路径恢复",
         }
     }
 
     fn pto_reinjection_enabled(self) -> bool {
-        matches!(self, Self::CrossPathHedge | Self::CrossPathHedgeAndAbandon)
+        matches!(
+            self,
+            Self::CrossPathHedge | Self::CrossPathHedgeAndAbandon | Self::CrossPathRecovery
+        )
     }
 
     fn abandon_reinjection_enabled(self) -> bool {
-        matches!(self, Self::CrossPathHedgeAndAbandon)
+        matches!(
+            self,
+            Self::CrossPathHedgeAndAbandon | Self::CrossPathRecovery
+        )
+    }
+
+    fn ack_progress_reinjection_enabled(self) -> bool {
+        matches!(self, Self::CrossPathRecovery)
     }
 }
 
@@ -334,6 +346,11 @@ pub struct PathMeasurement {
     pub path_abandon_recovery_empty_attempts: u64,
     pub path_abandon_reinjections: u64,
     pub path_abandon_reinjected_bytes: u64,
+    pub ack_progress_recovery_timeouts: u64,
+    pub ack_progress_recovery_attempts: u64,
+    pub ack_progress_recovery_empty_attempts: u64,
+    pub ack_progress_reinjections: u64,
+    pub ack_progress_reinjected_bytes: u64,
     pub ack_eliciting_packet_number_advance: u64,
     pub final_rtt: Duration,
     pub final_pto: Duration,
@@ -343,6 +360,7 @@ pub struct PathMeasurement {
     pub final_tracked_sent_packets: u64,
     pub final_tracked_ack_eliciting_packets: u64,
     pub final_loss_detection_timer_armed: bool,
+    pub final_ack_progress_recovery_timer_armed: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -438,6 +456,8 @@ pub struct SustainedFailoverTimeline {
     pub first_primary_pto: Option<Duration>,
     pub first_primary_recovery_attempt: Option<Duration>,
     pub first_primary_hedge: Option<Duration>,
+    pub first_primary_ack_progress_timeout: Option<Duration>,
+    pub first_primary_ack_progress_reinjection: Option<Duration>,
     pub first_primary_ack_eliciting_send: Option<Duration>,
     pub last_primary_ack_eliciting_send: Option<Duration>,
     pub first_primary_udp_receive: Option<Duration>,
@@ -485,6 +505,8 @@ impl SustainedFailoverTimeline {
             first_primary_pto: None,
             first_primary_recovery_attempt: None,
             first_primary_hedge: None,
+            first_primary_ack_progress_timeout: None,
+            first_primary_ack_progress_reinjection: None,
             first_primary_ack_eliciting_send: None,
             last_primary_ack_eliciting_send: None,
             first_primary_udp_receive: None,
@@ -1402,6 +1424,17 @@ fn observe_sustained_failover_timeline(
         primary.pto_hedges > primary_at_blackhole.pto_hedges,
         elapsed,
     );
+    record_first_timeline_event(
+        &mut timeline.first_primary_ack_progress_timeout,
+        primary.ack_progress_recovery_timeouts
+            > primary_at_blackhole.ack_progress_recovery_timeouts,
+        elapsed,
+    );
+    record_first_timeline_event(
+        &mut timeline.first_primary_ack_progress_reinjection,
+        primary.ack_progress_reinjections > primary_at_blackhole.ack_progress_reinjections,
+        elapsed,
+    );
     if primary.latest_ack_eliciting_packet_number
         > timeline.observed_primary_latest_ack_eliciting_packet_number
     {
@@ -1595,6 +1628,7 @@ fn configure_transport(
         .max_concurrent_multipath_paths(2)
         .cross_path_pto_reinjection(pto_recovery.pto_reinjection_enabled())
         .cross_path_abandon_reinjection(pto_recovery.abandon_reinjection_enabled())
+        .cross_path_ack_progress_reinjection(pto_recovery.ack_progress_reinjection_enabled())
         .default_path_max_idle_timeout(path_idle_timeout)
         .default_path_keep_alive_interval(Some(Duration::from_millis(200)))
         .datagram_receive_buffer_size(Some(1024 * 1024))
@@ -2391,6 +2425,21 @@ fn path_delta(before: PathStats, after: PathStats) -> PathMeasurement {
         path_abandon_reinjected_bytes: after
             .path_abandon_reinjected_bytes
             .saturating_sub(before.path_abandon_reinjected_bytes),
+        ack_progress_recovery_timeouts: after
+            .ack_progress_recovery_timeouts
+            .saturating_sub(before.ack_progress_recovery_timeouts),
+        ack_progress_recovery_attempts: after
+            .ack_progress_recovery_attempts
+            .saturating_sub(before.ack_progress_recovery_attempts),
+        ack_progress_recovery_empty_attempts: after
+            .ack_progress_recovery_empty_attempts
+            .saturating_sub(before.ack_progress_recovery_empty_attempts),
+        ack_progress_reinjections: after
+            .ack_progress_reinjections
+            .saturating_sub(before.ack_progress_reinjections),
+        ack_progress_reinjected_bytes: after
+            .ack_progress_reinjected_bytes
+            .saturating_sub(before.ack_progress_reinjected_bytes),
         ack_eliciting_packet_number_advance: after
             .latest_ack_eliciting_packet_number
             .saturating_sub(before.latest_ack_eliciting_packet_number),
@@ -2402,6 +2451,7 @@ fn path_delta(before: PathStats, after: PathStats) -> PathMeasurement {
         final_tracked_sent_packets: after.tracked_sent_packets,
         final_tracked_ack_eliciting_packets: after.tracked_ack_eliciting_packets,
         final_loss_detection_timer_armed: after.loss_detection_timer_armed,
+        final_ack_progress_recovery_timer_armed: after.ack_progress_recovery_timer_armed,
     }
 }
 
@@ -2617,6 +2667,15 @@ mod tests {
         let gap = recovery_gap_after_fault(&received, base + Duration::from_millis(11))
             .expect("故障前后都有数据，应找到恢复间隔");
         assert_eq!(gap, Duration::from_millis(400));
+    }
+
+    #[test]
+    fn ack_progress_diagnostic_variant_enables_all_recovery_primitives() {
+        let recovery = PtoRecovery::CrossPathRecovery;
+        assert!(recovery.pto_reinjection_enabled());
+        assert!(recovery.abandon_reinjection_enabled());
+        assert!(recovery.ack_progress_reinjection_enabled());
+        assert!(!PtoRecovery::CANDIDATES.contains(&recovery));
     }
 
     #[test]
