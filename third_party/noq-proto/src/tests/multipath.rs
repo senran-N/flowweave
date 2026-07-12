@@ -15,7 +15,8 @@ use crate::{
     ServerConfig, Side::*, TransportConfig, cid_queue::CidQueue,
 };
 use crate::{
-    ClosePathError, Dir, Event, PathAbandonReason, PathEvent, StreamEvent, TransportErrorCode,
+    ClosePathError, Dir, Event, PathAbandonReason, PathEvent, ReadError, StreamEvent,
+    TransportErrorCode,
     n0_nat_traversal,
 };
 
@@ -51,7 +52,7 @@ fn recovery_pair(
     pto_reinjection: bool,
     abandon_reinjection: bool,
 ) -> TestResult<(ConnPair, PathId)> {
-    recovery_pair_with_ack_progress(pto_reinjection, abandon_reinjection, false, false)
+    recovery_pair_with_ack_progress(pto_reinjection, abandon_reinjection, false, false, false)
 }
 
 fn recovery_pair_with_ack_progress(
@@ -59,6 +60,7 @@ fn recovery_pair_with_ack_progress(
     abandon_reinjection: bool,
     ack_progress_reinjection: bool,
     ack_escape: bool,
+    feedback_handoff: bool,
 ) -> TestResult<(ConnPair, PathId)> {
     let first_client_addr = Pair::CLIENT_ADDR;
     let first_server_addr = Pair::SERVER_ADDR;
@@ -79,6 +81,7 @@ fn recovery_pair_with_ack_progress(
         .cross_path_abandon_reinjection(abandon_reinjection)
         .cross_path_ack_progress_reinjection(ack_progress_reinjection)
         .cross_path_ack_escape(ack_escape)
+        .cross_path_feedback_handoff(feedback_handoff)
         .default_path_max_idle_timeout(Some(Duration::from_secs(60)));
     builder
         .server_transport_cfg
@@ -86,6 +89,7 @@ fn recovery_pair_with_ack_progress(
         .cross_path_abandon_reinjection(abandon_reinjection)
         .cross_path_ack_progress_reinjection(ack_progress_reinjection)
         .cross_path_ack_escape(ack_escape)
+        .cross_path_feedback_handoff(feedback_handoff)
         .default_path_max_idle_timeout(Some(Duration::from_secs(60)));
     let mut pair = builder.connect();
 
@@ -114,15 +118,19 @@ fn abandon_recovery_pair(enabled: bool) -> TestResult<(ConnPair, PathId)> {
 }
 
 fn ack_progress_recovery_pair(enabled: bool) -> TestResult<(ConnPair, PathId)> {
-    recovery_pair_with_ack_progress(false, false, enabled, false)
+    recovery_pair_with_ack_progress(false, false, enabled, false, false)
 }
 
 fn ack_escape_recovery_pair(enabled: bool) -> TestResult<(ConnPair, PathId)> {
-    recovery_pair_with_ack_progress(false, false, true, enabled)
+    recovery_pair_with_ack_progress(false, false, true, enabled, false)
+}
+
+fn feedback_handoff_recovery_pair() -> TestResult<(ConnPair, PathId)> {
+    recovery_pair_with_ack_progress(false, false, true, true, true)
 }
 
 fn pto_ack_escape_pair() -> TestResult<(ConnPair, PathId)> {
-    recovery_pair_with_ack_progress(true, false, false, true)
+    recovery_pair_with_ack_progress(true, false, false, true, false)
 }
 
 fn blackhole_primary_path(pair: &mut ConnPair) -> (SocketAddr, SocketAddr) {
@@ -466,11 +474,98 @@ fn ack_progress_recovery_returns_primary_ack_on_backup_path() -> TestResult {
         server_backup_after.path_acks_cross_path > server_backup_before.path_acks_cross_path,
         "the still-open primary path must be cumulatively acknowledged over the backup"
     );
+    assert_eq!(
+        pair.path_status(Server, PathId::ZERO)?,
+        PathStatus::Available,
+        "the historical ACK-escape variant must not change path scheduling"
+    );
+    assert_eq!(
+        pair.path_status(Server, backup)?,
+        PathStatus::Available,
+        "the passive peer keeps both paths available until the handoff switch is enabled"
+    );
     assert!(pair.path_status(Client, PathId::ZERO).is_ok());
 
     pair.drive_client();
     assert_eq!(count_finished_events(&mut pair, stream), 1);
     assert_eq!(pair.streams(Client).send_streams(), 0);
+    Ok(())
+}
+
+#[test]
+fn recovery_feedback_handoff_routes_stream_credit_on_backup() -> TestResult {
+    let _guard = subscribe();
+    let (mut pair, backup) = feedback_handoff_recovery_pair()?;
+    let recovered_stream =
+        deliver_primary_stream_and_drop_ack(&mut pair, b"feedback handoff trigger")?;
+
+    let (client_addr, server_addr) = blackhole_primary_path(&mut pair);
+    advance_client_until_ack_progress_reinjection(&mut pair, PathId::ZERO);
+    pair.drive_server();
+
+    assert_eq!(pair.path_status(Server, PathId::ZERO)?, PathStatus::Backup);
+    assert_eq!(pair.path_status(Server, backup)?, PathStatus::Available);
+
+    pair.drive_client();
+    assert_eq!(
+        read_all_stream_data(&mut pair, recovered_stream),
+        b"feedback handoff trigger"
+    );
+    pair.drive();
+
+    let primary_before = pair.path_stats(Server, PathId::ZERO).unwrap().frame_tx;
+    let backup_before = pair.path_stats(Server, backup).unwrap().frame_tx;
+
+    let stream = pair.streams(Client).open(Dir::Uni).unwrap();
+    let data = vec![0x5a; 200_000];
+    write_stream_data(&mut pair, stream, &data);
+    pair.drive();
+
+    assert_matches!(pair.streams(Server).accept(Dir::Uni), Some(id) if id == stream);
+    let mut receive = pair.recv_stream(Server, stream);
+    let mut chunks = receive.read(false)?;
+    let mut read = 0usize;
+    loop {
+        match chunks.next(usize::MAX) {
+            Ok(Some(chunk)) => read += chunk.bytes.len(),
+            Err(ReadError::Blocked) => break,
+            Ok(None) => panic!("unfinished stream unexpectedly reached FIN"),
+            Err(error) => panic!("failed reading flow-control test stream: {error}"),
+        }
+    }
+    let flow_control_update = chunks.finalize();
+    assert_eq!(read, data.len());
+    assert!(
+        flow_control_update.should_transmit(),
+        "reading more than one eighth of the stream window must queue MAX_STREAM_DATA"
+    );
+
+    pair.drive_server();
+    let primary_after = pair.path_stats(Server, PathId::ZERO).unwrap().frame_tx;
+    let backup_after = pair.path_stats(Server, backup).unwrap().frame_tx;
+    assert_eq!(
+        primary_after.max_stream_data, primary_before.max_stream_data,
+        "the blackholed primary must not consume the stream-credit update"
+    );
+    assert!(
+        backup_after.max_stream_data > backup_before.max_stream_data,
+        "the promoted recovery path must carry MAX_STREAM_DATA"
+    );
+
+    restore_primary_path(&mut pair, client_addr, server_addr);
+    pair.ping_path(Client, PathId::ZERO)?;
+    pair.conn_mut(Client).immediate_ack(PathId::ZERO);
+    pair.drive();
+    assert_eq!(
+        pair.path_status(Server, PathId::ZERO)?,
+        PathStatus::Available,
+        "a successful recovery probe must restore the previous primary status"
+    );
+    assert_eq!(
+        pair.path_status(Server, backup)?,
+        PathStatus::Available,
+        "a successful recovery probe must restore every previous local status"
+    );
     Ok(())
 }
 

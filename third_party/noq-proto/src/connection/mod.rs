@@ -124,6 +124,12 @@ enum StreamReinjectionTrigger {
     AckProgress,
 }
 
+#[derive(Debug)]
+struct RecoveryFeedbackHandoff {
+    preferred_path_id: PathId,
+    previous_statuses: Vec<(PathId, PathStatus)>,
+}
+
 /// Protocol state and logic for a single QUIC connection
 ///
 /// Objects of this type receive [`ConnectionEvent`]s and emit [`EndpointEvent`]s and application
@@ -315,6 +321,10 @@ pub struct Connection {
     /// time after a path is abandoned.
     abandoned_paths: AbandonedPaths,
 
+    /// Temporary local path-status override used while recovery feedback is routed away from a
+    /// suspected path. A successful probe on another path restores the previous statuses.
+    recovery_feedback_handoff: Option<RecoveryFeedbackHandoff>,
+
     /// State for n0's (<https://n0.computer>) nat traversal protocol.
     n0_nat_traversal: n0_nat_traversal::State,
     qlog: QlogSink,
@@ -439,6 +449,7 @@ impl Connection {
             remote_max_path_id: PathId::ZERO,
             max_path_id_with_cids: PathId::ZERO,
             abandoned_paths: Default::default(),
+            recovery_feedback_handoff: None,
 
             n0_nat_traversal: Default::default(),
             qlog,
@@ -3360,6 +3371,94 @@ impl Connection {
         stats.path_ack_escape_requests = stats.path_ack_escape_requests.saturating_add(1);
     }
 
+    /// Promote the validated path that delivered a recovery request to carry this endpoint's
+    /// outbound feedback. Other open paths remain usable, but become backups rather than silently
+    /// consuming connection-wide control frames on a suspected route.
+    fn handoff_recovery_feedback_path(&mut self, preferred_path_id: PathId) {
+        if !self.config.cross_path_feedback_handoff {
+            return;
+        }
+
+        if self
+            .recovery_feedback_handoff
+            .as_ref()
+            .is_some_and(|handoff| handoff.preferred_path_id == preferred_path_id)
+        {
+            return;
+        }
+        if self.recovery_feedback_handoff.is_some() {
+            self.restore_recovery_feedback_paths();
+        }
+
+        let previous_statuses = self
+            .paths
+            .iter()
+            .filter(|(path_id, _)| !self.abandoned_paths.contains(path_id))
+            .map(|(&path_id, path)| (path_id, path.data.local_status()))
+            .collect::<Vec<_>>();
+        let mut changed = Vec::new();
+        for &(path_id, _) in &previous_statuses {
+            let status = if path_id == preferred_path_id {
+                PathStatus::Available
+            } else {
+                PathStatus::Backup
+            };
+            if self
+                .path_data_mut(path_id)
+                .status
+                .local_update(status)
+                .is_some()
+            {
+                changed.push(path_id);
+            }
+        }
+
+        if changed.is_empty() {
+            return;
+        }
+        self.recovery_feedback_handoff = Some(RecoveryFeedbackHandoff {
+            preferred_path_id,
+            previous_statuses,
+        });
+        self.spaces[SpaceId::Data]
+            .pending
+            .path_status
+            .extend(changed);
+        trace!(
+            %preferred_path_id,
+            "promoted recovery path for outbound feedback"
+        );
+    }
+
+    fn restore_recovery_feedback_paths(&mut self) {
+        let Some(handoff) = self.recovery_feedback_handoff.take() else {
+            return;
+        };
+        let preferred_path_id = handoff.preferred_path_id;
+        let mut changed = Vec::new();
+        for (path_id, status) in handoff.previous_statuses {
+            if self.abandoned_paths.contains(&path_id) || !self.paths.contains_key(&path_id) {
+                continue;
+            }
+            if self
+                .path_data_mut(path_id)
+                .status
+                .local_update(status)
+                .is_some()
+            {
+                changed.push(path_id);
+            }
+        }
+        self.spaces[SpaceId::Data]
+            .pending
+            .path_status
+            .extend(changed);
+        trace!(
+            %preferred_path_id,
+            "restored path statuses after recovery probe"
+        );
+    }
+
     /// Queue outstanding STREAM data from one path for another validated path.
     ///
     /// Returns whether a reinjection episode was started. This is deliberately limited to one
@@ -5967,6 +6066,20 @@ impl Connection {
             }
         }
 
+        // A PING + IMMEDIATE_ACK on a non-preferred path is the recovery probe paired with the
+        // earlier cross-path reinjection. If it arrives, the path is usable again and temporary
+        // feedback routing can be rolled back without waiting for path-idle cleanup.
+        if self.config.cross_path_feedback_handoff
+            && received_immediate_ack
+            && !contains_stream
+            && self
+                .recovery_feedback_handoff
+                .as_ref()
+                .is_some_and(|handoff| handoff.preferred_path_id != path_id)
+        {
+            self.restore_recovery_feedback_paths();
+        }
+
         // A recovery request is deliberately encoded as IMMEDIATE_ACK alongside STREAM data on
         // the validated alternative path. Ordinary MTU probes, path validation packets, and
         // application calls that only request an immediate ACK cannot redirect another path's
@@ -5983,6 +6096,7 @@ impl Connection {
                     pns.pending_acks.request_ack_escape(path_id);
                 }
             }
+            self.handoff_recovery_feedback_path(path_id);
         }
 
         // Issue stream ID credit due to ACKs of outgoing finish/resets and incoming finish/resets

@@ -92,6 +92,7 @@ pub enum PtoRecovery {
     CrossPathHedgeAndAbandon,
     CrossPathRecovery,
     CrossPathRecoveryWithAckEscape,
+    CrossPathRecoveryWithFeedbackHandoff,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -134,6 +135,7 @@ impl PtoRecovery {
             Self::CrossPathHedgeAndAbandon => "FlowWeave PTO + abandoned 即时对冲",
             Self::CrossPathRecovery => "FlowWeave PTO + abandoned + ACK 进展跨路径恢复",
             Self::CrossPathRecoveryWithAckEscape => "FlowWeave ACK 进展恢复 + 有界跨路径 ACK 逃生",
+            Self::CrossPathRecoveryWithFeedbackHandoff => "FlowWeave ACK 逃生 + 关键反馈路径交接",
         }
     }
 
@@ -144,6 +146,7 @@ impl PtoRecovery {
                 | Self::CrossPathHedgeAndAbandon
                 | Self::CrossPathRecovery
                 | Self::CrossPathRecoveryWithAckEscape
+                | Self::CrossPathRecoveryWithFeedbackHandoff
         )
     }
 
@@ -153,18 +156,28 @@ impl PtoRecovery {
             Self::CrossPathHedgeAndAbandon
                 | Self::CrossPathRecovery
                 | Self::CrossPathRecoveryWithAckEscape
+                | Self::CrossPathRecoveryWithFeedbackHandoff
         )
     }
 
     fn ack_progress_reinjection_enabled(self) -> bool {
         matches!(
             self,
-            Self::CrossPathRecovery | Self::CrossPathRecoveryWithAckEscape
+            Self::CrossPathRecovery
+                | Self::CrossPathRecoveryWithAckEscape
+                | Self::CrossPathRecoveryWithFeedbackHandoff
         )
     }
 
     fn ack_escape_enabled(self) -> bool {
-        matches!(self, Self::CrossPathRecoveryWithAckEscape)
+        matches!(
+            self,
+            Self::CrossPathRecoveryWithAckEscape | Self::CrossPathRecoveryWithFeedbackHandoff
+        )
+    }
+
+    fn feedback_handoff_enabled(self) -> bool {
+        matches!(self, Self::CrossPathRecoveryWithFeedbackHandoff)
     }
 }
 
@@ -1784,6 +1797,7 @@ fn configure_transport(
         .cross_path_abandon_reinjection(pto_recovery.abandon_reinjection_enabled())
         .cross_path_ack_progress_reinjection(pto_recovery.ack_progress_reinjection_enabled())
         .cross_path_ack_escape(pto_recovery.ack_escape_enabled())
+        .cross_path_feedback_handoff(pto_recovery.feedback_handoff_enabled())
         .default_path_max_idle_timeout(path_idle_timeout)
         .default_path_keep_alive_interval(Some(Duration::from_millis(200)))
         .datagram_receive_buffer_size(Some(1024 * 1024))
@@ -2849,6 +2863,18 @@ mod tests {
         assert!(recovery.ack_progress_reinjection_enabled());
         assert!(recovery.ack_escape_enabled());
         assert!(!PtoRecovery::CrossPathRecovery.ack_escape_enabled());
+        assert!(!PtoRecovery::CANDIDATES.contains(&recovery));
+    }
+
+    #[test]
+    fn feedback_handoff_variant_preserves_historical_ack_escape() {
+        let recovery = PtoRecovery::CrossPathRecoveryWithFeedbackHandoff;
+        assert!(recovery.pto_reinjection_enabled());
+        assert!(recovery.abandon_reinjection_enabled());
+        assert!(recovery.ack_progress_reinjection_enabled());
+        assert!(recovery.ack_escape_enabled());
+        assert!(recovery.feedback_handoff_enabled());
+        assert!(!PtoRecovery::CrossPathRecoveryWithAckEscape.feedback_handoff_enabled());
         assert!(!PtoRecovery::CANDIDATES.contains(&recovery));
     }
 

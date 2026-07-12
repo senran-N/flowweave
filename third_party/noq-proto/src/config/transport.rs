@@ -67,6 +67,7 @@ pub struct TransportConfig {
     pub(crate) cross_path_abandon_reinjection: bool,
     pub(crate) cross_path_ack_progress_reinjection: bool,
     pub(crate) cross_path_ack_escape: bool,
+    pub(crate) cross_path_feedback_handoff: bool,
 
     pub(crate) default_path_max_idle_timeout: Option<Duration>,
     pub(crate) default_path_keep_alive_interval: Option<Duration>,
@@ -456,6 +457,17 @@ impl TransportConfig {
         self
     }
 
+    /// Whether a recovery packet carrying STREAM data and IMMEDIATE_ACK may promote its validated
+    /// path for the receiver's own outbound feedback while demoting the other open paths to
+    /// backup status.
+    ///
+    /// The handoff uses standard PATH_STATUS frames and local multipath scheduling. It does not
+    /// abandon any path, shorten path timers, or bypass congestion control. Disabled by default.
+    pub fn cross_path_feedback_handoff(&mut self, enabled: bool) -> &mut Self {
+        self.cross_path_feedback_handoff = enabled;
+        self
+    }
+
     /// Sets a default per-path maximum idle timeout
     ///
     /// If the path is idle for this long the path will be abandoned. Bear in mind this will
@@ -648,6 +660,7 @@ impl Default for TransportConfig {
             cross_path_abandon_reinjection: false,
             cross_path_ack_progress_reinjection: false,
             cross_path_ack_escape: false,
+            cross_path_feedback_handoff: false,
             default_path_max_idle_timeout: None,
             default_path_keep_alive_interval: None,
 
@@ -696,6 +709,7 @@ impl fmt::Debug for TransportConfig {
             cross_path_abandon_reinjection,
             cross_path_ack_progress_reinjection,
             cross_path_ack_escape,
+            cross_path_feedback_handoff,
             default_path_max_idle_timeout,
             default_path_keep_alive_interval,
             max_remote_nat_traversal_addresses,
@@ -750,6 +764,10 @@ impl fmt::Debug for TransportConfig {
                 cross_path_ack_progress_reinjection,
             )
             .field("cross_path_ack_escape", cross_path_ack_escape)
+            .field(
+                "cross_path_feedback_handoff",
+                cross_path_feedback_handoff,
+            )
             .field(
                 "default_path_max_idle_timeout",
                 default_path_max_idle_timeout,

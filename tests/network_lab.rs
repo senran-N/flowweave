@@ -578,6 +578,24 @@ async fn failover_second_gap_stream_state_diagnostic_lab() -> LabResult<()> {
     .await
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "必须通过 scripts/run_netem_lab.sh diagnose-feedback-handoff 在隔离网络命名空间中运行"]
+async fn failover_feedback_handoff_representative_diagnostic_lab() -> LabResult<()> {
+    const CASES: [(FailoverDirection, usize); 2] = [
+        (FailoverDirection::ClientToServer, 0_usize),
+        (FailoverDirection::ServerToClient, 0_usize),
+    ];
+    run_failover_diagnostic_cases(
+        "benchmark-results/2026-07-12-feedback-handoff-representative-summary.csv",
+        PtoRecovery::CrossPathRecoveryWithFeedbackHandoff,
+        "FlowWeave / 织流：A 组关键反馈路径交接代表场",
+        "复跑正向与反向种子 1101；恢复路接管 ACK 和流控反馈，不改 PathIdle、3 PTO 或线协议。",
+        &CASES,
+        Some("benchmark-results/2026-07-12-feedback-handoff-representative-timeline.csv"),
+    )
+    .await
+}
+
 async fn run_failover_diagnostic_cases(
     result_path: &str,
     pto_recovery: PtoRecovery,
