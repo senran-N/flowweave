@@ -590,10 +590,10 @@ async fn failover_abandon_reinjection_diagnostic_lab() -> LabResult<()> {
 #[ignore = "必须通过 scripts/run_netem_lab.sh diagnose-ack-progress 在隔离网络命名空间中运行"]
 async fn failover_ack_progress_reinjection_diagnostic_lab() -> LabResult<()> {
     run_seed_1103_failover_diagnostic(
-        "benchmark-results/2026-07-12-ack-progress-service-timeline-diagnostic.csv",
-        PtoRecovery::CrossPathRecovery,
-        "FlowWeave / 织流：A 组 ACK 进展服务集合只读时间线",
-        "算法与上一轮完全相同；只记录备用路重传/新数据和代主路 PATH_ACK 的首个时刻。",
+        "benchmark-results/2026-07-12-cross-path-ack-escape-diagnostic.csv",
+        PtoRecovery::CrossPathRecoveryWithAckEscape,
+        "FlowWeave / 织流：A 组有界跨路径 ACK 逃生诊断",
+        "只复跑正向种子 1103；恢复时在备用路请求一次累计 PATH_ACK，不改变路径状态或计时器。",
     )
     .await
 }
@@ -1038,6 +1038,13 @@ fn print_formal_failover_observation(observation: &FormalFailoverObservation) {
         receiver_primary.path_acks_cross_path,
         receiver_secondary.path_acks_same_path,
         receiver_secondary.path_acks_cross_path,
+    );
+    println!(
+        "  ACK 逃生：发送端主路/备用路请求 {}/{}；接收端主路/备用路逃生 PATH_ACK {}/{}",
+        after_primary.path_ack_escape_requests,
+        after_secondary.path_ack_escape_requests,
+        receiver_primary.path_ack_escape_acks,
+        receiver_secondary.path_ack_escape_acks,
     );
     println!(
         "  故障时主路/备用路开放 {} / {}；首个主路 loss/PTO/恢复尝试/对冲 {}/{}/{}/{}，备用路首次 UDP {}",
@@ -1895,7 +1902,7 @@ fn write_formal_failover_csv(
     observations: &[FormalFailoverObservation],
 ) -> LabResult<()> {
     let mut csv = String::from(
-        "direction,round,line_one_seed,line_two_seed,recovery,recovered,data_intact,recovery_gap_ms,transfer_duration_ms,records_received,application_bytes_received,failure_reason,primary_fresh_bytes_before_blackhole,secondary_fresh_bytes_before_blackhole,primary_pto_hedges_before_blackhole,secondary_pto_hedges_before_blackhole,primary_pto_hedge_bytes_before_blackhole,secondary_pto_hedge_bytes_before_blackhole,primary_udp_bytes_after_blackhole,secondary_udp_bytes_after_blackhole,total_udp_bytes_after_blackhole,primary_lost_packets,secondary_lost_packets,pto_hedges_after_blackhole,pto_hedge_bytes_after_blackhole,primary_path_open,secondary_path_open,primary_loss_timeouts_after_blackhole,secondary_loss_timeouts_after_blackhole,primary_pto_timeouts_after_blackhole,secondary_pto_timeouts_after_blackhole,primary_pto_recovery_attempts_after_blackhole,primary_pto_recovery_empty_attempts_after_blackhole,primary_last_pto_unacked_bytes,primary_last_pto_stream_frames,secondary_pto_recovery_attempts_after_blackhole,secondary_pto_recovery_empty_attempts_after_blackhole,secondary_last_pto_unacked_bytes,secondary_last_pto_stream_frames,primary_final_cwnd,secondary_final_cwnd,receiver_primary_path_acks_same_path_after_blackhole,receiver_primary_path_acks_cross_path_after_blackhole,receiver_secondary_path_acks_same_path_after_blackhole,receiver_secondary_path_acks_cross_path_after_blackhole,primary_open_at_fault,secondary_open_at_fault,first_primary_loss_timeout_ms,first_primary_pto_ms,first_primary_recovery_attempt_ms,first_primary_hedge_ms,first_secondary_udp_send_ms,first_receiver_primary_cross_path_ack_ms,first_receiver_secondary_same_path_ack_ms,primary_closed_ms,secondary_closed_ms,recovery_gap_started_after_fault_ms,recovery_gap_ended_after_fault_ms,recovery_gap_next_sequence,primary_rtt_at_fault_ms,primary_pto_at_fault_ms,primary_cwnd_at_fault,primary_bytes_in_flight_at_fault,primary_ack_eliciting_in_flight_at_fault,primary_tracked_sent_packets_at_fault,primary_tracked_ack_eliciting_packets_at_fault,primary_latest_ack_eliciting_pn_at_fault,primary_pto_count_at_fault,primary_loss_timer_armed_at_fault,primary_ack_eliciting_pn_advance_after_fault,first_primary_ack_eliciting_send_ms,last_primary_ack_eliciting_send_ms,first_primary_udp_receive_ms,last_primary_udp_receive_ms,first_primary_loss_timer_unarmed_ms,first_primary_ack_eliciting_in_flight_zero_ms,first_primary_tracked_ack_eliciting_zero_ms,max_primary_bytes_in_flight_after_fault,max_primary_ack_eliciting_in_flight_after_fault,max_primary_tracked_sent_packets_after_fault,max_primary_tracked_ack_eliciting_after_fault,primary_final_rtt_ms,primary_final_pto_ms,primary_final_bytes_in_flight,primary_final_ack_eliciting_in_flight,primary_final_tracked_sent_packets,primary_final_tracked_ack_eliciting_packets,primary_final_loss_timer_armed,primary_abandon_recovery_attempts_after_blackhole,primary_abandon_recovery_empty_attempts_after_blackhole,primary_abandon_reinjections_after_blackhole,primary_abandon_reinjected_bytes_after_blackhole,secondary_abandon_recovery_attempts_after_blackhole,secondary_abandon_recovery_empty_attempts_after_blackhole,secondary_abandon_reinjections_after_blackhole,secondary_abandon_reinjected_bytes_after_blackhole,primary_ack_progress_recovery_timeouts_after_blackhole,primary_ack_progress_recovery_attempts_after_blackhole,primary_ack_progress_recovery_empty_attempts_after_blackhole,primary_ack_progress_reinjections_after_blackhole,primary_ack_progress_reinjected_bytes_after_blackhole,secondary_ack_progress_recovery_timeouts_after_blackhole,secondary_ack_progress_recovery_attempts_after_blackhole,secondary_ack_progress_recovery_empty_attempts_after_blackhole,secondary_ack_progress_reinjections_after_blackhole,secondary_ack_progress_reinjected_bytes_after_blackhole,first_primary_ack_progress_timeout_ms,first_primary_ack_progress_reinjection_ms,primary_final_ack_progress_timer_armed,first_secondary_stream_retransmit_ms,first_secondary_fresh_stream_ms,first_receiver_secondary_cross_path_ack_ms\n",
+        "direction,round,line_one_seed,line_two_seed,recovery,recovered,data_intact,recovery_gap_ms,transfer_duration_ms,records_received,application_bytes_received,failure_reason,primary_fresh_bytes_before_blackhole,secondary_fresh_bytes_before_blackhole,primary_pto_hedges_before_blackhole,secondary_pto_hedges_before_blackhole,primary_pto_hedge_bytes_before_blackhole,secondary_pto_hedge_bytes_before_blackhole,primary_udp_bytes_after_blackhole,secondary_udp_bytes_after_blackhole,total_udp_bytes_after_blackhole,primary_lost_packets,secondary_lost_packets,pto_hedges_after_blackhole,pto_hedge_bytes_after_blackhole,primary_path_open,secondary_path_open,primary_loss_timeouts_after_blackhole,secondary_loss_timeouts_after_blackhole,primary_pto_timeouts_after_blackhole,secondary_pto_timeouts_after_blackhole,primary_pto_recovery_attempts_after_blackhole,primary_pto_recovery_empty_attempts_after_blackhole,primary_last_pto_unacked_bytes,primary_last_pto_stream_frames,secondary_pto_recovery_attempts_after_blackhole,secondary_pto_recovery_empty_attempts_after_blackhole,secondary_last_pto_unacked_bytes,secondary_last_pto_stream_frames,primary_final_cwnd,secondary_final_cwnd,receiver_primary_path_acks_same_path_after_blackhole,receiver_primary_path_acks_cross_path_after_blackhole,receiver_secondary_path_acks_same_path_after_blackhole,receiver_secondary_path_acks_cross_path_after_blackhole,primary_open_at_fault,secondary_open_at_fault,first_primary_loss_timeout_ms,first_primary_pto_ms,first_primary_recovery_attempt_ms,first_primary_hedge_ms,first_secondary_udp_send_ms,first_receiver_primary_cross_path_ack_ms,first_receiver_secondary_same_path_ack_ms,primary_closed_ms,secondary_closed_ms,recovery_gap_started_after_fault_ms,recovery_gap_ended_after_fault_ms,recovery_gap_next_sequence,primary_rtt_at_fault_ms,primary_pto_at_fault_ms,primary_cwnd_at_fault,primary_bytes_in_flight_at_fault,primary_ack_eliciting_in_flight_at_fault,primary_tracked_sent_packets_at_fault,primary_tracked_ack_eliciting_packets_at_fault,primary_latest_ack_eliciting_pn_at_fault,primary_pto_count_at_fault,primary_loss_timer_armed_at_fault,primary_ack_eliciting_pn_advance_after_fault,first_primary_ack_eliciting_send_ms,last_primary_ack_eliciting_send_ms,first_primary_udp_receive_ms,last_primary_udp_receive_ms,first_primary_loss_timer_unarmed_ms,first_primary_ack_eliciting_in_flight_zero_ms,first_primary_tracked_ack_eliciting_zero_ms,max_primary_bytes_in_flight_after_fault,max_primary_ack_eliciting_in_flight_after_fault,max_primary_tracked_sent_packets_after_fault,max_primary_tracked_ack_eliciting_after_fault,primary_final_rtt_ms,primary_final_pto_ms,primary_final_bytes_in_flight,primary_final_ack_eliciting_in_flight,primary_final_tracked_sent_packets,primary_final_tracked_ack_eliciting_packets,primary_final_loss_timer_armed,primary_abandon_recovery_attempts_after_blackhole,primary_abandon_recovery_empty_attempts_after_blackhole,primary_abandon_reinjections_after_blackhole,primary_abandon_reinjected_bytes_after_blackhole,secondary_abandon_recovery_attempts_after_blackhole,secondary_abandon_recovery_empty_attempts_after_blackhole,secondary_abandon_reinjections_after_blackhole,secondary_abandon_reinjected_bytes_after_blackhole,primary_ack_progress_recovery_timeouts_after_blackhole,primary_ack_progress_recovery_attempts_after_blackhole,primary_ack_progress_recovery_empty_attempts_after_blackhole,primary_ack_progress_reinjections_after_blackhole,primary_ack_progress_reinjected_bytes_after_blackhole,secondary_ack_progress_recovery_timeouts_after_blackhole,secondary_ack_progress_recovery_attempts_after_blackhole,secondary_ack_progress_recovery_empty_attempts_after_blackhole,secondary_ack_progress_reinjections_after_blackhole,secondary_ack_progress_reinjected_bytes_after_blackhole,first_primary_ack_progress_timeout_ms,first_primary_ack_progress_reinjection_ms,primary_final_ack_progress_timer_armed,first_secondary_stream_retransmit_ms,first_secondary_fresh_stream_ms,first_receiver_secondary_cross_path_ack_ms,primary_path_ack_escape_requests_after_blackhole,secondary_path_ack_escape_requests_after_blackhole,receiver_primary_path_ack_escape_acks_after_blackhole,receiver_secondary_path_ack_escape_acks_after_blackhole\n",
     );
 
     for observation in observations {
@@ -2119,7 +2126,7 @@ fn write_formal_failover_csv(
             ),
             after_primary.final_ack_progress_recovery_timer_armed,
         )?;
-        writeln!(
+        write!(
             csv,
             ",{},{},{}",
             csv_optional_milliseconds(
@@ -2135,6 +2142,14 @@ fn write_formal_failover_csv(
                     .timeline
                     .first_receiver_secondary_cross_path_ack,
             ),
+        )?;
+        writeln!(
+            csv,
+            ",{},{},{},{}",
+            after_primary.path_ack_escape_requests,
+            after_secondary.path_ack_escape_requests,
+            receiver_primary.path_ack_escape_acks,
+            receiver_secondary.path_ack_escape_acks,
         )?;
     }
 

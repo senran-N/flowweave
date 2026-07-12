@@ -43,6 +43,10 @@ pub struct FrameStats {
     pub path_acks_same_path: u64,
     /// PATH_ACK frames sent on a different path from the one they acknowledge.
     pub path_acks_cross_path: u64,
+    /// Recovery requests that placed an IMMEDIATE_ACK frame on an alternative path.
+    pub path_ack_escape_requests: u64,
+    /// PATH_ACK frames sent cross-path because of a recovery-time ACK escape request.
+    pub path_ack_escape_acks: u64,
     pub ack_frequency: u64,
     pub crypto: u64,
     pub connection_close: u64,
@@ -139,6 +143,8 @@ impl std::fmt::Debug for FrameStats {
             path_acks,
             path_acks_same_path,
             path_acks_cross_path,
+            path_ack_escape_requests,
+            path_ack_escape_acks,
             ack_frequency,
             crypto,
             connection_close,
@@ -198,6 +204,8 @@ impl std::fmt::Debug for FrameStats {
             .field("PATH_ACK", path_acks)
             .field("PATH_ACK_SAME_PATH", path_acks_same_path)
             .field("PATH_ACK_CROSS_PATH", path_acks_cross_path)
+            .field("PATH_ACK_ESCAPE_REQUEST", path_ack_escape_requests)
+            .field("PATH_ACK_ESCAPE", path_ack_escape_acks)
             .field("PATH_STATUS_AVAILABLE", path_status_available)
             .field("PATH_STATUS_BACKUP", path_status_backup)
             .field("PATH_CHALLENGE", path_challenge)

@@ -1122,6 +1122,8 @@ pub(super) struct PendingAcks {
     largest_ack_eliciting_packet: Option<u64>,
     /// The largest acknowledged packet number sent in an ACK frame
     largest_acked: Option<u64>,
+    /// A validated path selected by a recovery request to carry the next cumulative PATH_ACK.
+    ack_escape_via: Option<PathId>,
 }
 
 impl PendingAcks {
@@ -1137,6 +1139,7 @@ impl PendingAcks {
             largest_packet: Default::default(),
             largest_ack_eliciting_packet: Default::default(),
             largest_acked: Default::default(),
+            ack_escape_via: None,
         }
     }
 
@@ -1147,6 +1150,27 @@ impl PendingAcks {
 
     pub(super) fn set_immediate_ack_required(&mut self) {
         self.immediate_ack_required = true;
+    }
+
+    /// Prefer the next ACK on `path_id` instead of the path being acknowledged.
+    pub(super) fn request_ack_escape(&mut self, path_id: PathId) -> bool {
+        if self.ranges.is_empty() {
+            return false;
+        }
+        let changed = self.ack_escape_via != Some(path_id);
+        self.ack_escape_via = Some(path_id);
+        self.immediate_ack_required = true;
+        changed
+    }
+
+    pub(super) fn ack_escape_via(&self) -> Option<PathId> {
+        self.ack_escape_via
+    }
+
+    pub(super) fn clear_ack_escape_via(&mut self, path_id: PathId) {
+        if self.ack_escape_via == Some(path_id) {
+            self.ack_escape_via = None;
+        }
     }
 
     pub(super) fn on_max_ack_delay_timeout(&mut self) {
@@ -1272,6 +1296,7 @@ impl PendingAcks {
         self.non_ack_eliciting_since_last_ack_sent = 0;
         self.earliest_ack_eliciting_since_last_ack_sent = None;
         self.largest_acked = self.largest_ack_eliciting_packet;
+        self.ack_escape_via = None;
     }
 
     /// Insert one packet that needs to be acknowledged
@@ -1290,6 +1315,9 @@ impl PendingAcks {
     /// Remove ACKs of packets numbered at or below `max` from the set of pending ACKs
     pub(super) fn subtract_below(&mut self, max: u64) {
         self.ranges.remove(0..(max + 1));
+        if self.ranges.is_empty() {
+            self.ack_escape_via = None;
+        }
     }
 
     /// Returns the set of currently pending ACK ranges

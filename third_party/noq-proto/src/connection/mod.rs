@@ -683,6 +683,13 @@ impl Connection {
     fn abandon_path(&mut self, now: Instant, path_id: PathId, reason: PathAbandonReason) {
         trace!(%path_id, ?reason, "abandoning path");
 
+        // A path selected to carry an ACK escape can no longer do so once it is abandoned. Leave
+        // the pending ACK ranges intact so ordinary same-path or abandoned-path fallback rules can
+        // choose another route.
+        for pns in self.spaces[SpaceId::Data].iter_paths_mut() {
+            pns.pending_acks.clear_ack_escape_via(path_id);
+        }
+
         // Retain the packet-number space for the normal 3-PTO drain period, but do not make
         // application data wait for final path-state deletion before it can use another path.
         self.maybe_reinject_stream_data_on_path_abandon(path_id);
@@ -2205,7 +2212,8 @@ impl Connection {
                 .any(|(acknowledged_path_id, pns)| {
                     pns.pending_acks.can_send()
                         && (self.abandoned_paths.contains(acknowledged_path_id)
-                            || !self.remote_cids.contains_key(acknowledged_path_id))
+                            || !self.remote_cids.contains_key(acknowledged_path_id)
+                            || pns.pending_acks.ack_escape_via() == Some(path_id))
                 });
         let space = &mut self.spaces[space_id];
         let space_has_crypto = self.crypto_state.has_keys(space_id.encryption_level());
@@ -2220,6 +2228,18 @@ impl Connection {
         }
 
         let mut can_send = space.can_send(path_id, &self.streams);
+        if space_id == SpaceId::Data
+            && space
+                .number_spaces
+                .get(&path_id)
+                .and_then(|pns| pns.pending_acks.ack_escape_via())
+                .is_some_and(|via| via != path_id)
+        {
+            // The cumulative ACK has explicitly been reserved for another validated path. If the
+            // acknowledged path still advertises ACK work here, packet construction suppresses the
+            // frame and can loop producing empty packets.
+            can_send.acks = false;
+        }
         can_send.acks |= has_cross_path_ack_fallback;
 
         // Check for 1RTT space.
@@ -3306,15 +3326,36 @@ impl Connection {
         );
     }
 
-    /// Whether another path can safely carry a cross-path recovery copy.
-    fn has_cross_path_recovery_alternative(&self, path_id: PathId) -> bool {
-        self.paths.iter().any(|(other_path_id, path)| {
-            *other_path_id != path_id
+    /// Select another path that can safely carry a cross-path recovery copy and feedback request.
+    fn cross_path_recovery_alternative(&self, path_id: PathId) -> Option<PathId> {
+        self.paths.iter().find_map(|(other_path_id, path)| {
+            (*other_path_id != path_id
                 && self.remote_cids.contains_key(other_path_id)
                 && !self.abandoned_paths.contains(other_path_id)
                 && path.data.validated
-                && path.data.pto_recovery_probe_start.is_none()
+                && path.data.pto_recovery_probe_start.is_none())
+            .then_some(*other_path_id)
         })
+    }
+
+    fn has_cross_path_recovery_alternative(&self, path_id: PathId) -> bool {
+        self.cross_path_recovery_alternative(path_id).is_some()
+    }
+
+    /// Put one immediate-feedback request on the same alternative path that will carry recovery
+    /// data. The peer may answer with cumulative PATH_ACKs for other paths on this route.
+    fn request_cross_path_ack_escape(&mut self, path_id: PathId) {
+        if !self.config.cross_path_ack_escape || !self.peer_supports_ack_frequency() {
+            return;
+        }
+        let Some(alternative) = self.cross_path_recovery_alternative(path_id) else {
+            return;
+        };
+        self.spaces[SpaceId::Data]
+            .for_path(alternative)
+            .pending_immediate_ack = true;
+        let stats = &mut self.path_stats.for_path(alternative).frame_tx;
+        stats.path_ack_escape_requests = stats.path_ack_escape_requests.saturating_add(1);
     }
 
     /// Queue outstanding STREAM data from one path for another validated path.
@@ -3426,6 +3467,12 @@ impl Connection {
             recovery_probe_start,
             "queued cross-path STREAM reinjection"
         );
+        if matches!(
+            trigger,
+            StreamReinjectionTrigger::Pto | StreamReinjectionTrigger::AckProgress
+        ) {
+            self.request_cross_path_ack_escape(path_id);
+        }
         true
     }
 
@@ -5274,6 +5321,8 @@ impl Connection {
         let mut close = None;
         let payload_len = payload.len();
         let mut ack_eliciting = false;
+        let mut contains_stream = false;
+        let mut received_immediate_ack = false;
         // if this packet triggers a path migration and includes a observed address frame, it's
         // stored here
         let mut migration_observed_addr = None;
@@ -5342,6 +5391,7 @@ impl Connection {
                     self.read_crypto(SpaceId::Data, &frame, payload_len)?;
                 }
                 Frame::Stream(frame) => {
+                    contains_stream = true;
                     if self.streams.received(frame, payload_len)?.should_transmit() {
                         self.spaces[SpaceId::Data].pending.max_data = true;
                     }
@@ -5632,6 +5682,7 @@ impl Connection {
                 }
                 Frame::ImmediateAck => {
                     // This frame can only be sent in the Data space
+                    received_immediate_ack = true;
                     for pns in self.spaces[SpaceId::Data].iter_paths_mut() {
                         pns.pending_acks.set_immediate_ack_required();
                     }
@@ -5911,6 +5962,24 @@ impl Connection {
                     now + self.ack_frequency.max_ack_delay,
                     self.qlog.with_time(now),
                 );
+            }
+        }
+
+        // A recovery request is deliberately encoded as IMMEDIATE_ACK alongside STREAM data on
+        // the validated alternative path. Ordinary MTU probes, path validation packets, and
+        // application calls that only request an immediate ACK cannot redirect another path's
+        // cumulative feedback.
+        if self.config.cross_path_ack_escape
+            && received_immediate_ack
+            && contains_stream
+            && self.path_data(path_id).validated
+            && !self.abandoned_paths.contains(&path_id)
+            && self.remote_cids.contains_key(&path_id)
+        {
+            for (acknowledged_path_id, pns) in self.spaces[SpaceId::Data].number_spaces.iter_mut() {
+                if *acknowledged_path_id != path_id {
+                    pns.pending_acks.request_ack_escape(path_id);
+                }
             }
         }
 
@@ -6456,9 +6525,15 @@ impl Connection {
             if self.spaces[space_id]
                 .number_spaces
                 .get(&path_id)
-                .is_some_and(|pns| pns.pending_acks.can_send())
+                .is_some_and(|pns| {
+                    pns.pending_acks.can_send()
+                        && pns
+                            .pending_acks
+                            .ack_escape_via()
+                            .is_none_or(|via| via == path_id)
+                })
             {
-                acknowledged_paths.push(path_id);
+                acknowledged_paths.push((path_id, false));
             }
             if is_multipath_negotiated && space_id == SpaceId::Data {
                 acknowledged_paths.extend(
@@ -6469,9 +6544,15 @@ impl Connection {
                             **acknowledged_path_id != path_id
                                 && pns.pending_acks.can_send()
                                 && (self.abandoned_paths.contains(acknowledged_path_id)
-                                    || !self.remote_cids.contains_key(acknowledged_path_id))
+                                    || !self.remote_cids.contains_key(acknowledged_path_id)
+                                    || pns.pending_acks.ack_escape_via() == Some(path_id))
                         })
-                        .map(|(&acknowledged_path_id, _)| acknowledged_path_id),
+                        .map(|(&acknowledged_path_id, pns)| {
+                            (
+                                acknowledged_path_id,
+                                pns.pending_acks.ack_escape_via() == Some(path_id),
+                            )
+                        }),
                 );
             }
             acknowledged_paths
@@ -6513,7 +6594,7 @@ impl Connection {
         }
 
         // ACK
-        for acknowledged_path_id in acknowledged_paths {
+        for (acknowledged_path_id, ack_escape) in acknowledged_paths {
             Self::populate_acks(
                 now,
                 self.receiving_ecn,
@@ -6526,6 +6607,9 @@ impl Connection {
                 stats,
                 space_has_keys,
             );
+            if ack_escape {
+                stats.path_ack_escape_acks = stats.path_ack_escape_acks.saturating_add(1);
+            }
         }
 
         // ACK_FREQUENCY

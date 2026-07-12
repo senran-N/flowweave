@@ -51,13 +51,14 @@ fn recovery_pair(
     pto_reinjection: bool,
     abandon_reinjection: bool,
 ) -> TestResult<(ConnPair, PathId)> {
-    recovery_pair_with_ack_progress(pto_reinjection, abandon_reinjection, false)
+    recovery_pair_with_ack_progress(pto_reinjection, abandon_reinjection, false, false)
 }
 
 fn recovery_pair_with_ack_progress(
     pto_reinjection: bool,
     abandon_reinjection: bool,
     ack_progress_reinjection: bool,
+    ack_escape: bool,
 ) -> TestResult<(ConnPair, PathId)> {
     let first_client_addr = Pair::CLIENT_ADDR;
     let first_server_addr = Pair::SERVER_ADDR;
@@ -77,12 +78,14 @@ fn recovery_pair_with_ack_progress(
         .cross_path_pto_reinjection(pto_reinjection)
         .cross_path_abandon_reinjection(abandon_reinjection)
         .cross_path_ack_progress_reinjection(ack_progress_reinjection)
+        .cross_path_ack_escape(ack_escape)
         .default_path_max_idle_timeout(Some(Duration::from_secs(60)));
     builder
         .server_transport_cfg
         .cross_path_pto_reinjection(pto_reinjection)
         .cross_path_abandon_reinjection(abandon_reinjection)
         .cross_path_ack_progress_reinjection(ack_progress_reinjection)
+        .cross_path_ack_escape(ack_escape)
         .default_path_max_idle_timeout(Some(Duration::from_secs(60)));
     let mut pair = builder.connect();
 
@@ -111,7 +114,15 @@ fn abandon_recovery_pair(enabled: bool) -> TestResult<(ConnPair, PathId)> {
 }
 
 fn ack_progress_recovery_pair(enabled: bool) -> TestResult<(ConnPair, PathId)> {
-    recovery_pair_with_ack_progress(false, false, enabled)
+    recovery_pair_with_ack_progress(false, false, enabled, false)
+}
+
+fn ack_escape_recovery_pair(enabled: bool) -> TestResult<(ConnPair, PathId)> {
+    recovery_pair_with_ack_progress(false, false, true, enabled)
+}
+
+fn pto_ack_escape_pair() -> TestResult<(ConnPair, PathId)> {
+    recovery_pair_with_ack_progress(true, false, false, true)
 }
 
 fn blackhole_primary_path(pair: &mut ConnPair) -> (SocketAddr, SocketAddr) {
@@ -301,6 +312,39 @@ fn capture_primary_path_ack(pair: &mut ConnPair) -> TestResult<Vec<Inbound>> {
     Ok(ack)
 }
 
+fn deliver_primary_stream_and_drop_ack(
+    pair: &mut ConnPair,
+    data: &[u8],
+) -> TestResult<crate::StreamId> {
+    let stream = pair.streams(Client).open(Dir::Uni).unwrap();
+    write_stream_data(pair, stream, data);
+    pair.send_stream(Client, stream).finish()?;
+    pair.drive_client();
+    assert!(
+        !pair.server.inbound.is_empty(),
+        "the original primary STREAM packet must reach the server"
+    );
+
+    for _ in 0..8 {
+        pair.drive_server();
+        if !pair.client.inbound.is_empty() {
+            break;
+        }
+        let next = pair
+            .server
+            .next_wakeup()
+            .expect("server should retain an ACK wakeup for the primary STREAM packet");
+        pair.time = next;
+    }
+    assert!(
+        !pair.client.inbound.is_empty(),
+        "the server must generate a primary PATH_ACK before it is dropped"
+    );
+    pair.client.inbound.clear();
+    pair.server.inbound.clear();
+    Ok(stream)
+}
+
 #[test]
 fn cross_path_pto_reinjection_is_disabled_by_default() -> TestResult {
     let _guard = subscribe();
@@ -357,6 +401,97 @@ fn cross_path_ack_progress_reinjection_is_disabled_by_default() -> TestResult {
         backup_after.frame_tx.stream_retransmit_bytes,
         backup_before.frame_tx.stream_retransmit_bytes
     );
+    Ok(())
+}
+
+#[test]
+fn ack_escape_is_disabled_without_its_explicit_switch() -> TestResult {
+    let _guard = subscribe();
+    let (mut pair, backup) = ack_escape_recovery_pair(false)?;
+    let _stream = deliver_primary_stream_and_drop_ack(&mut pair, b"ACK escape default off")?;
+    let client_backup_before = pair.path_stats(Client, backup).unwrap().frame_tx;
+    let server_backup_before = pair.path_stats(Server, backup).unwrap().frame_tx;
+
+    blackhole_primary_path(&mut pair);
+    advance_client_until_ack_progress_reinjection(&mut pair, PathId::ZERO);
+    assert_eq!(
+        pair.path_stats(Client, backup)
+            .unwrap()
+            .frame_tx
+            .path_ack_escape_requests,
+        client_backup_before.path_ack_escape_requests,
+    );
+
+    pair.drive_server();
+    let server_backup_after = pair.path_stats(Server, backup).unwrap().frame_tx;
+    assert_eq!(
+        server_backup_after.path_ack_escape_acks,
+        server_backup_before.path_ack_escape_acks,
+    );
+    assert_eq!(
+        server_backup_after.path_acks_cross_path,
+        server_backup_before.path_acks_cross_path,
+    );
+    assert!(pair.path_status(Client, PathId::ZERO).is_ok());
+    Ok(())
+}
+
+#[test]
+fn ack_progress_recovery_returns_primary_ack_on_backup_path() -> TestResult {
+    let _guard = subscribe();
+    let (mut pair, backup) = ack_escape_recovery_pair(true)?;
+    let stream = deliver_primary_stream_and_drop_ack(&mut pair, b"bounded ACK escape")?;
+    let client_backup_before = pair.path_stats(Client, backup).unwrap().frame_tx;
+    let server_backup_before = pair.path_stats(Server, backup).unwrap().frame_tx;
+
+    blackhole_primary_path(&mut pair);
+    advance_client_until_ack_progress_reinjection(&mut pair, PathId::ZERO);
+    let client_backup_after = pair.path_stats(Client, backup).unwrap().frame_tx;
+    assert_eq!(
+        client_backup_after.path_ack_escape_requests,
+        client_backup_before.path_ack_escape_requests + 1,
+    );
+    assert!(
+        client_backup_after.immediate_ack > client_backup_before.immediate_ack,
+        "the recovery packet on the backup path must request immediate feedback"
+    );
+
+    pair.drive_server();
+    let server_backup_after = pair.path_stats(Server, backup).unwrap().frame_tx;
+    assert_eq!(
+        server_backup_after.path_ack_escape_acks,
+        server_backup_before.path_ack_escape_acks + 1,
+    );
+    assert!(
+        server_backup_after.path_acks_cross_path > server_backup_before.path_acks_cross_path,
+        "the still-open primary path must be cumulatively acknowledged over the backup"
+    );
+    assert!(pair.path_status(Client, PathId::ZERO).is_ok());
+
+    pair.drive_client();
+    assert_eq!(count_finished_events(&mut pair, stream), 1);
+    assert_eq!(pair.streams(Client).send_streams(), 0);
+    Ok(())
+}
+
+#[test]
+fn pto_recovery_also_requests_ack_escape_on_the_backup() -> TestResult {
+    let _guard = subscribe();
+    let (mut pair, backup) = pto_ack_escape_pair()?;
+    let before = pair.path_stats(Client, backup).unwrap().frame_tx;
+
+    let stream = pair.streams(Client).open(Dir::Uni).unwrap();
+    write_stream_data(&mut pair, stream, b"PTO ACK escape");
+    blackhole_primary_path(&mut pair);
+    pair.drive_client();
+    advance_client_until_hedge(&mut pair, PathId::ZERO);
+
+    let after = pair.path_stats(Client, backup).unwrap().frame_tx;
+    assert_eq!(
+        after.path_ack_escape_requests,
+        before.path_ack_escape_requests + 1,
+    );
+    assert!(after.immediate_ack > before.immediate_ack);
     Ok(())
 }
 
@@ -1149,7 +1284,7 @@ fn path_acks() {
 #[test]
 fn path_ack_prefers_same_feedback_path() -> TestResult {
     let _guard = subscribe();
-    let (mut pair, backup) = pto_hedge_pair(false)?;
+    let (mut pair, backup) = ack_escape_recovery_pair(true)?;
     let primary_before = pair.path_stats(Client, PathId::ZERO).unwrap().frame_tx;
     let backup_before = pair.path_stats(Client, backup).unwrap().frame_tx;
 

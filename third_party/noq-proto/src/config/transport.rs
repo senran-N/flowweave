@@ -66,6 +66,7 @@ pub struct TransportConfig {
     pub(crate) cross_path_pto_reinjection: bool,
     pub(crate) cross_path_abandon_reinjection: bool,
     pub(crate) cross_path_ack_progress_reinjection: bool,
+    pub(crate) cross_path_ack_escape: bool,
 
     pub(crate) default_path_max_idle_timeout: Option<Duration>,
     pub(crate) default_path_keep_alive_interval: Option<Duration>,
@@ -442,6 +443,19 @@ impl TransportConfig {
         self
     }
 
+    /// Whether a cross-path recovery episode may request one cumulative PATH_ACK response on the
+    /// same validated alternative path that carries the recovery data.
+    ///
+    /// This uses the existing IMMEDIATE_ACK and PATH_ACK frames. Ordinary acknowledgments still
+    /// prefer their own path; the exception is armed only by an explicit PTO or ACK-progress
+    /// recovery episode. Path status, idle detection, and path-state drain periods are unchanged.
+    ///
+    /// Disabled by default.
+    pub fn cross_path_ack_escape(&mut self, enabled: bool) -> &mut Self {
+        self.cross_path_ack_escape = enabled;
+        self
+    }
+
     /// Sets a default per-path maximum idle timeout
     ///
     /// If the path is idle for this long the path will be abandoned. Bear in mind this will
@@ -633,6 +647,7 @@ impl Default for TransportConfig {
             cross_path_pto_reinjection: false,
             cross_path_abandon_reinjection: false,
             cross_path_ack_progress_reinjection: false,
+            cross_path_ack_escape: false,
             default_path_max_idle_timeout: None,
             default_path_keep_alive_interval: None,
 
@@ -680,6 +695,7 @@ impl fmt::Debug for TransportConfig {
             cross_path_pto_reinjection,
             cross_path_abandon_reinjection,
             cross_path_ack_progress_reinjection,
+            cross_path_ack_escape,
             default_path_max_idle_timeout,
             default_path_keep_alive_interval,
             max_remote_nat_traversal_addresses,
@@ -733,6 +749,7 @@ impl fmt::Debug for TransportConfig {
                 "cross_path_ack_progress_reinjection",
                 cross_path_ack_progress_reinjection,
             )
+            .field("cross_path_ack_escape", cross_path_ack_escape)
             .field(
                 "default_path_max_idle_timeout",
                 default_path_max_idle_timeout,

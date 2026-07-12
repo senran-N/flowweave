@@ -91,6 +91,7 @@ pub enum PtoRecovery {
     CrossPathHedge,
     CrossPathHedgeAndAbandon,
     CrossPathRecovery,
+    CrossPathRecoveryWithAckEscape,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -132,25 +133,38 @@ impl PtoRecovery {
             Self::CrossPathHedge => "FlowWeave PTO 跨路径对冲",
             Self::CrossPathHedgeAndAbandon => "FlowWeave PTO + abandoned 即时对冲",
             Self::CrossPathRecovery => "FlowWeave PTO + abandoned + ACK 进展跨路径恢复",
+            Self::CrossPathRecoveryWithAckEscape => "FlowWeave ACK 进展恢复 + 有界跨路径 ACK 逃生",
         }
     }
 
     fn pto_reinjection_enabled(self) -> bool {
         matches!(
             self,
-            Self::CrossPathHedge | Self::CrossPathHedgeAndAbandon | Self::CrossPathRecovery
+            Self::CrossPathHedge
+                | Self::CrossPathHedgeAndAbandon
+                | Self::CrossPathRecovery
+                | Self::CrossPathRecoveryWithAckEscape
         )
     }
 
     fn abandon_reinjection_enabled(self) -> bool {
         matches!(
             self,
-            Self::CrossPathHedgeAndAbandon | Self::CrossPathRecovery
+            Self::CrossPathHedgeAndAbandon
+                | Self::CrossPathRecovery
+                | Self::CrossPathRecoveryWithAckEscape
         )
     }
 
     fn ack_progress_reinjection_enabled(self) -> bool {
-        matches!(self, Self::CrossPathRecovery)
+        matches!(
+            self,
+            Self::CrossPathRecovery | Self::CrossPathRecoveryWithAckEscape
+        )
+    }
+
+    fn ack_escape_enabled(self) -> bool {
+        matches!(self, Self::CrossPathRecoveryWithAckEscape)
     }
 }
 
@@ -332,6 +346,8 @@ pub struct PathMeasurement {
     pub retransmitted_stream_bytes_sent: u64,
     pub path_acks_same_path: u64,
     pub path_acks_cross_path: u64,
+    pub path_ack_escape_requests: u64,
+    pub path_ack_escape_acks: u64,
     pub lost_packets: u64,
     pub lost_bytes: u64,
     pub loss_detection_timeouts: u64,
@@ -1654,6 +1670,7 @@ fn configure_transport(
         .cross_path_pto_reinjection(pto_recovery.pto_reinjection_enabled())
         .cross_path_abandon_reinjection(pto_recovery.abandon_reinjection_enabled())
         .cross_path_ack_progress_reinjection(pto_recovery.ack_progress_reinjection_enabled())
+        .cross_path_ack_escape(pto_recovery.ack_escape_enabled())
         .default_path_max_idle_timeout(path_idle_timeout)
         .default_path_keep_alive_interval(Some(Duration::from_millis(200)))
         .datagram_receive_buffer_size(Some(1024 * 1024))
@@ -2410,6 +2427,14 @@ fn path_delta(before: PathStats, after: PathStats) -> PathMeasurement {
             .frame_tx
             .path_acks_cross_path
             .saturating_sub(before.frame_tx.path_acks_cross_path),
+        path_ack_escape_requests: after
+            .frame_tx
+            .path_ack_escape_requests
+            .saturating_sub(before.frame_tx.path_ack_escape_requests),
+        path_ack_escape_acks: after
+            .frame_tx
+            .path_ack_escape_acks
+            .saturating_sub(before.frame_tx.path_ack_escape_acks),
         lost_packets: after.lost_packets.saturating_sub(before.lost_packets),
         lost_bytes: after.lost_bytes.saturating_sub(before.lost_bytes),
         loss_detection_timeouts: after
@@ -2700,6 +2725,17 @@ mod tests {
         assert!(recovery.pto_reinjection_enabled());
         assert!(recovery.abandon_reinjection_enabled());
         assert!(recovery.ack_progress_reinjection_enabled());
+        assert!(!PtoRecovery::CANDIDATES.contains(&recovery));
+    }
+
+    #[test]
+    fn ack_escape_diagnostic_variant_is_isolated_from_history_and_candidates() {
+        let recovery = PtoRecovery::CrossPathRecoveryWithAckEscape;
+        assert!(recovery.pto_reinjection_enabled());
+        assert!(recovery.abandon_reinjection_enabled());
+        assert!(recovery.ack_progress_reinjection_enabled());
+        assert!(recovery.ack_escape_enabled());
+        assert!(!PtoRecovery::CrossPathRecovery.ack_escape_enabled());
         assert!(!PtoRecovery::CANDIDATES.contains(&recovery));
     }
 

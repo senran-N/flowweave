@@ -23,17 +23,17 @@ third_party/noq-proto 最初来自本机 Cargo 已校验的官方发布包。
 
 以下 12 个文件为 FlowWeave 当前实验快照中的可审计补丁，其他上游文件仍保持原样：
 
-- `src/config/transport.rs`：增加默认关闭的 PTO、abandoned 和 ACK 进展三项跨路径恢复配置，同一 NoQ 版本可分别复现官方基线与每个候选。
-- `src/connection/mod.rs`：在逐路径 Data PTO、路径 abandoned 或一个完整 PTO 没有新 ACK 进展时，把仍在途的 STREAM 范围加入全局重传队列一次。ACK 进展截止不被后续发包推迟，触发后原路径只探活、普通数据让给已验证备用路；探针确认后才恢复调度。标准 LossDetection、公开 PATH_STATUS、路径空闲和 3 PTO 清场保持不变。开放路径优先在本路径发送确认该路径的 PATH_ACK，关闭后才跨路回退；另记录恢复与反馈路径，并修复 GSO 小分段越界问题。
+- `src/config/transport.rs`：增加默认关闭的 PTO、abandoned、ACK 进展和有界 ACK 逃生四项跨路径恢复配置，同一 NoQ 版本可分别复现官方基线与每个候选。
+- `src/connection/mod.rs`：在逐路径 Data PTO、路径 abandoned 或一个完整 PTO 没有新 ACK 进展时，把仍在途的 STREAM 范围加入全局重传队列一次。ACK 进展截止不被后续发包推迟，触发后原路径只探活、普通数据让给已验证备用路；探针确认后才恢复调度。恢复候选还可在实际承载 STREAM 恢复数据的备用路请求一次立即反馈，让该路带回其他路径累计 PATH_ACK；普通探测不会改变 ACK 路由。标准 LossDetection、公开 PATH_STATUS、路径空闲和 3 PTO 清场保持不变。另记录恢复与反馈路径，并修复 GSO 小分段越界问题。
 - `src/connection/packet_builder.rs`：在包真正发送并登记后启动 ACK 进展纪元；后续包只登记在途状态，不移动既有恢复截止。另保留 GSO 小分段收尾修复。
 - `src/connection/paths.rs`：保存跨路径恢复探针包号边界、ACK 进展纪元起点和 O(1) 在途 STREAM 帧计数；这些都不进入线协议，也不发送公开 `PATH_STATUS`。
 - `src/connection/qlog.rs`：给独立 ACK 进展恢复定时器提供可识别的 qlog 名称。
 - `src/connection/send_buffer.rs`：区分首次与重传数据；重复、重叠和乱序 ACK 只计算新确认字节，并取消已经无用的待发重复范围。
-- `src/connection/spaces.rs`：逐路径判断本路径待发 ACK，让 Backup 路径可以发送 ACK-only 包，同时不把其他开放路径的 ACK 错当成本路径工作。
-- `src/connection/stats.rs`：分别统计每条路径首次/重传 STREAM 字节、loss/PTO、abandoned 与 ACK 进展恢复尝试、三类对冲载荷和同路/跨路 PATH_ACK；另只读暴露当前 PTO、在途字节/包、应用数据包表、PTO 计数和两只恢复定时器是否武装。
+- `src/connection/spaces.rs`：逐路径判断本路径待发 ACK，让 Backup 路径可以发送 ACK-only 包，同时不把其他开放路径的 ACK 错当成本路径工作；有界逃生会为下一次累计确认保存唯一指定的返回路径，发送或失效后立即清理。
+- `src/connection/stats.rs`：分别统计每条路径首次/重传 STREAM 字节、loss/PTO、abandoned 与 ACK 进展恢复尝试、三类对冲载荷、同路/跨路 PATH_ACK，以及 ACK 逃生请求和实际返回；另只读暴露当前 PTO、在途字节/包、应用数据包表、PTO 计数和两只恢复定时器是否武装。
 - `src/connection/streams/send.rs`：把“流是否完成”和“本次新确认字节数”一起返回，防止两个副本的 ACK 重复扣账。
 - `src/connection/streams/state.rs`：按新确认字节更新连接账目，让重传接口报告本次真正新加入队列的载荷，并向内部诊断暴露全连接未确认 STREAM 字节快照。
 - `src/connection/timer.rs`：增加独立逐路径 ACK 进展恢复定时器，并排在标准 LossDetection 之后处理同刻到期事件。
-- `src/tests/multipath.rs`：验证测量、三项默认关闭、单路径保护、PTO/abandoned/ACK 进展恢复、截止不滑动、每纪元一次、备用路接管、拥塞窗口、纯 FIN、两种 ACK 顺序和旧 ACK 边界；确定性证明 ACK 进展恢复可先于被后续发包推迟的标准 PTO 触发，同时不改变 3 PTO 清场与 PATH_ACK 规则。
+- `src/tests/multipath.rs`：验证测量、四项默认关闭、单路径保护、PTO/abandoned/ACK 进展恢复、截止不滑动、每纪元一次、备用路接管、拥塞窗口、纯 FIN、两种 ACK 顺序和旧 ACK 边界；另证明 PTO 与 ACK 进展恢复都能请求一次 ACK 逃生、正常开放路径仍同路确认，并回归空包发送循环。
 
 轮询、最低 RTT、预计最早送达、交付速率加权和 ACK-ECF 都已经按基准结果完整删除；NoQ 当前仍保持官方调度行为，不保留失败调度开关。PTO 对冲是独立的数据恢复机制，不参与 B 组容量调度。BBR3 只读容量接口曾在实验快照 `29f0ec2` 中验证，但没有通过 2 MiB 五种子短筛，随后已完整删除。
