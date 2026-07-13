@@ -44,6 +44,8 @@ mod vpn_identity_config;
 mod vpn_packet_bridge;
 mod vpn_product_config;
 #[cfg(target_os = "linux")]
+mod vpn_product_endpoint;
+#[cfg(target_os = "linux")]
 mod vpn_product_runtime;
 mod vpn_quota;
 mod vpn_session;
@@ -151,6 +153,17 @@ pub use vpn_product_config::{
     VPN_TUN_NAME_MAX_BYTES, VpnClientProductConfig, VpnProductConfigError, VpnServerProductConfig,
     load_vpn_client_product_config, load_vpn_server_product_config,
     parse_vpn_client_product_config_json, parse_vpn_server_product_config_json,
+};
+#[cfg(target_os = "linux")]
+pub use vpn_product_endpoint::{
+    VPN_CLOSE_PRODUCT_ENDPOINT_START_FAILED, VPN_CLOSE_PRODUCT_ENDPOINT_STOPPED,
+    VPN_PRODUCT_ENDPOINT_DEFAULT_CONNECT_ATTEMPTS, VPN_PRODUCT_ENDPOINT_DEFAULT_CONTROL_TIMEOUT,
+    VPN_PRODUCT_ENDPOINT_DEFAULT_DRAIN_TIMEOUT, VPN_PRODUCT_ENDPOINT_DEFAULT_OPERATION_TIMEOUT,
+    VpnClientProductEndpointReport, VpnClientProductEndpointRuntime, VpnProductConnectStartError,
+    VpnProductEndpointError, VpnProductEndpointLimits, VpnProductEndpointLimitsError,
+    VpnProductPathOpenError, VpnServerProductEndpointReport, VpnServerProductEndpointRuntime,
+    VpnServerProductEndpointStopReason, connect_vpn_client_product_endpoint,
+    start_vpn_server_product_endpoint,
 };
 #[cfg(target_os = "linux")]
 pub use vpn_product_runtime::{

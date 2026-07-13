@@ -1008,7 +1008,7 @@ fn enforce_private_permissions(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::{
         os::fd::OwnedFd,
         os::unix::net::UnixDatagram as StdUnixDatagram,
@@ -1320,14 +1320,14 @@ mod tests {
         assert!(client.acquire_runtime().is_some());
     }
 
-    struct TestDeployment {
-        path: PathBuf,
-        server_config: PathBuf,
-        client_config: PathBuf,
+    pub(crate) struct TestDeployment {
+        pub(crate) path: PathBuf,
+        pub(crate) server_config: PathBuf,
+        pub(crate) client_config: PathBuf,
     }
 
     impl TestDeployment {
-        fn new() -> Self {
+        pub(crate) fn new() -> Self {
             let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
             let path = std::env::temp_dir().join(format!(
                 "flowweave-vpn-product-bootstrap-{}-{sequence}",
@@ -1460,7 +1460,7 @@ mod tests {
         (certificate.der().clone(), key.serialize_der())
     }
 
-    fn write_json(path: &Path, value: &serde_json::Value) {
+    pub(crate) fn write_json(path: &Path, value: &serde_json::Value) {
         write_file(path, &serde_json::to_vec(value).unwrap(), 0o600);
     }
 
@@ -1471,7 +1471,7 @@ mod tests {
         fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
     }
 
-    fn packet_device_pair() -> (VpnPacketDevice, UnixDatagram) {
+    pub(crate) fn packet_device_pair() -> (VpnPacketDevice, UnixDatagram) {
         let (device, peer) = StdUnixDatagram::pair().unwrap();
         peer.set_nonblocking(true).unwrap();
         let device = VpnPacketDevice::from_file(File::from(OwnedFd::from(device))).unwrap();
@@ -1479,7 +1479,7 @@ mod tests {
         (device, peer)
     }
 
-    fn ipv4_packet(len: usize, source: &str, destination: &str, fill: u8) -> Vec<u8> {
+    pub(crate) fn ipv4_packet(len: usize, source: &str, destination: &str, fill: u8) -> Vec<u8> {
         let source = source.parse::<std::net::Ipv4Addr>().unwrap().octets();
         let destination = destination.parse::<std::net::Ipv4Addr>().unwrap().octets();
         let mut packet = vec![fill; len];
@@ -1492,7 +1492,7 @@ mod tests {
         packet
     }
 
-    fn ipv6_packet(len: usize, source: &str, destination: &str, fill: u8) -> Vec<u8> {
+    pub(crate) fn ipv6_packet(len: usize, source: &str, destination: &str, fill: u8) -> Vec<u8> {
         let source = source.parse::<std::net::Ipv6Addr>().unwrap().octets();
         let destination = destination.parse::<std::net::Ipv6Addr>().unwrap().octets();
         let mut packet = vec![fill; len];
