@@ -3,8 +3,10 @@
 use std::{
     fs,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    os::fd::AsRawFd,
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
+    process::Command,
     sync::Arc,
     time::Duration,
 };
@@ -21,8 +23,9 @@ use rcgen::{
 };
 use serde_json::json;
 use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
-    net::{TcpListener, TcpStream, UdpSocket, tcp::OwnedReadHalf, tcp::OwnedWriteHalf},
+    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
+    net::{TcpListener, TcpSocket, TcpStream, UdpSocket, tcp::OwnedReadHalf, tcp::OwnedWriteHalf},
+    task::spawn_blocking,
     time::{sleep, timeout},
 };
 
@@ -36,7 +39,8 @@ const SERVER_QUIC_PORT: u16 = 4433;
 const SERVER_CONTROL_PORT: u16 = 49000;
 const SERVER_UPLINK_IPV4_PORT: u16 = 6100;
 const SERVER_UPLINK_IPV6_PORT: u16 = 6101;
-const IO_TIMEOUT: Duration = Duration::from_secs(5);
+const SERVER_TCP_IPV4_PORT: u16 = 6200;
+const IO_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[test]
 #[ignore = "必须通过 scripts/run_vpn_tun_lab.sh 在一次性 user+network namespace 中运行"]
@@ -131,6 +135,12 @@ async fn run_endpoint_server(directory: &Path) {
     ))
     .await
     .unwrap();
+    let tcp_ipv4 = TcpListener::bind(SocketAddr::new(
+        IpAddr::V4(SERVER_TUN_IPV4),
+        SERVER_TCP_IPV4_PORT,
+    ))
+    .await
+    .unwrap();
     let control = TcpListener::bind(SocketAddr::new(
         IpAddr::V4(SERVER_OUTER_IPV4),
         SERVER_CONTROL_PORT,
@@ -191,6 +201,71 @@ async fn run_endpoint_server(directory: &Path) {
         downlink_ipv6.len()
     );
     send_line(&mut write, "DOWN6_SENT").await;
+
+    recv_udp_payload(
+        &uplink_ipv4,
+        &payload(1472, 0x91),
+        IpAddr::V4(CLIENT_TUN_IPV4),
+    )
+    .await;
+    send_line(&mut write, "MTU4_UP_OK").await;
+    let mtu_ipv4_port = parse_port(&read_line(&mut read).await, "MTU4_DOWN");
+    let mtu_ipv4 = payload(1472, 0x92);
+    assert_eq!(
+        uplink_ipv4
+            .send_to(
+                &mtu_ipv4,
+                SocketAddr::new(IpAddr::V4(CLIENT_TUN_IPV4), mtu_ipv4_port),
+            )
+            .await
+            .unwrap(),
+        mtu_ipv4.len()
+    );
+    send_line(&mut write, "MTU4_DOWN_SENT").await;
+
+    recv_udp_payload(
+        &uplink_ipv6,
+        &payload(1452, 0x93),
+        IpAddr::V6(CLIENT_TUN_IPV6),
+    )
+    .await;
+    send_line(&mut write, "MTU6_UP_OK").await;
+    let mtu_ipv6_port = parse_port(&read_line(&mut read).await, "MTU6_DOWN");
+    let mtu_ipv6 = payload(1452, 0x94);
+    assert_eq!(
+        uplink_ipv6
+            .send_to(
+                &mtu_ipv6,
+                SocketAddr::new(IpAddr::V6(CLIENT_TUN_IPV6), mtu_ipv6_port),
+            )
+            .await
+            .unwrap(),
+        mtu_ipv6.len()
+    );
+    send_line(&mut write, "MTU6_DOWN_SENT").await;
+
+    let (mut tcp_stream, tcp_peer) = timeout(IO_TIMEOUT, tcp_ipv4.accept())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(tcp_peer.ip(), IpAddr::V4(CLIENT_TUN_IPV4));
+    let mut tcp_payload = Vec::new();
+    timeout(IO_TIMEOUT, tcp_stream.read_to_end(&mut tcp_payload))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(tcp_payload, payload(256 * 1024, 0xa5));
+    timeout(IO_TIMEOUT, async {
+        tcp_stream.write_all(&tcp_payload).await?;
+        tcp_stream.shutdown().await
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    send_line(&mut write, "TCP4_OK").await;
+
+    assert_eq!(read_line(&mut read).await, "PING_OK");
+    send_line(&mut write, "PING_ACK").await;
 
     assert_eq!(read_line(&mut read).await, "GEN1_DONE");
     wait_for_server_session_release(&bootstrap).await;
@@ -308,6 +383,110 @@ async fn run_endpoint_client(directory: &Path) {
         IpAddr::V6(SERVER_TUN_IPV6),
     )
     .await;
+
+    let mtu_ipv4_payload = payload(1472, 0x91);
+    assert_eq!(
+        uplink_ipv4
+            .send_to(
+                &mtu_ipv4_payload,
+                SocketAddr::new(IpAddr::V4(SERVER_TUN_IPV4), SERVER_UPLINK_IPV4_PORT),
+            )
+            .await
+            .unwrap(),
+        mtu_ipv4_payload.len()
+    );
+    assert_eq!(read_line(&mut read).await, "MTU4_UP_OK");
+    send_line(
+        &mut write,
+        &format!("MTU4_DOWN {}", downlink_ipv4.local_addr().unwrap().port()),
+    )
+    .await;
+    assert_eq!(read_line(&mut read).await, "MTU4_DOWN_SENT");
+    recv_udp_payload(
+        &downlink_ipv4,
+        &payload(1472, 0x92),
+        IpAddr::V4(SERVER_TUN_IPV4),
+    )
+    .await;
+
+    let mtu_ipv6_payload = payload(1452, 0x93);
+    assert_eq!(
+        uplink_ipv6
+            .send_to(
+                &mtu_ipv6_payload,
+                SocketAddr::new(IpAddr::V6(SERVER_TUN_IPV6), SERVER_UPLINK_IPV6_PORT),
+            )
+            .await
+            .unwrap(),
+        mtu_ipv6_payload.len()
+    );
+    assert_eq!(read_line(&mut read).await, "MTU6_UP_OK");
+    send_line(
+        &mut write,
+        &format!("MTU6_DOWN {}", downlink_ipv6.local_addr().unwrap().port()),
+    )
+    .await;
+    assert_eq!(read_line(&mut read).await, "MTU6_DOWN_SENT");
+    recv_udp_payload(
+        &downlink_ipv6,
+        &payload(1452, 0x94),
+        IpAddr::V6(SERVER_TUN_IPV6),
+    )
+    .await;
+
+    enable_strict_pmtu(&uplink_ipv4, false);
+    let ipv4_oversize = uplink_ipv4
+        .send_to(
+            &payload(1473, 0x95),
+            SocketAddr::new(IpAddr::V4(SERVER_TUN_IPV4), SERVER_UPLINK_IPV4_PORT),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(ipv4_oversize.raw_os_error(), Some(libc::EMSGSIZE));
+    enable_strict_pmtu(&uplink_ipv6, true);
+    let ipv6_oversize = uplink_ipv6
+        .send_to(
+            &payload(1453, 0x96),
+            SocketAddr::new(IpAddr::V6(SERVER_TUN_IPV6), SERVER_UPLINK_IPV6_PORT),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(ipv6_oversize.raw_os_error(), Some(libc::EMSGSIZE));
+
+    let tcp_socket = TcpSocket::new_v4().unwrap();
+    tcp_socket
+        .bind(SocketAddr::new(IpAddr::V4(CLIENT_TUN_IPV4), 0))
+        .unwrap();
+    let mut tcp_stream = timeout(
+        IO_TIMEOUT,
+        tcp_socket.connect(SocketAddr::new(
+            IpAddr::V4(SERVER_TUN_IPV4),
+            SERVER_TCP_IPV4_PORT,
+        )),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let tcp_payload = payload(256 * 1024, 0xa5);
+    timeout(IO_TIMEOUT, async {
+        tcp_stream.write_all(&tcp_payload).await?;
+        tcp_stream.shutdown().await
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    let mut tcp_echo = Vec::new();
+    timeout(IO_TIMEOUT, tcp_stream.read_to_end(&mut tcp_echo))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(tcp_echo, tcp_payload);
+    assert_eq!(read_line(&mut read).await, "TCP4_OK");
+
+    run_unprivileged_ping(false).await;
+    run_unprivileged_ping(true).await;
+    send_line(&mut write, "PING_OK").await;
+    assert_eq!(read_line(&mut read).await, "PING_ACK");
 
     let first_report = first.shutdown().await;
     assert!(first_report.endpoint_drained);
@@ -493,6 +672,61 @@ fn payload(length: usize, fill: u8) -> Vec<u8> {
     (0..length)
         .map(|index| fill.wrapping_add((index % 17) as u8))
         .collect()
+}
+
+fn enable_strict_pmtu(socket: &UdpSocket, ipv6: bool) {
+    let value = libc::IP_PMTUDISC_DO;
+    let (level, option) = if ipv6 {
+        (libc::IPPROTO_IPV6, libc::IPV6_MTU_DISCOVER)
+    } else {
+        (libc::IPPROTO_IP, libc::IP_MTU_DISCOVER)
+    };
+    // SAFETY: socket is live and value points to a correctly sized integer option.
+    let result = unsafe {
+        libc::setsockopt(
+            socket.as_raw_fd(),
+            level,
+            option,
+            (&value as *const libc::c_int).cast(),
+            std::mem::size_of_val(&value) as libc::socklen_t,
+        )
+    };
+    assert_eq!(result, 0, "failed to enable strict PMTU discovery");
+}
+
+async fn run_unprivileged_ping(ipv6: bool) {
+    let destination = if ipv6 {
+        SERVER_TUN_IPV6.to_string()
+    } else {
+        SERVER_TUN_IPV4.to_string()
+    };
+    let output = timeout(
+        IO_TIMEOUT,
+        spawn_blocking(move || {
+            Command::new("ping")
+                .args([
+                    if ipv6 { "-6" } else { "-4" },
+                    "-n",
+                    "-c",
+                    "2",
+                    "-W",
+                    "2",
+                    "-w",
+                    "5",
+                    &destination,
+                ])
+                .output()
+        }),
+    )
+    .await
+    .unwrap()
+    .unwrap()
+    .unwrap();
+    assert!(
+        output.status.success(),
+        "ping failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 fn endpoint_lab_directory() -> PathBuf {

@@ -146,6 +146,7 @@ unshare \
         ip netns exec fwclient ip -6 addr add fd77::2/128 dev fwvpn0 nodad
         ip netns exec fwclient ip route add 10.77.0.1/32 dev fwvpn0
         ip netns exec fwclient ip -6 route add fd77::1/128 dev fwvpn0
+        ip netns exec fwclient sh -c '"'"'echo "1000 1000" > /proc/sys/net/ipv4/ping_group_range'"'"'
 
         server_pid=
         cleanup_endpoint_lab() {
