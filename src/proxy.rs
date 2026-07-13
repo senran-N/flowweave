@@ -19,8 +19,9 @@ use subtle::ConstantTimeEq;
 use tokio::{
     io::AsyncWriteExt,
     net::{TcpListener, TcpStream, lookup_host},
+    sync::Semaphore,
     task::JoinHandle,
-    time::{Instant, sleep},
+    time::{Instant, sleep, timeout},
 };
 
 use super::{
@@ -33,6 +34,13 @@ const MAX_TOKEN_LENGTH: usize = 256;
 const MAX_TARGET_LENGTH: usize = 128;
 const MAX_PRODUCT_PATHS: usize = 8;
 const PRODUCT_PATH_IDLE_TIMEOUT: Duration = Duration::from_secs(3);
+const PRODUCT_MAX_SERVER_CONNECTIONS: usize = 64;
+const PRODUCT_MAX_STREAMS_PER_CONNECTION: u32 = 64;
+const PRODUCT_MAX_CLIENT_STREAMS: usize = 64;
+const PRODUCT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+const PRODUCT_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+const PRODUCT_UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const PRODUCT_STREAM_OPEN_TIMEOUT: Duration = Duration::from_secs(10);
 
 const STATUS_OK: u8 = 0;
 const STATUS_VERSION: u8 = 1;
@@ -57,6 +65,27 @@ const CLIENT_REQUIRED_KEYS: [&str; 6] = [
     "target",
 ];
 const CLIENT_OPTIONAL_KEYS: [&str; 2] = ["primary_local_ip", "additional_local_ips"];
+
+#[derive(Debug, Clone, Copy)]
+struct ProxyRuntimeLimits {
+    max_server_connections: usize,
+    max_streams_per_connection: u32,
+    max_client_streams: usize,
+    handshake_timeout: Duration,
+    request_timeout: Duration,
+    upstream_connect_timeout: Duration,
+    stream_open_timeout: Duration,
+}
+
+const PRODUCT_RUNTIME_LIMITS: ProxyRuntimeLimits = ProxyRuntimeLimits {
+    max_server_connections: PRODUCT_MAX_SERVER_CONNECTIONS,
+    max_streams_per_connection: PRODUCT_MAX_STREAMS_PER_CONNECTION,
+    max_client_streams: PRODUCT_MAX_CLIENT_STREAMS,
+    handshake_timeout: PRODUCT_HANDSHAKE_TIMEOUT,
+    request_timeout: PRODUCT_REQUEST_TIMEOUT,
+    upstream_connect_timeout: PRODUCT_UPSTREAM_CONNECT_TIMEOUT,
+    stream_open_timeout: PRODUCT_STREAM_OPEN_TIMEOUT,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProxyServerConfig {
@@ -179,6 +208,13 @@ pub async fn run_proxy_client(path: impl AsRef<Path>) -> LabResult<()> {
 }
 
 pub async fn start_proxy_server(config: ProxyServerConfig) -> LabResult<ProxyRuntime> {
+    start_proxy_server_with_limits(config, PRODUCT_RUNTIME_LIMITS).await
+}
+
+async fn start_proxy_server_with_limits(
+    config: ProxyServerConfig,
+    limits: ProxyRuntimeLimits,
+) -> LabResult<ProxyRuntime> {
     let certificate = read_certificate(&config.certificate_der)?;
     let private_key = read_private_key(&config.private_key_der)?;
     let token = Arc::new(read_token(&config.token_file)?);
@@ -186,13 +222,18 @@ pub async fn start_proxy_server(config: ProxyServerConfig) -> LabResult<ProxyRun
     let mut server_config = ServerConfig::with_single_cert(vec![certificate], private_key.into())?;
     let transport = Arc::get_mut(&mut server_config.transport)
         .ok_or_else(|| other_error("无法配置服务端产品传输参数"))?;
-    configure_product_transport(transport, (MAX_PRODUCT_PATHS + 1) as u32);
+    configure_product_transport(
+        transport,
+        (MAX_PRODUCT_PATHS + 1) as u32,
+        limits.max_streams_per_connection,
+    );
 
     let endpoint = Endpoint::server(server_config, config.listen)?;
     let local_addr = endpoint.local_addr()?;
     let allowed_target = config.allowed_target;
-    let task =
-        tokio::spawn(async move { run_server_accept_loop(endpoint, token, allowed_target).await });
+    let task = tokio::spawn(async move {
+        run_server_accept_loop(endpoint, token, allowed_target, limits).await
+    });
     Ok(ProxyRuntime {
         local_addr,
         task: Some(task),
@@ -200,9 +241,18 @@ pub async fn start_proxy_server(config: ProxyServerConfig) -> LabResult<ProxyRun
 }
 
 pub async fn start_proxy_client(config: ProxyClientConfig) -> LabResult<ProxyRuntime> {
+    start_proxy_client_with_limits(config, PRODUCT_RUNTIME_LIMITS).await
+}
+
+async fn start_proxy_client_with_limits(
+    config: ProxyClientConfig,
+    limits: ProxyRuntimeLimits,
+) -> LabResult<ProxyRuntime> {
     let certificate = read_certificate(&config.ca_certificate_der)?;
     let token = Arc::new(read_token(&config.token_file)?);
-    let server_addr = resolve_server_addr(&config).await?;
+    let server_addr = timeout(limits.handshake_timeout, resolve_server_addr(&config))
+        .await
+        .map_err(|_| other_error("解析服务端地址超时"))??;
     let replace_bootstrap_path =
         config.primary_local_ip.is_some() && !config.additional_local_ips.is_empty();
     let bind_ip = if replace_bootstrap_path {
@@ -222,19 +272,23 @@ pub async fn start_proxy_client(config: ProxyClientConfig) -> LabResult<ProxyRun
         config.additional_local_ips.len() + 1 + usize::from(replace_bootstrap_path);
     let path_count = u32::try_from(transient_path_count)
         .map_err(|_| other_error("additional_local_ips 数量过多"))?;
-    configure_product_transport(&mut transport, path_count);
+    configure_product_transport(&mut transport, path_count, 0);
     client_config.transport_config(Arc::new(transport));
     endpoint.set_default_client_config(client_config);
 
-    let connection = endpoint
+    let connecting = endpoint
         .connect(server_addr, &config.server_name)
-        .map_err(|error| other_error(format!("客户端无法开始 TLS 连接：{error}")))?
-        .await?;
+        .map_err(|error| other_error(format!("客户端无法开始 TLS 连接：{error}")))?;
+    let connection = timeout(limits.handshake_timeout, connecting)
+        .await
+        .map_err(|_| other_error("客户端 TLS 连接超时"))??;
     if !connection.is_multipath_enabled() {
         connection.close(0_u8.into(), b"multipath negotiation failed");
         return Err(other_error("客户端和服务端没有协商成功 MPQUIC"));
     }
-    connection.handshake_confirmed().await?;
+    timeout(limits.handshake_timeout, connection.handshake_confirmed())
+        .await
+        .map_err(|_| other_error("客户端等待 TLS 确认超时"))??;
 
     let configured_paths = config
         .primary_local_ip
@@ -263,7 +317,7 @@ pub async fn start_proxy_client(config: ProxyClientConfig) -> LabResult<ProxyRun
     let local_addr = listener.local_addr()?;
     let target = config.target;
     let task = tokio::spawn(async move {
-        run_client_accept_loop(endpoint, connection, listener, token, target).await
+        run_client_accept_loop(endpoint, connection, listener, token, target, limits).await
     });
     Ok(ProxyRuntime {
         local_addr,
@@ -302,21 +356,34 @@ async fn run_server_accept_loop(
     endpoint: Endpoint,
     token: Arc<Vec<u8>>,
     allowed_target: SocketAddr,
+    limits: ProxyRuntimeLimits,
 ) -> LabResult<()> {
+    let connection_slots = Arc::new(Semaphore::new(limits.max_server_connections));
     loop {
         let incoming = endpoint
             .accept()
             .await
             .ok_or_else(|| other_error("服务端 Endpoint 已停止监听"))?;
+        let connection_slot = match connection_slots.clone().try_acquire_owned() {
+            Ok(slot) => slot,
+            Err(_) => {
+                eprintln!("event=proxy_connection_refused reason=connection_limit");
+                incoming.refuse();
+                continue;
+            }
+        };
         let token = token.clone();
         tokio::spawn(async move {
+            let _connection_slot = connection_slot;
             let result = async {
-                let connection = incoming.await?;
+                let connection = timeout(limits.handshake_timeout, async move { incoming.await })
+                    .await
+                    .map_err(|_| other_error("服务端 TLS 握手超时"))??;
                 if !connection.is_multipath_enabled() {
                     connection.close(0_u8.into(), b"multipath required");
                     return Err(other_error("入站连接没有协商 MPQUIC"));
                 }
-                serve_proxy_connection(connection, token, allowed_target).await
+                serve_proxy_connection(connection, token, allowed_target, limits).await
             }
             .await;
             if let Err(error) = result {
@@ -330,6 +397,7 @@ async fn serve_proxy_connection(
     connection: Connection,
     token: Arc<Vec<u8>>,
     allowed_target: SocketAddr,
+    limits: ProxyRuntimeLimits,
 ) -> LabResult<()> {
     loop {
         let (send, receive) = match connection.accept_bi().await {
@@ -341,7 +409,9 @@ async fn serve_proxy_connection(
         };
         let token = token.clone();
         tokio::spawn(async move {
-            if let Err(error) = handle_server_stream(send, receive, &token, allowed_target).await {
+            if let Err(error) =
+                handle_server_stream(send, receive, &token, allowed_target, limits).await
+            {
                 eprintln!("FlowWeave 服务端数据流结束：{error}");
             }
         });
@@ -353,12 +423,17 @@ async fn handle_server_stream(
     mut receive: noq::RecvStream,
     expected_token: &[u8],
     allowed_target: SocketAddr,
+    limits: ProxyRuntimeLimits,
 ) -> LabResult<()> {
-    let request = match read_proxy_request(&mut receive).await {
-        Ok(request) => request,
-        Err(rejection) => {
+    let request = match timeout(limits.request_timeout, read_proxy_request(&mut receive)).await {
+        Ok(Ok(request)) => request,
+        Ok(Err(rejection)) => {
             send_status(&mut send, rejection.status).await?;
             return Err(other_error(rejection.message));
+        }
+        Err(_) => {
+            send_status(&mut send, STATUS_FORMAT).await?;
+            return Err(other_error("代理请求读取超时"));
         }
     };
 
@@ -371,11 +446,20 @@ async fn handle_server_stream(
         return Err(other_error("代理请求目标不在允许范围内"));
     }
 
-    let upstream = match TcpStream::connect(allowed_target).await {
-        Ok(upstream) => upstream,
-        Err(error) => {
+    let upstream = match timeout(
+        limits.upstream_connect_timeout,
+        TcpStream::connect(allowed_target),
+    )
+    .await
+    {
+        Ok(Ok(upstream)) => upstream,
+        Ok(Err(error)) => {
             send_status(&mut send, STATUS_UPSTREAM).await?;
             return Err(other_error(format!("无法连接固定上游：{error}")));
+        }
+        Err(_) => {
+            send_status(&mut send, STATUS_UPSTREAM).await?;
+            return Err(other_error("连接固定上游超时"));
         }
     };
     send.write_all(&[STATUS_OK]).await?;
@@ -388,7 +472,9 @@ async fn run_client_accept_loop(
     listener: TcpListener,
     token: Arc<Vec<u8>>,
     target: SocketAddr,
+    limits: ProxyRuntimeLimits,
 ) -> LabResult<()> {
+    let stream_slots = Arc::new(Semaphore::new(limits.max_client_streams));
     loop {
         tokio::select! {
             error = connection.closed() => {
@@ -396,10 +482,21 @@ async fn run_client_accept_loop(
             }
             accepted = listener.accept() => {
                 let (local, _) = accepted?;
+                let stream_slot = match stream_slots.clone().try_acquire_owned() {
+                    Ok(slot) => slot,
+                    Err(_) => {
+                        eprintln!("event=proxy_stream_refused reason=client_stream_limit");
+                        drop(local);
+                        continue;
+                    }
+                };
                 let connection = connection.clone();
                 let token = token.clone();
                 tokio::spawn(async move {
-                    if let Err(error) = handle_client_stream(connection, local, &token, target).await {
+                    let _stream_slot = stream_slot;
+                    if let Err(error) =
+                        handle_client_stream(connection, local, &token, target, limits).await
+                    {
                         eprintln!("FlowWeave 客户端数据流结束：{error}");
                     }
                 });
@@ -413,13 +510,22 @@ async fn handle_client_stream(
     local: TcpStream,
     token: &[u8],
     target: SocketAddr,
+    limits: ProxyRuntimeLimits,
 ) -> LabResult<()> {
-    let (mut send, mut receive) = connection.open_bi().await?;
+    let streams = timeout(limits.stream_open_timeout, connection.open_bi())
+        .await
+        .map_err(|_| other_error("打开代理 QUIC 数据流超时"))?;
+    let (mut send, mut receive) = streams?;
     let request = encode_proxy_request(token, target)?;
-    send.write_all(&request).await?;
 
     let mut status = [0_u8; 1];
-    receive.read_exact(&mut status).await?;
+    timeout(limits.request_timeout, async {
+        send.write_all(&request).await?;
+        receive.read_exact(&mut status).await?;
+        Ok::<(), super::LabError>(())
+    })
+    .await
+    .map_err(|_| other_error("代理数据流协商超时"))??;
     if status[0] != STATUS_OK {
         return Err(other_error(format!(
             "服务端拒绝代理数据流（状态 {}）",
@@ -572,7 +678,11 @@ async fn send_status(send: &mut noq::SendStream, status: u8) -> LabResult<()> {
     Ok(())
 }
 
-fn configure_product_transport(transport: &mut TransportConfig, path_count: u32) {
+fn configure_product_transport(
+    transport: &mut TransportConfig,
+    path_count: u32,
+    incoming_bidi_streams: u32,
+) {
     configure_transport(
         transport,
         Some(PRODUCT_PATH_IDLE_TIMEOUT),
@@ -582,6 +692,8 @@ fn configure_product_transport(transport: &mut TransportConfig, path_count: u32)
         false,
     );
     transport.max_concurrent_multipath_paths(path_count.max(1));
+    transport.max_concurrent_bidi_streams(incoming_bidi_streams.into());
+    transport.max_concurrent_uni_streams(0_u8.into());
 }
 
 fn read_certificate(path: &Path) -> LabResult<CertificateDer<'static>> {
@@ -820,6 +932,18 @@ mod tests {
 
     static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
+    fn test_runtime_limits() -> ProxyRuntimeLimits {
+        ProxyRuntimeLimits {
+            max_server_connections: 4,
+            max_streams_per_connection: 4,
+            max_client_streams: 4,
+            handshake_timeout: Duration::from_secs(2),
+            request_timeout: Duration::from_secs(2),
+            upstream_connect_timeout: Duration::from_secs(2),
+            stream_open_timeout: Duration::from_secs(2),
+        }
+    }
+
     struct TestDirectory(PathBuf);
 
     impl TestDirectory {
@@ -918,6 +1042,8 @@ mod tests {
             for required_line in [
                 "User=flowweave",
                 "UMask=0077",
+                "TasksMax=512",
+                "MemoryMax=1G",
                 "CapabilityBoundingSet=",
                 "NoNewPrivileges=true",
                 "ProtectHostname=true",
@@ -976,9 +1102,11 @@ mod tests {
     #[test]
     fn product_transport_enables_v69_without_b_sensor() {
         let mut transport = TransportConfig::default();
-        configure_product_transport(&mut transport, 3);
+        configure_product_transport(&mut transport, 3, PRODUCT_MAX_STREAMS_PER_CONNECTION);
         let debug = format!("{transport:?}");
         assert!(debug.contains("max_concurrent_multipath_paths: Some(3)"));
+        assert!(debug.contains("max_concurrent_bidi_streams: 64"));
+        assert!(debug.contains("max_concurrent_uni_streams: 0"));
         assert!(debug.contains("cross_path_pto_reinjection: true"));
         assert!(debug.contains("cross_path_abandon_reinjection: true"));
         assert!(debug.contains("cross_path_ack_progress_reinjection: true"));
@@ -1118,6 +1246,158 @@ mod tests {
         server.shutdown().await;
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn slow_proxy_request_is_rejected_before_upstream_connect() {
+        let _network_test_guard = crate::LOCAL_NETWORK_TEST_LOCK.lock().await;
+        let directory = TestDirectory::new();
+        let (certificate_path, key_path, token_path) = write_test_credentials(&directory);
+        let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let limits = ProxyRuntimeLimits {
+            request_timeout: Duration::from_millis(50),
+            ..test_runtime_limits()
+        };
+        let server = start_proxy_server_with_limits(
+            ProxyServerConfig {
+                listen: "127.0.0.1:0".parse().unwrap(),
+                certificate_der: certificate_path.clone(),
+                private_key_der: key_path,
+                token_file: token_path,
+                allowed_target: upstream.local_addr().unwrap(),
+            },
+            limits,
+        )
+        .await
+        .unwrap();
+        let (raw_endpoint, connection) =
+            connect_raw_proxy(server.local_addr(), &certificate_path).await;
+
+        let (mut send_guard, mut receive) = connection.open_bi().await.unwrap();
+        send_guard.write_all(&[0_u8]).await.unwrap();
+        let mut status = [0_u8; 1];
+        timeout(Duration::from_secs(1), receive.read_exact(&mut status))
+            .await
+            .expect("慢请求应在产品截止时间内被拒绝")
+            .unwrap();
+        assert_eq!(status[0], STATUS_FORMAT);
+        assert!(
+            timeout(Duration::from_millis(100), upstream.accept())
+                .await
+                .is_err(),
+            "请求超时不得连接固定上游"
+        );
+
+        connection.close(0_u8.into(), b"test complete");
+        raw_endpoint.close(0_u8.into(), b"test complete");
+        server.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn server_connection_limit_refuses_a_second_handshake() {
+        let _network_test_guard = crate::LOCAL_NETWORK_TEST_LOCK.lock().await;
+        let directory = TestDirectory::new();
+        let (certificate_path, key_path, token_path) = write_test_credentials(&directory);
+        let limits = ProxyRuntimeLimits {
+            max_server_connections: 1,
+            ..test_runtime_limits()
+        };
+        let server = start_proxy_server_with_limits(
+            ProxyServerConfig {
+                listen: "127.0.0.1:0".parse().unwrap(),
+                certificate_der: certificate_path.clone(),
+                private_key_der: key_path,
+                token_file: token_path,
+                allowed_target: "127.0.0.1:9".parse().unwrap(),
+            },
+            limits,
+        )
+        .await
+        .unwrap();
+        let (first_endpoint, first_connection) =
+            connect_raw_proxy(server.local_addr(), &certificate_path).await;
+
+        let second = timeout(
+            Duration::from_secs(2),
+            try_connect_raw_proxy(server.local_addr(), &certificate_path),
+        )
+        .await
+        .expect("第二次握手应被立即拒绝");
+        assert!(second.is_err());
+
+        first_connection.close(0_u8.into(), b"test complete");
+        first_endpoint.close(0_u8.into(), b"test complete");
+        server.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn client_stream_limit_closes_excess_local_connections() {
+        let _network_test_guard = crate::LOCAL_NETWORK_TEST_LOCK.lock().await;
+        use tokio::sync::oneshot;
+
+        let directory = TestDirectory::new();
+        let (certificate_path, key_path, token_path) = write_test_credentials(&directory);
+        let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream.local_addr().unwrap();
+        let (accepted_tx, accepted_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        let upstream_task = tokio::spawn(async move {
+            let (stream, _) = upstream.accept().await.unwrap();
+            let _ = accepted_tx.send(());
+            let _ = release_rx.await;
+            drop(stream);
+        });
+
+        let server = start_proxy_server_with_limits(
+            ProxyServerConfig {
+                listen: "127.0.0.1:0".parse().unwrap(),
+                certificate_der: certificate_path.clone(),
+                private_key_der: key_path,
+                token_file: token_path.clone(),
+                allowed_target: upstream_addr,
+            },
+            test_runtime_limits(),
+        )
+        .await
+        .unwrap();
+        let client_limits = ProxyRuntimeLimits {
+            max_client_streams: 1,
+            ..test_runtime_limits()
+        };
+        let client = start_proxy_client_with_limits(
+            ProxyClientConfig {
+                listen: "127.0.0.1:0".parse().unwrap(),
+                server: server.local_addr().to_string(),
+                server_name: "localhost".to_owned(),
+                ca_certificate_der: certificate_path,
+                token_file: token_path,
+                target: upstream_addr,
+                primary_local_ip: None,
+                additional_local_ips: Vec::new(),
+            },
+            client_limits,
+        )
+        .await
+        .unwrap();
+
+        let first = TcpStream::connect(client.local_addr()).await.unwrap();
+        timeout(Duration::from_secs(2), accepted_rx)
+            .await
+            .expect("首个代理流应连接固定上游")
+            .unwrap();
+
+        let mut second = TcpStream::connect(client.local_addr()).await.unwrap();
+        let mut buffer = [0_u8; 1];
+        let closed = timeout(Duration::from_secs(1), second.read(&mut buffer))
+            .await
+            .expect("超额本地连接应被及时关闭");
+        assert!(matches!(closed, Ok(0) | Err(_)));
+
+        drop(first);
+        let _ = release_tx.send(());
+        upstream_task.await.unwrap();
+        client.shutdown().await;
+        server.shutdown().await;
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn failed_upstream_stream_does_not_terminate_existing_stream() {
         let _network_test_guard = crate::LOCAL_NETWORK_TEST_LOCK.lock().await;
@@ -1231,23 +1511,29 @@ mod tests {
         server_addr: SocketAddr,
         certificate_path: &Path,
     ) -> (Endpoint, Connection) {
+        try_connect_raw_proxy(server_addr, certificate_path)
+            .await
+            .unwrap()
+    }
+
+    async fn try_connect_raw_proxy(
+        server_addr: SocketAddr,
+        certificate_path: &Path,
+    ) -> LabResult<(Endpoint, Connection)> {
         let mut roots = RootCertStore::empty();
-        roots
-            .add(read_certificate(certificate_path).unwrap())
-            .unwrap();
-        let mut client_config = ClientConfig::with_root_certificates(Arc::new(roots)).unwrap();
+        roots.add(read_certificate(certificate_path)?)?;
+        let mut client_config = ClientConfig::with_root_certificates(Arc::new(roots))?;
         let mut transport = TransportConfig::default();
-        configure_product_transport(&mut transport, 1);
+        configure_product_transport(&mut transport, 1, 0);
         client_config.transport_config(Arc::new(transport));
-        let endpoint = Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        let endpoint = Endpoint::client("127.0.0.1:0".parse()?)?;
         endpoint.set_default_client_config(client_config);
         let connection = endpoint
             .connect(server_addr, "localhost")
-            .unwrap()
-            .await
-            .unwrap();
-        connection.handshake_confirmed().await.unwrap();
-        (endpoint, connection)
+            .map_err(|error| other_error(format!("测试客户端无法开始连接：{error}")))?
+            .await?;
+        connection.handshake_confirmed().await?;
+        Ok((endpoint, connection))
     }
 
     async fn send_raw_request(connection: &Connection, request: &[u8]) -> u8 {
