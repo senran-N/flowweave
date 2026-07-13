@@ -1,28 +1,37 @@
 use std::{
     collections::{HashMap, HashSet},
-    fs, io,
+    fmt, fs, io,
     net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
-    sync::Arc,
-    time::Duration,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+#[cfg(not(test))]
+use std::io::Write as _;
+
 use noq::{
-    ClientConfig, Connection, ConnectionError, Endpoint, FourTuple, PathError, PathId, PathStatus,
-    ServerConfig, TransportConfig,
+    ClientConfig, Connection, ConnectionError, Endpoint, FourTuple, PathError, PathEvent, PathId,
+    PathStatus, ServerConfig, TransportConfig,
     rustls::{
         RootCertStore,
         pki_types::{CertificateDer, PrivatePkcs8KeyDer},
     },
 };
+use noq_proto::PathAbandonReason;
+use serde_json::{Map, Value, json};
 use subtle::ConstantTimeEq;
 use tokio::{
     io::AsyncWriteExt,
     net::{TcpListener, TcpStream, lookup_host},
-    sync::Semaphore,
-    task::JoinHandle,
-    time::{Instant, sleep, timeout},
+    sync::{Semaphore, watch},
+    task::{JoinHandle, JoinSet},
+    time::{Instant, interval_at, sleep, timeout},
 };
+use tokio_stream::StreamExt;
 
 use super::{
     LabResult, MultipathScheduler, PtoRecovery, QuicCongestion, configure_transport, other_error,
@@ -41,6 +50,9 @@ const PRODUCT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const PRODUCT_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const PRODUCT_UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const PRODUCT_STREAM_OPEN_TIMEOUT: Duration = Duration::from_secs(10);
+const PRODUCT_SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
+const PRODUCT_METRICS_INTERVAL: Duration = Duration::from_secs(10);
+const EVENT_SCHEMA: &str = "flowweave.runtime.v1";
 
 const STATUS_OK: u8 = 0;
 const STATUS_VERSION: u8 = 1;
@@ -75,6 +87,8 @@ struct ProxyRuntimeLimits {
     request_timeout: Duration,
     upstream_connect_timeout: Duration,
     stream_open_timeout: Duration,
+    shutdown_drain_timeout: Duration,
+    metrics_interval: Duration,
 }
 
 const PRODUCT_RUNTIME_LIMITS: ProxyRuntimeLimits = ProxyRuntimeLimits {
@@ -85,7 +99,251 @@ const PRODUCT_RUNTIME_LIMITS: ProxyRuntimeLimits = ProxyRuntimeLimits {
     request_timeout: PRODUCT_REQUEST_TIMEOUT,
     upstream_connect_timeout: PRODUCT_UPSTREAM_CONNECT_TIMEOUT,
     stream_open_timeout: PRODUCT_STREAM_OPEN_TIMEOUT,
+    shutdown_drain_timeout: PRODUCT_SHUTDOWN_DRAIN_TIMEOUT,
+    metrics_interval: PRODUCT_METRICS_INTERVAL,
 };
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ProxyMetricsSnapshot {
+    pub active_connections: u64,
+    pub total_connections: u64,
+    pub connection_rejects: u64,
+    pub active_streams: u64,
+    pub total_streams: u64,
+    pub stream_rejects: u64,
+    pub dns_timeouts: u64,
+    pub handshake_timeouts: u64,
+    pub request_timeouts: u64,
+    pub stream_open_timeouts: u64,
+    pub upstream_connect_timeouts: u64,
+    pub upstream_errors: u64,
+    pub upload_bytes: u64,
+    pub download_bytes: u64,
+    pub graceful_shutdowns: u64,
+    pub forced_shutdowns: u64,
+}
+
+#[derive(Debug, Default)]
+struct ProxyMetrics {
+    active_connections: AtomicU64,
+    total_connections: AtomicU64,
+    connection_rejects: AtomicU64,
+    active_streams: AtomicU64,
+    total_streams: AtomicU64,
+    stream_rejects: AtomicU64,
+    dns_timeouts: AtomicU64,
+    handshake_timeouts: AtomicU64,
+    request_timeouts: AtomicU64,
+    stream_open_timeouts: AtomicU64,
+    upstream_connect_timeouts: AtomicU64,
+    upstream_errors: AtomicU64,
+    upload_bytes: AtomicU64,
+    download_bytes: AtomicU64,
+    graceful_shutdowns: AtomicU64,
+    forced_shutdowns: AtomicU64,
+}
+
+impl ProxyMetrics {
+    fn snapshot(&self) -> ProxyMetricsSnapshot {
+        ProxyMetricsSnapshot {
+            active_connections: self.active_connections.load(Ordering::Relaxed),
+            total_connections: self.total_connections.load(Ordering::Relaxed),
+            connection_rejects: self.connection_rejects.load(Ordering::Relaxed),
+            active_streams: self.active_streams.load(Ordering::Relaxed),
+            total_streams: self.total_streams.load(Ordering::Relaxed),
+            stream_rejects: self.stream_rejects.load(Ordering::Relaxed),
+            dns_timeouts: self.dns_timeouts.load(Ordering::Relaxed),
+            handshake_timeouts: self.handshake_timeouts.load(Ordering::Relaxed),
+            request_timeouts: self.request_timeouts.load(Ordering::Relaxed),
+            stream_open_timeouts: self.stream_open_timeouts.load(Ordering::Relaxed),
+            upstream_connect_timeouts: self.upstream_connect_timeouts.load(Ordering::Relaxed),
+            upstream_errors: self.upstream_errors.load(Ordering::Relaxed),
+            upload_bytes: self.upload_bytes.load(Ordering::Relaxed),
+            download_bytes: self.download_bytes.load(Ordering::Relaxed),
+            graceful_shutdowns: self.graceful_shutdowns.load(Ordering::Relaxed),
+            forced_shutdowns: self.forced_shutdowns.load(Ordering::Relaxed),
+        }
+    }
+
+    fn start_connection(self: &Arc<Self>) -> ActiveMetricGuard {
+        self.total_connections.fetch_add(1, Ordering::Relaxed);
+        self.active_connections.fetch_add(1, Ordering::Relaxed);
+        ActiveMetricGuard {
+            metrics: self.clone(),
+            kind: ActiveMetricKind::Connection,
+        }
+    }
+
+    fn start_stream(self: &Arc<Self>) -> ActiveMetricGuard {
+        self.total_streams.fetch_add(1, Ordering::Relaxed);
+        self.active_streams.fetch_add(1, Ordering::Relaxed);
+        ActiveMetricGuard {
+            metrics: self.clone(),
+            kind: ActiveMetricKind::Stream,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ActiveMetricKind {
+    Connection,
+    Stream,
+}
+
+#[derive(Debug)]
+struct ActiveMetricGuard {
+    metrics: Arc<ProxyMetrics>,
+    kind: ActiveMetricKind,
+}
+
+impl Drop for ActiveMetricGuard {
+    fn drop(&mut self) {
+        let metric = match self.kind {
+            ActiveMetricKind::Connection => &self.metrics.active_connections,
+            ActiveMetricKind::Stream => &self.metrics.active_streams,
+        };
+        metric.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+trait ProxyEventSink: Send + Sync {
+    fn write_line(&self, line: &str);
+}
+
+#[cfg(not(test))]
+#[derive(Debug)]
+struct StderrEventSink;
+
+#[cfg(not(test))]
+impl ProxyEventSink for StderrEventSink {
+    fn write_line(&self, line: &str) {
+        let stderr = io::stderr();
+        let mut stderr = stderr.lock();
+        let _ = stderr.write_all(line.as_bytes());
+        let _ = stderr.write_all(b"\n");
+    }
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+struct NullEventSink;
+
+#[cfg(test)]
+impl ProxyEventSink for NullEventSink {
+    fn write_line(&self, _line: &str) {}
+}
+
+#[cfg(not(test))]
+fn default_event_sink() -> Arc<dyn ProxyEventSink> {
+    Arc::new(StderrEventSink)
+}
+
+#[cfg(test)]
+fn default_event_sink() -> Arc<dyn ProxyEventSink> {
+    Arc::new(NullEventSink)
+}
+
+#[derive(Clone)]
+struct ProxyEventLog {
+    role: &'static str,
+    sink: Arc<dyn ProxyEventSink>,
+}
+
+struct ProxyRuntimeContext {
+    limits: ProxyRuntimeLimits,
+    shutdown: watch::Receiver<bool>,
+    metrics: Arc<ProxyMetrics>,
+    events: ProxyEventLog,
+}
+
+impl ProxyEventLog {
+    fn new(role: &'static str, sink: Arc<dyn ProxyEventSink>) -> Self {
+        Self { role, sink }
+    }
+
+    fn emit(&self, level: &'static str, event: &'static str, fields: Value) {
+        let mut record = Map::new();
+        record.insert("schema".to_owned(), Value::String(EVENT_SCHEMA.to_owned()));
+        record.insert("ts_unix_ms".to_owned(), json!(unix_timestamp_millis()));
+        record.insert("level".to_owned(), Value::String(level.to_owned()));
+        record.insert("role".to_owned(), Value::String(self.role.to_owned()));
+        record.insert("event".to_owned(), Value::String(event.to_owned()));
+        if let Value::Object(fields) = fields {
+            record.extend(fields);
+        }
+        if let Ok(line) = serde_json::to_string(&record) {
+            self.sink.write_line(&line);
+        }
+    }
+
+    fn emit_metrics(&self, metrics: &ProxyMetrics) {
+        self.emit(
+            "info",
+            "metrics_snapshot",
+            metrics_snapshot_json(metrics.snapshot()),
+        );
+    }
+}
+
+fn unix_timestamp_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| u64::try_from(duration.as_millis()).ok())
+        .unwrap_or(0)
+}
+
+fn metrics_snapshot_json(snapshot: ProxyMetricsSnapshot) -> Value {
+    json!({
+        "active_connections": snapshot.active_connections,
+        "total_connections": snapshot.total_connections,
+        "connection_rejects": snapshot.connection_rejects,
+        "active_streams": snapshot.active_streams,
+        "total_streams": snapshot.total_streams,
+        "stream_rejects": snapshot.stream_rejects,
+        "dns_timeouts": snapshot.dns_timeouts,
+        "handshake_timeouts": snapshot.handshake_timeouts,
+        "request_timeouts": snapshot.request_timeouts,
+        "stream_open_timeouts": snapshot.stream_open_timeouts,
+        "upstream_connect_timeouts": snapshot.upstream_connect_timeouts,
+        "upstream_errors": snapshot.upstream_errors,
+        "upload_bytes": snapshot.upload_bytes,
+        "download_bytes": snapshot.download_bytes,
+        "graceful_shutdowns": snapshot.graceful_shutdowns,
+        "forced_shutdowns": snapshot.forced_shutdowns,
+    })
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ProxyTaskError {
+    code: &'static str,
+}
+
+impl ProxyTaskError {
+    const fn new(code: &'static str) -> Self {
+        Self { code }
+    }
+}
+
+impl fmt::Display for ProxyTaskError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.code)
+    }
+}
+
+impl std::error::Error for ProxyTaskError {}
+
+type ProxyTaskResult<T> = Result<T, ProxyTaskError>;
+
+trait RuntimeCode<T> {
+    fn runtime_code(self, code: &'static str) -> ProxyTaskResult<T>;
+}
+
+impl<T, E> RuntimeCode<T> for Result<T, E> {
+    fn runtime_code(self, code: &'static str) -> ProxyTaskResult<T> {
+        self.map_err(|_| ProxyTaskError::new(code))
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProxyServerConfig {
@@ -162,6 +420,8 @@ impl ProxyClientConfig {
 #[derive(Debug)]
 pub struct ProxyRuntime {
     local_addr: SocketAddr,
+    shutdown: watch::Sender<bool>,
+    metrics: Arc<ProxyMetrics>,
     task: Option<JoinHandle<LabResult<()>>>,
 }
 
@@ -170,7 +430,15 @@ impl ProxyRuntime {
         self.local_addr
     }
 
-    pub async fn wait(mut self) -> LabResult<()> {
+    pub fn metrics_snapshot(&self) -> ProxyMetricsSnapshot {
+        self.metrics.snapshot()
+    }
+
+    pub fn request_shutdown(&self) {
+        let _ = self.shutdown.send(true);
+    }
+
+    async fn join(&mut self) -> LabResult<()> {
         let task = self
             .task
             .take()
@@ -179,16 +447,20 @@ impl ProxyRuntime {
             .map_err(|error| other_error(format!("代理运行任务异常退出：{error}")))?
     }
 
-    pub async fn shutdown(mut self) {
-        if let Some(task) = self.task.take() {
-            task.abort();
-            let _ = task.await;
-        }
+    pub async fn wait(mut self) -> LabResult<()> {
+        self.join().await
+    }
+
+    pub async fn shutdown(mut self) -> ProxyMetricsSnapshot {
+        self.request_shutdown();
+        let _ = self.join().await;
+        self.metrics.snapshot()
     }
 }
 
 impl Drop for ProxyRuntime {
     fn drop(&mut self) {
+        self.request_shutdown();
         if let Some(task) = self.task.as_ref() {
             task.abort();
         }
@@ -197,14 +469,41 @@ impl Drop for ProxyRuntime {
 
 pub async fn run_proxy_server(path: impl AsRef<Path>) -> LabResult<()> {
     let runtime = start_proxy_server(ProxyServerConfig::load(path)?).await?;
-    eprintln!("FlowWeave 服务端正在监听 UDP {}", runtime.local_addr());
-    runtime.wait().await
+    run_runtime_until_signal(runtime).await
 }
 
 pub async fn run_proxy_client(path: impl AsRef<Path>) -> LabResult<()> {
     let runtime = start_proxy_client(ProxyClientConfig::load(path)?).await?;
-    eprintln!("FlowWeave 客户端正在监听 TCP {}", runtime.local_addr());
-    runtime.wait().await
+    run_runtime_until_signal(runtime).await
+}
+
+async fn run_runtime_until_signal(mut runtime: ProxyRuntime) -> LabResult<()> {
+    tokio::select! {
+        result = runtime.join() => result,
+        signal = wait_for_shutdown_signal() => {
+            signal?;
+            runtime.request_shutdown();
+            runtime.join().await
+        }
+    }
+}
+
+#[cfg(unix)]
+async fn wait_for_shutdown_signal() -> LabResult<()> {
+    use tokio::signal::unix::{SignalKind, signal};
+
+    let mut terminate = signal(SignalKind::terminate())?;
+    tokio::select! {
+        result = tokio::signal::ctrl_c() => result?,
+        _ = terminate.recv() => {}
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+async fn wait_for_shutdown_signal() -> LabResult<()> {
+    tokio::signal::ctrl_c().await?;
+    Ok(())
 }
 
 pub async fn start_proxy_server(config: ProxyServerConfig) -> LabResult<ProxyRuntime> {
@@ -215,6 +514,16 @@ async fn start_proxy_server_with_limits(
     config: ProxyServerConfig,
     limits: ProxyRuntimeLimits,
 ) -> LabResult<ProxyRuntime> {
+    start_proxy_server_with_limits_and_sink(config, limits, default_event_sink()).await
+}
+
+async fn start_proxy_server_with_limits_and_sink(
+    config: ProxyServerConfig,
+    limits: ProxyRuntimeLimits,
+    sink: Arc<dyn ProxyEventSink>,
+) -> LabResult<ProxyRuntime> {
+    let metrics = Arc::new(ProxyMetrics::default());
+    let events = ProxyEventLog::new("server", sink);
     let certificate = read_certificate(&config.certificate_der)?;
     let private_key = read_private_key(&config.private_key_der)?;
     let token = Arc::new(read_token(&config.token_file)?);
@@ -231,11 +540,31 @@ async fn start_proxy_server_with_limits(
     let endpoint = Endpoint::server(server_config, config.listen)?;
     let local_addr = endpoint.local_addr()?;
     let allowed_target = config.allowed_target;
+    let (shutdown, shutdown_rx) = watch::channel(false);
+    events.emit(
+        "info",
+        "runtime_started",
+        json!({"listen": local_addr.to_string(), "transport": "udp"}),
+    );
+    let task_metrics = metrics.clone();
     let task = tokio::spawn(async move {
-        run_server_accept_loop(endpoint, token, allowed_target, limits).await
+        run_server_accept_loop(
+            endpoint,
+            token,
+            allowed_target,
+            ProxyRuntimeContext {
+                limits,
+                shutdown: shutdown_rx,
+                metrics: task_metrics,
+                events,
+            },
+        )
+        .await
     });
     Ok(ProxyRuntime {
         local_addr,
+        shutdown,
+        metrics,
         task: Some(task),
     })
 }
@@ -248,11 +577,26 @@ async fn start_proxy_client_with_limits(
     config: ProxyClientConfig,
     limits: ProxyRuntimeLimits,
 ) -> LabResult<ProxyRuntime> {
+    start_proxy_client_with_limits_and_sink(config, limits, default_event_sink()).await
+}
+
+async fn start_proxy_client_with_limits_and_sink(
+    config: ProxyClientConfig,
+    limits: ProxyRuntimeLimits,
+    sink: Arc<dyn ProxyEventSink>,
+) -> LabResult<ProxyRuntime> {
+    let metrics = Arc::new(ProxyMetrics::default());
+    let events = ProxyEventLog::new("client", sink);
     let certificate = read_certificate(&config.ca_certificate_der)?;
     let token = Arc::new(read_token(&config.token_file)?);
-    let server_addr = timeout(limits.handshake_timeout, resolve_server_addr(&config))
-        .await
-        .map_err(|_| other_error("解析服务端地址超时"))??;
+    let server_addr = match timeout(limits.handshake_timeout, resolve_server_addr(&config)).await {
+        Ok(result) => result?,
+        Err(_) => {
+            metrics.dns_timeouts.fetch_add(1, Ordering::Relaxed);
+            events.emit("error", "startup_failed", json!({"reason": "dns_timeout"}));
+            return Err(other_error("解析服务端地址超时"));
+        }
+    };
     let replace_bootstrap_path =
         config.primary_local_ip.is_some() && !config.additional_local_ips.is_empty();
     let bind_ip = if replace_bootstrap_path {
@@ -279,16 +623,34 @@ async fn start_proxy_client_with_limits(
     let connecting = endpoint
         .connect(server_addr, &config.server_name)
         .map_err(|error| other_error(format!("客户端无法开始 TLS 连接：{error}")))?;
-    let connection = timeout(limits.handshake_timeout, connecting)
-        .await
-        .map_err(|_| other_error("客户端 TLS 连接超时"))??;
+    let connection = match timeout(limits.handshake_timeout, connecting).await {
+        Ok(result) => result?,
+        Err(_) => {
+            metrics.handshake_timeouts.fetch_add(1, Ordering::Relaxed);
+            events.emit(
+                "error",
+                "startup_failed",
+                json!({"reason": "handshake_timeout"}),
+            );
+            return Err(other_error("客户端 TLS 连接超时"));
+        }
+    };
     if !connection.is_multipath_enabled() {
         connection.close(0_u8.into(), b"multipath negotiation failed");
         return Err(other_error("客户端和服务端没有协商成功 MPQUIC"));
     }
-    timeout(limits.handshake_timeout, connection.handshake_confirmed())
-        .await
-        .map_err(|_| other_error("客户端等待 TLS 确认超时"))??;
+    match timeout(limits.handshake_timeout, connection.handshake_confirmed()).await {
+        Ok(result) => result?,
+        Err(_) => {
+            metrics.handshake_timeouts.fetch_add(1, Ordering::Relaxed);
+            events.emit(
+                "error",
+                "startup_failed",
+                json!({"reason": "handshake_confirmation_timeout"}),
+            );
+            return Err(other_error("客户端等待 TLS 确认超时"));
+        }
+    }
 
     let configured_paths = config
         .primary_local_ip
@@ -316,11 +678,33 @@ async fn start_proxy_client_with_limits(
     let listener = TcpListener::bind(config.listen).await?;
     let local_addr = listener.local_addr()?;
     let target = config.target;
+    let (shutdown, shutdown_rx) = watch::channel(false);
+    events.emit(
+        "info",
+        "runtime_started",
+        json!({"listen": local_addr.to_string(), "transport": "tcp"}),
+    );
+    let task_metrics = metrics.clone();
     let task = tokio::spawn(async move {
-        run_client_accept_loop(endpoint, connection, listener, token, target, limits).await
+        run_client_accept_loop(
+            endpoint,
+            connection,
+            listener,
+            token,
+            target,
+            ProxyRuntimeContext {
+                limits,
+                shutdown: shutdown_rx,
+                metrics: task_metrics,
+                events,
+            },
+        )
+        .await
     });
     Ok(ProxyRuntime {
         local_addr,
+        shutdown,
+        metrics,
         task: Some(task),
     })
 }
@@ -356,65 +740,384 @@ async fn run_server_accept_loop(
     endpoint: Endpoint,
     token: Arc<Vec<u8>>,
     allowed_target: SocketAddr,
-    limits: ProxyRuntimeLimits,
+    runtime: ProxyRuntimeContext,
 ) -> LabResult<()> {
+    let ProxyRuntimeContext {
+        limits,
+        mut shutdown,
+        metrics,
+        events,
+    } = runtime;
     let connection_slots = Arc::new(Semaphore::new(limits.max_server_connections));
+    let mut connection_tasks = JoinSet::new();
+    let mut metrics_tick = interval_at(
+        Instant::now() + limits.metrics_interval,
+        limits.metrics_interval,
+    );
     loop {
-        let incoming = endpoint
-            .accept()
-            .await
-            .ok_or_else(|| other_error("服务端 Endpoint 已停止监听"))?;
-        let connection_slot = match connection_slots.clone().try_acquire_owned() {
-            Ok(slot) => slot,
-            Err(_) => {
-                eprintln!("event=proxy_connection_refused reason=connection_limit");
-                incoming.refuse();
-                continue;
-            }
-        };
-        let token = token.clone();
-        tokio::spawn(async move {
-            let _connection_slot = connection_slot;
-            let result = async {
-                let connection = timeout(limits.handshake_timeout, async move { incoming.await })
-                    .await
-                    .map_err(|_| other_error("服务端 TLS 握手超时"))??;
-                if !connection.is_multipath_enabled() {
-                    connection.close(0_u8.into(), b"multipath required");
-                    return Err(other_error("入站连接没有协商 MPQUIC"));
+        tokio::select! {
+            biased;
+            _ = shutdown.changed() => break,
+            joined = connection_tasks.join_next(), if !connection_tasks.is_empty() => {
+                if joined.is_some_and(|result| result.is_err()) {
+                    events.emit(
+                        "error",
+                        "connection_task_failed",
+                        json!({"reason": "task_panic"}),
+                    );
                 }
-                serve_proxy_connection(connection, token, allowed_target, limits).await
             }
-            .await;
-            if let Err(error) = result {
-                eprintln!("FlowWeave 服务端连接结束：{error}");
+            _ = metrics_tick.tick() => events.emit_metrics(&metrics),
+            incoming = endpoint.accept() => {
+                let incoming = incoming.ok_or_else(|| other_error("服务端 Endpoint 已停止监听"))?;
+                let connection_slot = match connection_slots.clone().try_acquire_owned() {
+                    Ok(slot) => slot,
+                    Err(_) => {
+                        metrics.connection_rejects.fetch_add(1, Ordering::Relaxed);
+                        events.emit(
+                            "warn",
+                            "connection_rejected",
+                            json!({"reason": "connection_limit"}),
+                        );
+                        incoming.refuse();
+                        continue;
+                    }
+                };
+                let token = token.clone();
+                let task_metrics = metrics.clone();
+                let task_events = events.clone();
+                let mut task_shutdown = shutdown.clone();
+                connection_tasks.spawn(async move {
+                    let _connection_slot = connection_slot;
+                    let _connection_metric = task_metrics.start_connection();
+                    let connecting = match incoming.accept() {
+                        Ok(connecting) => connecting,
+                        Err(_) => {
+                            task_events.emit(
+                                "warn",
+                                "connection_failed",
+                                json!({"reason": "handshake_failed"}),
+                            );
+                            return;
+                        }
+                    };
+                    let connection = tokio::select! {
+                        biased;
+                        _ = task_shutdown.changed() => {
+                            task_events.emit(
+                                "info",
+                                "connection_failed",
+                                json!({"reason": "shutdown"}),
+                            );
+                            return;
+                        }
+                        result = timeout(limits.handshake_timeout, connecting) => match result {
+                            Ok(Ok(connection)) => connection,
+                            Ok(Err(_)) => {
+                                task_events.emit(
+                                    "warn",
+                                    "connection_failed",
+                                    json!({"reason": "handshake_failed"}),
+                                );
+                                return;
+                            }
+                            Err(_) => {
+                                task_metrics
+                                    .handshake_timeouts
+                                    .fetch_add(1, Ordering::Relaxed);
+                                task_events.emit(
+                                    "warn",
+                                    "connection_failed",
+                                    json!({"reason": "handshake_timeout"}),
+                                );
+                                return;
+                            }
+                        }
+                    };
+                    if !connection.is_multipath_enabled() {
+                        connection.close(0_u8.into(), b"multipath required");
+                        task_events.emit(
+                            "warn",
+                            "connection_failed",
+                            json!({"reason": "multipath_required"}),
+                        );
+                        return;
+                    }
+
+                    let connection_id = connection.stable_id();
+                    task_events.emit(
+                        "info",
+                        "connection_started",
+                        json!({"connection_id": connection_id}),
+                    );
+                    let result = serve_proxy_connection(
+                        &connection,
+                        token,
+                        allowed_target,
+                        limits,
+                        task_shutdown,
+                        task_metrics.clone(),
+                        task_events.clone(),
+                    )
+                    .await;
+                    let stats = connection.stats();
+                    match result {
+                        Ok(reason) => task_events.emit(
+                            "info",
+                            "connection_finished",
+                            json!({
+                                "connection_id": connection_id,
+                                "reason": reason,
+                                "udp_tx_bytes": stats.udp_tx.bytes,
+                                "udp_rx_bytes": stats.udp_rx.bytes,
+                                "lost_bytes": stats.lost_bytes,
+                            }),
+                        ),
+                        Err(error) => task_events.emit(
+                            "warn",
+                            "connection_finished",
+                            json!({
+                                "connection_id": connection_id,
+                                "reason": error.code,
+                                "udp_tx_bytes": stats.udp_tx.bytes,
+                                "udp_rx_bytes": stats.udp_rx.bytes,
+                                "lost_bytes": stats.lost_bytes,
+                            }),
+                        ),
+                    }
+                });
             }
-        });
+        }
     }
+
+    endpoint.set_server_config(None);
+    events.emit(
+        "info",
+        "shutdown_started",
+        json!({"drain_timeout_ms": duration_millis(limits.shutdown_drain_timeout)}),
+    );
+    let drain_started = Instant::now();
+    let graceful = timeout(
+        limits.shutdown_drain_timeout,
+        drain_join_set(&mut connection_tasks),
+    )
+    .await
+    .is_ok();
+    if graceful {
+        metrics.graceful_shutdowns.fetch_add(1, Ordering::Relaxed);
+    } else {
+        metrics.forced_shutdowns.fetch_add(1, Ordering::Relaxed);
+        events.emit(
+            "warn",
+            "shutdown_forced",
+            json!({"reason": "drain_timeout"}),
+        );
+        endpoint.close(0_u8.into(), b"shutdown drain timeout");
+        connection_tasks.abort_all();
+        drain_join_set(&mut connection_tasks).await;
+    }
+    endpoint.close(0_u8.into(), b"shutdown complete");
+    events.emit_metrics(&metrics);
+    events.emit(
+        "info",
+        "shutdown_complete",
+        json!({
+            "forced": !graceful,
+            "drain_ms": duration_millis(drain_started.elapsed()),
+        }),
+    );
+    Ok(())
 }
 
 async fn serve_proxy_connection(
-    connection: Connection,
+    connection: &Connection,
     token: Arc<Vec<u8>>,
     allowed_target: SocketAddr,
     limits: ProxyRuntimeLimits,
-) -> LabResult<()> {
-    loop {
-        let (send, receive) = match connection.accept_bi().await {
-            Ok(streams) => streams,
-            Err(ConnectionError::ApplicationClosed(_) | ConnectionError::LocallyClosed) => {
-                return Ok(());
+    mut shutdown: watch::Receiver<bool>,
+    metrics: Arc<ProxyMetrics>,
+    events: ProxyEventLog,
+) -> ProxyTaskResult<&'static str> {
+    let connection_id = connection.stable_id();
+    let mut stream_tasks = JoinSet::new();
+    let mut path_events = connection.path_events();
+    let mut path_events_open = true;
+    let (finish_reason, drain_streams) = loop {
+        tokio::select! {
+            biased;
+            _ = shutdown.changed() => break ("shutdown", true),
+            joined = stream_tasks.join_next(), if !stream_tasks.is_empty() => {
+                if joined.is_some_and(|result| result.is_err()) {
+                    events.emit(
+                        "error",
+                        "stream_task_failed",
+                        json!({"connection_id": connection_id, "reason": "task_panic"}),
+                    );
+                }
             }
-            Err(error) => return Err(error.into()),
-        };
-        let token = token.clone();
-        tokio::spawn(async move {
-            if let Err(error) =
-                handle_server_stream(send, receive, &token, allowed_target, limits).await
-            {
-                eprintln!("FlowWeave 服务端数据流结束：{error}");
+            event = path_events.next(), if path_events_open => {
+                match event {
+                    Some(Ok(event)) => emit_path_event(&events, connection_id, event),
+                    Some(Err(error)) => events.emit(
+                        "warn",
+                        "path_events_lagged",
+                        json!({"connection_id": connection_id, "lost_events": error.0}),
+                    ),
+                    None => path_events_open = false,
+                }
             }
-        });
+            accepted = connection.accept_bi() => {
+                let (send, receive) = match accepted {
+                    Ok(streams) => streams,
+                    Err(ConnectionError::ApplicationClosed(_) | ConnectionError::LocallyClosed) => {
+                        break ("peer_closed", false);
+                    }
+                    Err(_) => {
+                        stream_tasks.abort_all();
+                        drain_join_set(&mut stream_tasks).await;
+                        return Err(ProxyTaskError::new("stream_accept_failed"));
+                    }
+                };
+                let stream_token = token.clone();
+                let stream_metrics = metrics.clone();
+                let stream_events = events.clone();
+                stream_tasks.spawn(async move {
+                    let _stream_metric = stream_metrics.start_stream();
+                    stream_events.emit(
+                        "info",
+                        "stream_started",
+                        json!({"connection_id": connection_id}),
+                    );
+                    match handle_server_stream(
+                        send,
+                        receive,
+                        &stream_token,
+                        allowed_target,
+                        limits,
+                        &stream_metrics,
+                    )
+                    .await
+                    {
+                        Ok(bytes) => {
+                            stream_metrics
+                                .upload_bytes
+                                .fetch_add(bytes.quic_to_tcp, Ordering::Relaxed);
+                            stream_metrics
+                                .download_bytes
+                                .fetch_add(bytes.tcp_to_quic, Ordering::Relaxed);
+                            stream_events.emit(
+                                "info",
+                                "stream_finished",
+                                json!({
+                                    "connection_id": connection_id,
+                                    "reason": "completed",
+                                    "upload_bytes": bytes.quic_to_tcp,
+                                    "download_bytes": bytes.tcp_to_quic,
+                                }),
+                            );
+                        }
+                        Err(error) => stream_events.emit(
+                            "warn",
+                            "stream_finished",
+                            json!({"connection_id": connection_id, "reason": error.code}),
+                        ),
+                    }
+                });
+            }
+        }
+    };
+
+    if drain_streams {
+        drain_join_set(&mut stream_tasks).await;
+        connection.close(0_u8.into(), b"shutdown complete");
+    } else {
+        stream_tasks.abort_all();
+        drain_join_set(&mut stream_tasks).await;
+    }
+    Ok(finish_reason)
+}
+
+async fn drain_join_set(tasks: &mut JoinSet<()>) {
+    while tasks.join_next().await.is_some() {}
+}
+
+fn duration_millis(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+fn emit_path_event(events: &ProxyEventLog, connection_id: usize, event: PathEvent) {
+    match event {
+        PathEvent::Established { id, .. } => events.emit(
+            "info",
+            "path_changed",
+            json!({
+                "connection_id": connection_id,
+                "path_id": id.to_string(),
+                "change": "established",
+            }),
+        ),
+        PathEvent::Abandoned { id, reason, .. } => events.emit(
+            "warn",
+            "path_changed",
+            json!({
+                "connection_id": connection_id,
+                "path_id": id.to_string(),
+                "change": "abandoned",
+                "reason": path_abandon_reason(&reason),
+            }),
+        ),
+        PathEvent::Discarded { id, path_stats, .. } => events.emit(
+            "info",
+            "path_changed",
+            json!({
+                "connection_id": connection_id,
+                "path_id": id.to_string(),
+                "change": "discarded",
+                "lost_packets": path_stats.lost_packets,
+                "lost_bytes": path_stats.lost_bytes,
+            }),
+        ),
+        PathEvent::RemoteStatus { id, status, .. } => events.emit(
+            "info",
+            "path_changed",
+            json!({
+                "connection_id": connection_id,
+                "path_id": id.to_string(),
+                "change": "remote_status",
+                "status": path_status_name(status),
+            }),
+        ),
+        PathEvent::ObservedAddr { id, addr: _, .. } => events.emit(
+            "info",
+            "path_changed",
+            json!({
+                "connection_id": connection_id,
+                "path_id": id.to_string(),
+                "change": "observed_address",
+            }),
+        ),
+        _ => events.emit(
+            "info",
+            "path_changed",
+            json!({"connection_id": connection_id, "change": "unknown"}),
+        ),
+    }
+}
+
+fn path_status_name(status: PathStatus) -> &'static str {
+    match status {
+        PathStatus::Available => "available",
+        PathStatus::Backup => "backup",
+    }
+}
+
+fn path_abandon_reason(reason: &PathAbandonReason) -> &'static str {
+    match reason {
+        PathAbandonReason::ApplicationClosed { .. } => "application_closed",
+        PathAbandonReason::ValidationFailed => "validation_failed",
+        PathAbandonReason::TimedOut => "timed_out",
+        PathAbandonReason::UnusableAfterNetworkChange => "network_changed",
+        PathAbandonReason::RemoteAbandoned { .. } => "remote_abandoned",
     }
 }
 
@@ -424,26 +1127,38 @@ async fn handle_server_stream(
     expected_token: &[u8],
     allowed_target: SocketAddr,
     limits: ProxyRuntimeLimits,
-) -> LabResult<()> {
+    metrics: &ProxyMetrics,
+) -> ProxyTaskResult<RelayBytes> {
     let request = match timeout(limits.request_timeout, read_proxy_request(&mut receive)).await {
         Ok(Ok(request)) => request,
         Ok(Err(rejection)) => {
-            send_status(&mut send, rejection.status).await?;
-            return Err(other_error(rejection.message));
+            send_status(&mut send, rejection.status)
+                .await
+                .runtime_code("status_write_failed")?;
+            let code = rejection_code(rejection.status);
+            let _ = rejection.message;
+            return Err(ProxyTaskError::new(code));
         }
         Err(_) => {
-            send_status(&mut send, STATUS_FORMAT).await?;
-            return Err(other_error("代理请求读取超时"));
+            metrics.request_timeouts.fetch_add(1, Ordering::Relaxed);
+            send_status(&mut send, STATUS_FORMAT)
+                .await
+                .runtime_code("status_write_failed")?;
+            return Err(ProxyTaskError::new("request_timeout"));
         }
     };
 
     if !token_matches(expected_token, &request.token) {
-        send_status(&mut send, STATUS_AUTHORIZATION).await?;
-        return Err(other_error("代理令牌验证失败"));
+        send_status(&mut send, STATUS_AUTHORIZATION)
+            .await
+            .runtime_code("status_write_failed")?;
+        return Err(ProxyTaskError::new("authorization_rejected"));
     }
     if request.target != allowed_target {
-        send_status(&mut send, STATUS_TARGET).await?;
-        return Err(other_error("代理请求目标不在允许范围内"));
+        send_status(&mut send, STATUS_TARGET)
+            .await
+            .runtime_code("status_write_failed")?;
+        return Err(ProxyTaskError::new("target_rejected"));
     }
 
     let upstream = match timeout(
@@ -453,56 +1168,233 @@ async fn handle_server_stream(
     .await
     {
         Ok(Ok(upstream)) => upstream,
-        Ok(Err(error)) => {
-            send_status(&mut send, STATUS_UPSTREAM).await?;
-            return Err(other_error(format!("无法连接固定上游：{error}")));
+        Ok(Err(_)) => {
+            metrics.upstream_errors.fetch_add(1, Ordering::Relaxed);
+            send_status(&mut send, STATUS_UPSTREAM)
+                .await
+                .runtime_code("status_write_failed")?;
+            return Err(ProxyTaskError::new("upstream_connect_failed"));
         }
         Err(_) => {
-            send_status(&mut send, STATUS_UPSTREAM).await?;
-            return Err(other_error("连接固定上游超时"));
+            metrics
+                .upstream_connect_timeouts
+                .fetch_add(1, Ordering::Relaxed);
+            send_status(&mut send, STATUS_UPSTREAM)
+                .await
+                .runtime_code("status_write_failed")?;
+            return Err(ProxyTaskError::new("upstream_connect_timeout"));
         }
     };
-    send.write_all(&[STATUS_OK]).await?;
+    send.write_all(&[STATUS_OK])
+        .await
+        .runtime_code("status_write_failed")?;
     relay_tcp_and_quic(upstream, send, receive).await
 }
 
+fn rejection_code(status: u8) -> &'static str {
+    match status {
+        STATUS_VERSION => "protocol_version_rejected",
+        STATUS_FORMAT => "request_format_rejected",
+        _ => "request_rejected",
+    }
+}
+
 async fn run_client_accept_loop(
-    _endpoint: Endpoint,
+    endpoint: Endpoint,
     connection: Connection,
     listener: TcpListener,
     token: Arc<Vec<u8>>,
     target: SocketAddr,
-    limits: ProxyRuntimeLimits,
+    runtime: ProxyRuntimeContext,
 ) -> LabResult<()> {
+    let ProxyRuntimeContext {
+        limits,
+        mut shutdown,
+        metrics,
+        events,
+    } = runtime;
+    let connection_metric = metrics.start_connection();
+    let connection_id = connection.stable_id();
+    events.emit(
+        "info",
+        "connection_started",
+        json!({"connection_id": connection_id}),
+    );
     let stream_slots = Arc::new(Semaphore::new(limits.max_client_streams));
-    loop {
+    let mut stream_tasks = JoinSet::new();
+    let mut path_events = connection.path_events();
+    let mut path_events_open = true;
+    let mut metrics_tick = interval_at(
+        Instant::now() + limits.metrics_interval,
+        limits.metrics_interval,
+    );
+    let stop_reason = loop {
         tokio::select! {
-            error = connection.closed() => {
-                return Err(other_error(format!("到服务端的 FlowWeave 连接已关闭：{error}")));
+            biased;
+            _ = shutdown.changed() => break "shutdown",
+            _ = connection.closed() => break "connection_closed",
+            joined = stream_tasks.join_next(), if !stream_tasks.is_empty() => {
+                if joined.is_some_and(|result| result.is_err()) {
+                    events.emit(
+                        "error",
+                        "stream_task_failed",
+                        json!({"connection_id": connection_id, "reason": "task_panic"}),
+                    );
+                }
             }
+            event = path_events.next(), if path_events_open => {
+                match event {
+                    Some(Ok(event)) => emit_path_event(&events, connection_id, event),
+                    Some(Err(error)) => events.emit(
+                        "warn",
+                        "path_events_lagged",
+                        json!({"connection_id": connection_id, "lost_events": error.0}),
+                    ),
+                    None => path_events_open = false,
+                }
+            }
+            _ = metrics_tick.tick() => events.emit_metrics(&metrics),
             accepted = listener.accept() => {
                 let (local, _) = accepted?;
                 let stream_slot = match stream_slots.clone().try_acquire_owned() {
                     Ok(slot) => slot,
                     Err(_) => {
-                        eprintln!("event=proxy_stream_refused reason=client_stream_limit");
+                        metrics.stream_rejects.fetch_add(1, Ordering::Relaxed);
+                        events.emit(
+                            "warn",
+                            "stream_rejected",
+                            json!({"connection_id": connection_id, "reason": "client_stream_limit"}),
+                        );
                         drop(local);
                         continue;
                     }
                 };
-                let connection = connection.clone();
-                let token = token.clone();
-                tokio::spawn(async move {
+                let stream_connection = connection.clone();
+                let stream_token = token.clone();
+                let stream_metrics = metrics.clone();
+                let stream_events = events.clone();
+                stream_tasks.spawn(async move {
                     let _stream_slot = stream_slot;
-                    if let Err(error) =
-                        handle_client_stream(connection, local, &token, target, limits).await
+                    let _stream_metric = stream_metrics.start_stream();
+                    stream_events.emit(
+                        "info",
+                        "stream_started",
+                        json!({"connection_id": connection_id}),
+                    );
+                    match handle_client_stream(
+                        stream_connection,
+                        local,
+                        &stream_token,
+                        target,
+                        limits,
+                        &stream_metrics,
+                    )
+                    .await
                     {
-                        eprintln!("FlowWeave 客户端数据流结束：{error}");
+                        Ok(bytes) => {
+                            stream_metrics
+                                .upload_bytes
+                                .fetch_add(bytes.tcp_to_quic, Ordering::Relaxed);
+                            stream_metrics
+                                .download_bytes
+                                .fetch_add(bytes.quic_to_tcp, Ordering::Relaxed);
+                            stream_events.emit(
+                                "info",
+                                "stream_finished",
+                                json!({
+                                    "connection_id": connection_id,
+                                    "reason": "completed",
+                                    "upload_bytes": bytes.tcp_to_quic,
+                                    "download_bytes": bytes.quic_to_tcp,
+                                }),
+                            );
+                        }
+                        Err(error) => stream_events.emit(
+                            "warn",
+                            "stream_finished",
+                            json!({"connection_id": connection_id, "reason": error.code}),
+                        ),
                     }
                 });
             }
         }
+    };
+
+    drop(listener);
+    if stop_reason == "connection_closed" {
+        stream_tasks.abort_all();
+        drain_join_set(&mut stream_tasks).await;
+        let stats = connection.stats();
+        events.emit(
+            "error",
+            "connection_finished",
+            json!({
+                "connection_id": connection_id,
+                "reason": "transport_closed",
+                "udp_tx_bytes": stats.udp_tx.bytes,
+                "udp_rx_bytes": stats.udp_rx.bytes,
+                "lost_bytes": stats.lost_bytes,
+            }),
+        );
+        drop(connection_metric);
+        events.emit_metrics(&metrics);
+        events.emit(
+            "error",
+            "runtime_failed",
+            json!({"reason": "server_connection_closed"}),
+        );
+        return Err(other_error("到服务端的 FlowWeave 连接已关闭"));
     }
+
+    events.emit(
+        "info",
+        "shutdown_started",
+        json!({"drain_timeout_ms": duration_millis(limits.shutdown_drain_timeout)}),
+    );
+    let drain_started = Instant::now();
+    let graceful = timeout(
+        limits.shutdown_drain_timeout,
+        drain_join_set(&mut stream_tasks),
+    )
+    .await
+    .is_ok();
+    if graceful {
+        metrics.graceful_shutdowns.fetch_add(1, Ordering::Relaxed);
+    } else {
+        metrics.forced_shutdowns.fetch_add(1, Ordering::Relaxed);
+        events.emit(
+            "warn",
+            "shutdown_forced",
+            json!({"reason": "drain_timeout"}),
+        );
+        stream_tasks.abort_all();
+        drain_join_set(&mut stream_tasks).await;
+    }
+    connection.close(0_u8.into(), b"shutdown complete");
+    endpoint.close(0_u8.into(), b"shutdown complete");
+    let stats = connection.stats();
+    events.emit(
+        "info",
+        "connection_finished",
+        json!({
+            "connection_id": connection_id,
+            "reason": if graceful { "shutdown" } else { "shutdown_forced" },
+            "udp_tx_bytes": stats.udp_tx.bytes,
+            "udp_rx_bytes": stats.udp_rx.bytes,
+            "lost_bytes": stats.lost_bytes,
+        }),
+    );
+    drop(connection_metric);
+    events.emit_metrics(&metrics);
+    events.emit(
+        "info",
+        "shutdown_complete",
+        json!({
+            "forced": !graceful,
+            "drain_ms": duration_millis(drain_started.elapsed()),
+        }),
+    );
+    Ok(())
 }
 
 async fn handle_client_stream(
@@ -511,48 +1403,77 @@ async fn handle_client_stream(
     token: &[u8],
     target: SocketAddr,
     limits: ProxyRuntimeLimits,
-) -> LabResult<()> {
-    let streams = timeout(limits.stream_open_timeout, connection.open_bi())
-        .await
-        .map_err(|_| other_error("打开代理 QUIC 数据流超时"))?;
-    let (mut send, mut receive) = streams?;
-    let request = encode_proxy_request(token, target)?;
+    metrics: &ProxyMetrics,
+) -> ProxyTaskResult<RelayBytes> {
+    let streams = match timeout(limits.stream_open_timeout, connection.open_bi()).await {
+        Ok(streams) => streams.runtime_code("stream_open_failed")?,
+        Err(_) => {
+            metrics.stream_open_timeouts.fetch_add(1, Ordering::Relaxed);
+            return Err(ProxyTaskError::new("stream_open_timeout"));
+        }
+    };
+    let (mut send, mut receive) = streams;
+    let request = encode_proxy_request(token, target).runtime_code("request_encode_failed")?;
 
     let mut status = [0_u8; 1];
-    timeout(limits.request_timeout, async {
-        send.write_all(&request).await?;
-        receive.read_exact(&mut status).await?;
-        Ok::<(), super::LabError>(())
-    })
-    .await
-    .map_err(|_| other_error("代理数据流协商超时"))??;
+    let negotiation = async {
+        send.write_all(&request)
+            .await
+            .runtime_code("request_write_failed")?;
+        receive
+            .read_exact(&mut status)
+            .await
+            .runtime_code("status_read_failed")?;
+        Ok::<(), ProxyTaskError>(())
+    };
+    match timeout(limits.request_timeout, negotiation).await {
+        Ok(result) => result?,
+        Err(_) => {
+            metrics.request_timeouts.fetch_add(1, Ordering::Relaxed);
+            return Err(ProxyTaskError::new("request_negotiation_timeout"));
+        }
+    }
     if status[0] != STATUS_OK {
-        return Err(other_error(format!(
-            "服务端拒绝代理数据流（状态 {}）",
-            status[0]
-        )));
+        return Err(ProxyTaskError::new(match status[0] {
+            STATUS_VERSION => "server_rejected_version",
+            STATUS_FORMAT => "server_rejected_format",
+            STATUS_AUTHORIZATION => "server_rejected_authorization",
+            STATUS_TARGET => "server_rejected_target",
+            STATUS_UPSTREAM => "server_rejected_upstream",
+            _ => "server_rejected_unknown",
+        }));
     }
     relay_tcp_and_quic(local, send, receive).await
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct RelayBytes {
+    tcp_to_quic: u64,
+    quic_to_tcp: u64,
 }
 
 async fn relay_tcp_and_quic(
     tcp: TcpStream,
     mut quic_send: noq::SendStream,
     mut quic_receive: noq::RecvStream,
-) -> LabResult<()> {
+) -> ProxyTaskResult<RelayBytes> {
     let (mut tcp_read, mut tcp_write) = tcp.into_split();
-    let upload = async {
-        tokio::io::copy(&mut tcp_read, &mut quic_send).await?;
+    let tcp_to_quic = async {
+        let bytes = tokio::io::copy(&mut tcp_read, &mut quic_send).await?;
         quic_send.shutdown().await?;
-        Ok::<(), io::Error>(())
+        Ok::<u64, io::Error>(bytes)
     };
-    let download = async {
-        tokio::io::copy(&mut quic_receive, &mut tcp_write).await?;
+    let quic_to_tcp = async {
+        let bytes = tokio::io::copy(&mut quic_receive, &mut tcp_write).await?;
         tcp_write.shutdown().await?;
-        Ok::<(), io::Error>(())
+        Ok::<u64, io::Error>(bytes)
     };
-    tokio::try_join!(upload, download)?;
-    Ok(())
+    let (tcp_to_quic, quic_to_tcp) =
+        tokio::try_join!(tcp_to_quic, quic_to_tcp).runtime_code("relay_io_failed")?;
+    Ok(RelayBytes {
+        tcp_to_quic,
+        quic_to_tcp,
+    })
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -921,11 +1842,15 @@ fn resolve_path(base: &Path, value: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use std::{
-        sync::atomic::{AtomicU64, Ordering},
+        sync::{
+            Mutex,
+            atomic::{AtomicU64, Ordering},
+        },
         time::Duration,
     };
 
     use tokio::io::AsyncReadExt;
+    use tokio::sync::Notify;
     use tokio::time::timeout;
 
     use super::*;
@@ -941,6 +1866,45 @@ mod tests {
             request_timeout: Duration::from_secs(2),
             upstream_connect_timeout: Duration::from_secs(2),
             stream_open_timeout: Duration::from_secs(2),
+            shutdown_drain_timeout: Duration::from_secs(2),
+            metrics_interval: Duration::from_secs(60),
+        }
+    }
+
+    #[derive(Default)]
+    struct TestEventSink {
+        lines: Mutex<Vec<String>>,
+        notify: Notify,
+    }
+
+    impl ProxyEventSink for TestEventSink {
+        fn write_line(&self, line: &str) {
+            self.lines.lock().unwrap().push(line.to_owned());
+            self.notify.notify_waiters();
+        }
+    }
+
+    impl TestEventSink {
+        fn lines(&self) -> Vec<String> {
+            self.lines.lock().unwrap().clone()
+        }
+
+        async fn wait_for_event(&self, role: &str, event: &str) {
+            timeout(Duration::from_secs(2), async {
+                loop {
+                    let notified = self.notify.notified();
+                    let found = self.lines.lock().unwrap().iter().any(|line| {
+                        serde_json::from_str::<Value>(line)
+                            .is_ok_and(|record| record["role"] == role && record["event"] == event)
+                    });
+                    if found {
+                        return;
+                    }
+                    notified.await;
+                }
+            })
+            .await
+            .expect("应在截止时间内收到指定运行事件");
         }
     }
 
@@ -1042,6 +2006,7 @@ mod tests {
             for required_line in [
                 "User=flowweave",
                 "UMask=0077",
+                "TimeoutStopSec=15s",
                 "TasksMax=512",
                 "MemoryMax=1G",
                 "CapabilityBoundingSet=",
@@ -1466,6 +2431,257 @@ mod tests {
         client.shutdown().await;
         server.shutdown().await;
         upstream_task.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn jsonl_events_are_parseable_and_do_not_expose_secrets_or_payloads() {
+        let _network_test_guard = crate::LOCAL_NETWORK_TEST_LOCK.lock().await;
+        let directory = TestDirectory::new();
+        let (certificate_path, key_path, token_path) = write_test_credentials(&directory);
+        let secret_token = b"FLOWWEAVE_TEST_TOKEN_0123456789_ABCDEFGHIJKLMN";
+        fs::write(&token_path, secret_token).unwrap();
+        set_private_permissions(&token_path);
+        let private_key_bytes = fs::read(&key_path).unwrap();
+        let private_key_marker = format!("{:?}", &private_key_bytes[..16]);
+        let payload = b"FLOWWEAVE_APPLICATION_PAYLOAD_MUST_NOT_APPEAR";
+
+        let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream.local_addr().unwrap();
+        let upstream_task = tokio::spawn(async move {
+            let (mut stream, _) = upstream.accept().await.unwrap();
+            let (mut read, mut write) = stream.split();
+            tokio::io::copy(&mut read, &mut write).await.unwrap();
+        });
+        let sink = Arc::new(TestEventSink::default());
+        let server = start_proxy_server_with_limits_and_sink(
+            ProxyServerConfig {
+                listen: "127.0.0.1:0".parse().unwrap(),
+                certificate_der: certificate_path.clone(),
+                private_key_der: key_path.clone(),
+                token_file: token_path.clone(),
+                allowed_target: upstream_addr,
+            },
+            test_runtime_limits(),
+            sink.clone(),
+        )
+        .await
+        .unwrap();
+        let client = start_proxy_client_with_limits_and_sink(
+            ProxyClientConfig {
+                listen: "127.0.0.1:0".parse().unwrap(),
+                server: server.local_addr().to_string(),
+                server_name: "localhost".to_owned(),
+                ca_certificate_der: certificate_path,
+                token_file: token_path,
+                target: upstream_addr,
+                primary_local_ip: None,
+                additional_local_ips: Vec::new(),
+            },
+            test_runtime_limits(),
+            sink.clone(),
+        )
+        .await
+        .unwrap();
+
+        let mut stream = TcpStream::connect(client.local_addr()).await.unwrap();
+        stream.write_all(payload).await.unwrap();
+        stream.shutdown().await.unwrap();
+        let mut echoed = Vec::new();
+        stream.read_to_end(&mut echoed).await.unwrap();
+        assert_eq!(echoed, payload);
+
+        let client_snapshot = client.shutdown().await;
+        let server_snapshot = server.shutdown().await;
+        upstream_task.await.unwrap();
+        assert_eq!(client_snapshot.active_connections, 0);
+        assert_eq!(client_snapshot.active_streams, 0);
+        assert_eq!(client_snapshot.total_streams, 1);
+        assert_eq!(client_snapshot.upload_bytes, payload.len() as u64);
+        assert_eq!(client_snapshot.download_bytes, payload.len() as u64);
+        assert_eq!(server_snapshot.active_connections, 0);
+        assert_eq!(server_snapshot.active_streams, 0);
+
+        let lines = sink.lines();
+        assert!(!lines.is_empty());
+        let mut saw_connection_id = false;
+        let mut saw_metrics = false;
+        for line in &lines {
+            assert!(!line.contains('\n'), "单条事件不得包含嵌入换行");
+            let record: Value = serde_json::from_str(line).expect("每行都必须是有效 JSON");
+            assert_eq!(record["schema"], EVENT_SCHEMA);
+            assert!(record["ts_unix_ms"].as_u64().is_some());
+            assert!(record["level"].as_str().is_some());
+            assert!(record["role"].as_str().is_some());
+            assert!(record["event"].as_str().is_some());
+            if record["event"] == "connection_started" {
+                saw_connection_id |= record["connection_id"].as_u64().is_some();
+            }
+            saw_metrics |= record["event"] == "metrics_snapshot";
+        }
+        assert!(saw_connection_id);
+        assert!(saw_metrics);
+
+        let logs = lines.join("\n");
+        assert!(!logs.contains(std::str::from_utf8(secret_token).unwrap()));
+        assert!(!logs.contains(std::str::from_utf8(payload).unwrap()));
+        assert!(!logs.contains(&key_path.display().to_string()));
+        assert!(!logs.contains("private-key.der"));
+        assert!(!logs.contains(&private_key_marker));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn graceful_shutdown_stops_accepting_and_drains_an_existing_stream() {
+        let _network_test_guard = crate::LOCAL_NETWORK_TEST_LOCK.lock().await;
+        let directory = TestDirectory::new();
+        let (certificate_path, key_path, token_path) = write_test_credentials(&directory);
+        let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream.local_addr().unwrap();
+        let upstream_task = tokio::spawn(async move {
+            let (mut stream, _) = upstream.accept().await.unwrap();
+            let (mut read, mut write) = stream.split();
+            tokio::io::copy(&mut read, &mut write).await.unwrap();
+        });
+        let sink = Arc::new(TestEventSink::default());
+        let server = start_proxy_server_with_limits_and_sink(
+            ProxyServerConfig {
+                listen: "127.0.0.1:0".parse().unwrap(),
+                certificate_der: certificate_path.clone(),
+                private_key_der: key_path,
+                token_file: token_path.clone(),
+                allowed_target: upstream_addr,
+            },
+            test_runtime_limits(),
+            sink.clone(),
+        )
+        .await
+        .unwrap();
+        let client = start_proxy_client_with_limits_and_sink(
+            ProxyClientConfig {
+                listen: "127.0.0.1:0".parse().unwrap(),
+                server: server.local_addr().to_string(),
+                server_name: "localhost".to_owned(),
+                ca_certificate_der: certificate_path,
+                token_file: token_path,
+                target: upstream_addr,
+                primary_local_ip: None,
+                additional_local_ips: Vec::new(),
+            },
+            test_runtime_limits(),
+            sink.clone(),
+        )
+        .await
+        .unwrap();
+
+        let client_addr = client.local_addr();
+        let mut stream = TcpStream::connect(client_addr).await.unwrap();
+        stream.write_all(b"before-shutdown").await.unwrap();
+        let mut first_echo = [0_u8; 15];
+        stream.read_exact(&mut first_echo).await.unwrap();
+        assert_eq!(&first_echo, b"before-shutdown");
+
+        let shutdown_task = tokio::spawn(async move { client.shutdown().await });
+        sink.wait_for_event("client", "shutdown_started").await;
+        let new_connection = timeout(Duration::from_secs(1), TcpStream::connect(client_addr))
+            .await
+            .expect("关闭接入后连接尝试必须及时结束");
+        assert!(new_connection.is_err(), "关闭接入后不得接受新的本地 TCP");
+
+        stream.write_all(b"during-drain").await.unwrap();
+        stream.shutdown().await.unwrap();
+        let mut remaining = Vec::new();
+        stream.read_to_end(&mut remaining).await.unwrap();
+        assert_eq!(&remaining, b"during-drain");
+
+        let snapshot = timeout(Duration::from_secs(3), shutdown_task)
+            .await
+            .expect("现有流应在 drain 截止内结束")
+            .unwrap();
+        assert_eq!(snapshot.graceful_shutdowns, 1);
+        assert_eq!(snapshot.forced_shutdowns, 0);
+        assert_eq!(snapshot.active_connections, 0);
+        assert_eq!(snapshot.active_streams, 0);
+        server.shutdown().await;
+        upstream_task.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn shutdown_timeout_forces_remaining_streams_and_clears_active_gauges() {
+        let _network_test_guard = crate::LOCAL_NETWORK_TEST_LOCK.lock().await;
+        use tokio::sync::oneshot;
+
+        let directory = TestDirectory::new();
+        let (certificate_path, key_path, token_path) = write_test_credentials(&directory);
+        let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream.local_addr().unwrap();
+        let (accepted_tx, accepted_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        let upstream_task = tokio::spawn(async move {
+            let (stream, _) = upstream.accept().await.unwrap();
+            let _ = accepted_tx.send(());
+            let _ = release_rx.await;
+            drop(stream);
+        });
+
+        let server = start_proxy_server_with_limits(
+            ProxyServerConfig {
+                listen: "127.0.0.1:0".parse().unwrap(),
+                certificate_der: certificate_path.clone(),
+                private_key_der: key_path,
+                token_file: token_path.clone(),
+                allowed_target: upstream_addr,
+            },
+            test_runtime_limits(),
+        )
+        .await
+        .unwrap();
+        let client_limits = ProxyRuntimeLimits {
+            shutdown_drain_timeout: Duration::from_millis(75),
+            ..test_runtime_limits()
+        };
+        let client = start_proxy_client_with_limits(
+            ProxyClientConfig {
+                listen: "127.0.0.1:0".parse().unwrap(),
+                server: server.local_addr().to_string(),
+                server_name: "localhost".to_owned(),
+                ca_certificate_der: certificate_path,
+                token_file: token_path,
+                target: upstream_addr,
+                primary_local_ip: None,
+                additional_local_ips: Vec::new(),
+            },
+            client_limits,
+        )
+        .await
+        .unwrap();
+
+        let client_addr = client.local_addr();
+        let mut stream = TcpStream::connect(client_addr).await.unwrap();
+        stream.write_all(b"keep-open").await.unwrap();
+        timeout(Duration::from_secs(2), accepted_rx)
+            .await
+            .expect("代理流应连接固定上游")
+            .unwrap();
+
+        let shutdown_started = Instant::now();
+        let snapshot = timeout(Duration::from_secs(1), client.shutdown())
+            .await
+            .expect("强制关闭必须受 drain 截止约束");
+        assert!(shutdown_started.elapsed() < Duration::from_secs(1));
+        assert_eq!(snapshot.graceful_shutdowns, 0);
+        assert_eq!(snapshot.forced_shutdowns, 1);
+        assert_eq!(snapshot.active_connections, 0);
+        assert_eq!(snapshot.active_streams, 0);
+        assert_eq!(snapshot.total_streams, 1);
+        assert!(TcpStream::connect(client_addr).await.is_err());
+
+        let mut closed = [0_u8; 1];
+        let read = timeout(Duration::from_secs(1), stream.read(&mut closed))
+            .await
+            .expect("强制关闭后本地流必须及时结束");
+        assert!(matches!(read, Ok(0) | Err(_)));
+        let _ = release_tx.send(());
+        upstream_task.await.unwrap();
+        server.shutdown().await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

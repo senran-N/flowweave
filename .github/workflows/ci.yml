@@ -12,7 +12,7 @@ jobs:
   root:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install pinned Rust toolchain
         run: rustup toolchain install 1.88.0 --profile minimal --component clippy,rustfmt
       - name: Check formatting
@@ -27,7 +27,7 @@ jobs:
   vendor:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install pinned Rust toolchain
         run: rustup toolchain install 1.88.0 --profile minimal --component clippy,rustfmt
       - name: Test NoQ Proto patch set

@@ -11,8 +11,10 @@ readme = "README.md"
 noq = { version = "=1.0.1", default-features = false, features = ["runtime-tokio", "rustls", "ring"] }
 noq-proto = { version = "=1.0.1", default-features = false }
 rcgen = { version = "=0.14.5", default-features = false, features = ["crypto", "ring"] }
+serde_json = "=1.0.140"
 subtle = "=2.6.1"
-tokio = { version = "=1.47.1", features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
+tokio = { version = "=1.47.1", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-stream = "=0.1.18"
 
 [patch.crates-io]
 noq = { path = "third_party/noq" }

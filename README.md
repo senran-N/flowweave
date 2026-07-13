@@ -38,6 +38,8 @@ cargo build --release --bin flowweave-proxy
 
 - 产品入口使用标准 TLS 1.3、独立 CA 和严格 `server_name` 校验，没有跳过证书验证的产品开关。
 - 服务端只连接配置中的唯一 `allowed_target`，客户端只监听 loopback；它不是开放代理、SOCKS5、TUN 或任意 UDP 转发器。
+- 代理运行事件使用稳定的 `flowweave.runtime.v1` JSONL；原子指标快照可从日志和 `ProxyRuntime::metrics_snapshot()` 读取，事件不记录令牌、私钥或应用载荷。
+- SIGTERM 和 Ctrl-C 会先停止新接入，再给现有流最多 10 秒完成传输；超过截止时间才强制终止残余任务。
 - `scripts/run_netem_lab.sh` 只允许在一次性隔离网络命名空间中运行；不要绕过它直接对真实网卡执行实验命令。
 - 私钥、令牌、真实证书、Hysteria 下载二进制和 Cargo 构建目录不得提交到仓库。
 
@@ -52,6 +54,6 @@ cargo build --release --bin flowweave-proxy
 
 ## 当前限制
 
-实验室结果不等于生产 SLA。真实公网双接口、长期 soak、升级兼容、客户端身份轮换和生产级可观测性仍待完成。C 组编码器目前也是实验入口，不是通用实时媒体协议。
+实验室结果不等于生产 SLA。真实公网双接口、长期 soak、升级兼容、客户端身份轮换、外部指标采集与告警仍待完成。C 组编码器目前也是实验入口，不是通用实时媒体协议。
 
 本仓库当前尚未声明开源许可证；在许可证确定前，不应把第三方许可证误认为 FlowWeave 自身的授权。

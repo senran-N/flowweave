@@ -40,8 +40,8 @@ pub use hysteria::{
     run_hysteria_throughput, verify_hysteria_binary,
 };
 pub use proxy::{
-    ProxyClientConfig, ProxyRuntime, ProxyServerConfig, run_proxy_client, run_proxy_server,
-    start_proxy_client, start_proxy_server,
+    ProxyClientConfig, ProxyMetricsSnapshot, ProxyRuntime, ProxyServerConfig, run_proxy_client,
+    run_proxy_server, start_proxy_client, start_proxy_server,
 };
 pub use realtime::{
     RealtimeDatagramConfig, RealtimeDatagramReport, run_batched_duplication_realtime,

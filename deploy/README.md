@@ -126,7 +126,21 @@ ss -ltnp | grep 10022
 - additional IP 没有配置在本机、路由不通或与服务端地址族不同；客户端按合同拒绝静默降级。
 - 防火墙只开放了 TCP；FlowWeave 外层传输使用 QUIC/UDP。
 
-日志只报告配置、TLS、路径、状态码和 I/O 错误，不输出令牌、私钥或完整应用载荷。客户端 QUIC 连接失效时进程退出，由 systemd 的 `Restart=on-failure` 执行外部重启；程序内部没有隐藏重连器。
+运行事件逐行输出为 JSON（JSONL），schema 固定为 `flowweave.runtime.v1`。每条记录至少包含 `schema`、`ts_unix_ms`、`level`、`role` 和 `event`；`connection_started`、`connection_finished` 与 `path_changed` 使用 NoQ 的连接稳定 ID 和路径 ID 关联生命周期。路径事件只报告状态、原因和丢包计数，不记录观察到的地址。这些结构化运行事件不输出令牌、私钥、配置中的密钥路径或应用载荷。
+
+主要事件包括：
+
+- `runtime_started`：监听已就绪；
+- `connection_started` / `connection_finished`：QUIC 连接生命周期与汇总 UDP 字节、丢失字节；
+- `stream_started` / `stream_finished`：代理流结果和成功流的上下行字节；
+- `connection_rejected` / `stream_rejected`：固定并发上限触发；
+- `path_changed`：路径建立、放弃、丢弃或远端状态变化；
+- `metrics_snapshot`：每 10 秒以及退出前输出一次原子计数快照；
+- `shutdown_started` / `shutdown_forced` / `shutdown_complete`：drain 截止、超时原因、实际耗时及是否强制关闭。
+
+`metrics_snapshot` 包含活动/累计连接与流、配额拒绝、DNS/TLS/请求/开流/上游连接超时、上游错误、应用上下行字节和优雅/强制退出次数。嵌入库的调用方也可通过 `ProxyRuntime::metrics_snapshot()` 读取同一组原子计数；`ProxyRuntime::shutdown()` 完成后返回最终快照。
+
+SIGTERM 和 Ctrl-C 会触发有界优雅退出：服务端先禁止新 QUIC 连接，客户端先关闭本地 TCP listener，现有代理流最多继续 drain 10 秒；到期仍未完成时关闭 QUIC Endpoint、终止残余任务并把 `forced_shutdowns` 加一。systemd 样例的 `TimeoutStopSec=15s` 给程序的 10 秒窗口留出清理余量。客户端 QUIC 连接意外失效时进程仍会以失败状态退出，由 `Restart=on-failure` 执行外部重启；程序内部没有隐藏重连器。
 
 当前运行保护是固定产品合同，不从配置文件放大：服务端最多同时处理 64 条 QUIC 连接，每条连接最多允许 64 条客户端双向流且拒绝所有单向流；客户端最多同时转发 64 条本地 TCP 连接，超额连接会立即关闭。DNS/TLS、打开 QUIC 流和上游 TCP 连接的截止为 10 秒，代理请求头与授权响应截止为 5 秒。systemd 样例另设置 `TasksMax=512` 与 `MemoryMax=1G`；若真实试点触发这些上限，应先记录负载、RSS、活动连接和失败原因，再通过新版本审计调整，不能临时删除保护后继续运行。
 
