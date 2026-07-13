@@ -52,7 +52,7 @@ const PRODUCT_UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const PRODUCT_STREAM_OPEN_TIMEOUT: Duration = Duration::from_secs(10);
 const PRODUCT_SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
 const PRODUCT_METRICS_INTERVAL: Duration = Duration::from_secs(10);
-const EVENT_SCHEMA: &str = "flowweave.runtime.v1";
+pub const PROXY_EVENT_SCHEMA: &str = "flowweave.runtime.v1";
 
 const STATUS_OK: u8 = 0;
 const STATUS_VERSION: u8 = 1;
@@ -206,7 +206,7 @@ impl Drop for ActiveMetricGuard {
     }
 }
 
-trait ProxyEventSink: Send + Sync {
+pub(crate) trait ProxyEventSink: Send + Sync {
     fn write_line(&self, line: &str);
 }
 
@@ -263,7 +263,10 @@ impl ProxyEventLog {
 
     fn emit(&self, level: &'static str, event: &'static str, fields: Value) {
         let mut record = Map::new();
-        record.insert("schema".to_owned(), Value::String(EVENT_SCHEMA.to_owned()));
+        record.insert(
+            "schema".to_owned(),
+            Value::String(PROXY_EVENT_SCHEMA.to_owned()),
+        );
         record.insert("ts_unix_ms".to_owned(), json!(unix_timestamp_millis()));
         record.insert("level".to_owned(), Value::String(level.to_owned()));
         record.insert("role".to_owned(), Value::String(self.role.to_owned()));
@@ -510,6 +513,13 @@ pub async fn start_proxy_server(config: ProxyServerConfig) -> LabResult<ProxyRun
     start_proxy_server_with_limits(config, PRODUCT_RUNTIME_LIMITS).await
 }
 
+pub(crate) async fn start_proxy_server_with_sink(
+    config: ProxyServerConfig,
+    sink: Arc<dyn ProxyEventSink>,
+) -> LabResult<ProxyRuntime> {
+    start_proxy_server_with_limits_and_sink(config, PRODUCT_RUNTIME_LIMITS, sink).await
+}
+
 async fn start_proxy_server_with_limits(
     config: ProxyServerConfig,
     limits: ProxyRuntimeLimits,
@@ -571,6 +581,13 @@ async fn start_proxy_server_with_limits_and_sink(
 
 pub async fn start_proxy_client(config: ProxyClientConfig) -> LabResult<ProxyRuntime> {
     start_proxy_client_with_limits(config, PRODUCT_RUNTIME_LIMITS).await
+}
+
+pub(crate) async fn start_proxy_client_with_sink(
+    config: ProxyClientConfig,
+    sink: Arc<dyn ProxyEventSink>,
+) -> LabResult<ProxyRuntime> {
+    start_proxy_client_with_limits_and_sink(config, PRODUCT_RUNTIME_LIMITS, sink).await
 }
 
 async fn start_proxy_client_with_limits(
@@ -2508,7 +2525,7 @@ mod tests {
         for line in &lines {
             assert!(!line.contains('\n'), "单条事件不得包含嵌入换行");
             let record: Value = serde_json::from_str(line).expect("每行都必须是有效 JSON");
-            assert_eq!(record["schema"], EVENT_SCHEMA);
+            assert_eq!(record["schema"], PROXY_EVENT_SCHEMA);
             assert!(record["ts_unix_ms"].as_u64().is_some());
             assert!(record["level"].as_str().is_some());
             assert!(record["role"].as_str().is_some());
@@ -2527,6 +2544,10 @@ mod tests {
         assert!(!logs.contains(&key_path.display().to_string()));
         assert!(!logs.contains("private-key.der"));
         assert!(!logs.contains(&private_key_marker));
+        let health = crate::analyze_proxy_jsonl(std::io::Cursor::new(logs))
+            .unwrap()
+            .evaluate(crate::ProxyHealthPolicy::strict_both());
+        assert!(health.healthy, "{:?}", health.violations);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

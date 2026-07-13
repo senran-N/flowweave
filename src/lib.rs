@@ -25,6 +25,8 @@ use tokio::{
 mod b_ingress;
 mod hysteria;
 mod proxy;
+mod proxy_observe;
+mod proxy_soak;
 mod realtime;
 mod realtime_controller;
 mod realtime_v3;
@@ -40,9 +42,14 @@ pub use hysteria::{
     run_hysteria_throughput, verify_hysteria_binary,
 };
 pub use proxy::{
-    ProxyClientConfig, ProxyMetricsSnapshot, ProxyRuntime, ProxyServerConfig, run_proxy_client,
-    run_proxy_server, start_proxy_client, start_proxy_server,
+    PROXY_EVENT_SCHEMA, ProxyClientConfig, ProxyMetricsSnapshot, ProxyRuntime, ProxyServerConfig,
+    run_proxy_client, run_proxy_server, start_proxy_client, start_proxy_server,
 };
+pub use proxy_observe::{
+    MAX_PROXY_EVENT_LINE_BYTES, PROXY_OBSERVATION_SCHEMA, ProxyHealthPolicy, ProxyHealthReport,
+    ProxyObservation, ProxyRoleObservation, analyze_proxy_jsonl,
+};
+pub use proxy_soak::{PROXY_SOAK_REPORT_SCHEMA, ProxySoakConfig, ProxySoakReport, run_proxy_soak};
 pub use realtime::{
     RealtimeDatagramConfig, RealtimeDatagramReport, run_batched_duplication_realtime,
 };
