@@ -70,6 +70,7 @@ cargo run --release --bin flowweave-proxy-observe -- \
 - `src/vpn_data_policy.rs`：上行源地址防伪、双向目标 ACL 和下行虚拟地址归属检查；
 - `src/vpn_identity.rs`：证书指纹身份、双指纹轮换、虚拟地址、目标 CIDR 和每身份资源合同；
 - `src/vpn_identity_config.rs`：严格 JSON 身份文件、私有权限和失败保留旧状态的原子注册表替换；
+- `src/vpn_packet_bridge.rs`：Linux 预附着包文件描述符与 DATAGRAM 运行器之间的双向桥接、超限/队列丢弃计数和协同退出；本层不创建 TUN 或修改路由；
 - `src/vpn_quota.rs`：跨代际共享 token bucket、逐身份速率隔离和全局重组字节/未完成包原子上限；
 - `src/vpn_session.rs`：真实 mTLS QUIC 上的 `FWC1` 控制握手、强制 MPQUIC/DATAGRAM 和稳定拒绝原因；
 - `src/vpn_tls.rs`：TLS 1.3 双向证书、独立 CA、VPN ALPN 和叶证书指纹提取；
@@ -83,6 +84,6 @@ cargo run --release --bin flowweave-proxy-observe -- \
 
 ## 当前限制
 
-实验室结果不等于生产 SLA。仓库已有默认 60 秒的单机真实 TLS/MPQUIC soak、可配置 JSONL 阈值检查、共享令牌无重启轮换，以及带限速、应用字节预算和周期检查点的公网 workload/echo 部署入口；现已完成同一物理出口下“两张接口 + 两条源路由 + 两个 NAT”的 30 分钟真实公网双路径 soak。VPN 已完成逐客户端身份、活动代际、在线撤销、按身份分片的数据热路径、外层 `FWI1` 准入、真实重组、原子全局账本和双向 ACL；客户端现在能直接从受验证的 `FWC1 ACCEPT` 建立数据句柄，双方协商的最大 IP 包长会在收发两端实际执行。真实 loopback 组合测试已串通 TLS 1.3 mTLS、控制握手、受管服务端会话、客户端工厂和双方 NoQ DATAGRAM 运行器，并验证 IPv4 上行、IPv6 下行、超限拒绝及旧运行器退出。产品 client/server 命令、TUN 设备、路由/NAT 和 DNS 仍未接入。两个独立运营商出口只保留为运营商级故障隔离声明边界；多小时/多天证据、跨版本升级、外部指标存储与告警投递仍待完成。C 组编码器目前也是实验入口，不是通用实时媒体协议。
+实验室结果不等于生产 SLA。仓库已有默认 60 秒的单机真实 TLS/MPQUIC soak、可配置 JSONL 阈值检查、共享令牌无重启轮换，以及带限速、应用字节预算和周期检查点的公网 workload/echo 部署入口；现已完成同一物理出口下“两张接口 + 两条源路由 + 两个 NAT”的 30 分钟真实公网双路径 soak。VPN 已完成逐客户端身份、活动代际、在线撤销、按身份分片的数据热路径、外层 `FWI1` 准入、真实重组、原子全局账本和双向 ACL；客户端现在能直接从受验证的 `FWC1 ACCEPT` 建立数据句柄，双方协商的最大 IP 包长会在收发两端实际执行。真实 loopback 组合测试已串通 TLS 1.3 mTLS、控制握手、受管服务端会话、客户端工厂和双方 NoQ DATAGRAM 运行器，并验证 IPv4 上行、IPv6 下行、超限拒绝及旧运行器退出。Linux 侧还新增了只接收“预附着包文件描述符”的非特权桥接骨架，已用真实 Unix packet socket 验证双向包边界、超限丢弃、代际失效和设备写失败；它没有执行 TUN ioctl 或修改路由。产品 client/server 命令、真实 TUN 设备接线、路由/NAT 和 DNS 仍未完成。两个独立运营商出口只保留为运营商级故障隔离声明边界；多小时/多天证据、跨版本升级、外部指标存储与告警投递仍待完成。C 组编码器目前也是实验入口，不是通用实时媒体协议。
 
 本仓库当前尚未声明开源许可证；在许可证确定前，不应把第三方许可证误认为 FlowWeave 自身的授权。

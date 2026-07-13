@@ -250,6 +250,7 @@ dependencies = [
 name = "flowweave-lab"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "noq",
  "noq-proto",
  "rcgen",

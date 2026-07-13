@@ -40,6 +40,8 @@ mod vpn_data_policy;
 mod vpn_datagram_runtime;
 mod vpn_identity;
 mod vpn_identity_config;
+#[cfg(target_os = "linux")]
+mod vpn_packet_bridge;
 mod vpn_quota;
 mod vpn_session;
 mod vpn_tls;
@@ -132,6 +134,12 @@ pub use vpn_identity_config::{
     SharedVpnIdentityRegistry, VPN_IDENTITY_CONFIG_MAX_BYTES, VPN_IDENTITY_CONFIG_VERSION,
     VpnIdentityConfigError, VpnIdentityReloadReport, load_vpn_identity_registry,
     parse_vpn_identity_registry_json,
+};
+#[cfg(target_os = "linux")]
+pub use vpn_packet_bridge::{
+    VpnPacketBridge, VpnPacketBridgeConfig, VpnPacketBridgeConfigError, VpnPacketBridgeMetrics,
+    VpnPacketBridgeMetricsSnapshot, VpnPacketBridgeReport, VpnPacketBridgeStartError,
+    VpnPacketBridgeStopReason, VpnPacketDevice, start_vpn_packet_bridge,
 };
 pub use vpn_quota::{
     VPN_DEFAULT_GLOBAL_INFLIGHT_PACKETS, VPN_DEFAULT_GLOBAL_REASSEMBLY_BYTES,

@@ -1058,12 +1058,16 @@ fn add(counter: &AtomicU64, amount: u64) {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "linux")]
+    use std::{fs::File, os::fd::OwnedFd, os::unix::net::UnixDatagram as StdUnixDatagram};
     use std::{
         net::{Ipv4Addr, Ipv6Addr},
         sync::Arc,
     };
 
     use noq::Endpoint;
+    #[cfg(target_os = "linux")]
+    use tokio::net::UnixDatagram;
     use tokio::time::timeout;
 
     use crate::{
@@ -1071,6 +1075,12 @@ mod tests {
         VpnIdentityLimits, VpnIpNetwork,
         vpn_data_policy::VpnDataPolicyMetrics,
         vpn_quota::{VpnGlobalReassemblyBudget, VpnIdentityRateLimiter, VpnQuotaMetrics},
+    };
+    #[cfg(target_os = "linux")]
+    use crate::{
+        VpnPacketBridgeConfig, VpnPacketBridgeMetrics, VpnPacketBridgeStopReason, VpnPacketDevice,
+        start_vpn_packet_bridge,
+        vpn_packet_bridge::{VpnPacketReaderExit, run_packet_reader},
     };
 
     use super::*;
@@ -1208,6 +1218,246 @@ mod tests {
         server_connection.close(0_u8.into(), b"test complete");
         client_endpoint.close(0_u8.into(), b"test complete");
         server_endpoint.close(0_u8.into(), b"test complete");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn packet_device_bridge_preserves_packets_over_real_noq_datagrams() {
+        let _network_test_guard = crate::LOCAL_NETWORK_TEST_LOCK.lock().await;
+        let (server_endpoint, client_endpoint, server_connection, client_connection) =
+            connection_pair().await;
+        let server_runtime = start_vpn_datagram_runtime(
+            server_connection.clone(),
+            active_data_path(1),
+            VpnDatagramRuntimeConfig::new(VpnDatagramRole::Server, 1200).unwrap(),
+        )
+        .unwrap();
+        let client_runtime = start_vpn_datagram_runtime(
+            client_connection.clone(),
+            active_data_path(1),
+            VpnDatagramRuntimeConfig::new(VpnDatagramRole::Client, 1200).unwrap(),
+        )
+        .unwrap();
+        let (server_device, server_tun) = packet_device_pair();
+        let (client_device, client_tun) = packet_device_pair();
+        let bridge_config = VpnPacketBridgeConfig::new(3000).unwrap();
+        let server_bridge =
+            start_vpn_packet_bridge(server_device, server_runtime, bridge_config).unwrap();
+        let client_bridge =
+            start_vpn_packet_bridge(client_device, client_runtime, bridge_config).unwrap();
+
+        client_tun.send(&vec![0x7f; 3001]).await.unwrap();
+        let uplink = ipv4_packet(3000, "10.77.0.2", "198.51.100.8", 0x91);
+        client_tun.send(&uplink).await.unwrap();
+        let mut received = vec![0_u8; 4096];
+        let received_len = timeout(Duration::from_secs(3), server_tun.recv(&mut received))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&received[..received_len], uplink);
+
+        let downlink = ipv6_packet(1280, "2001:db8::8", "fd77::2", 0x92);
+        server_tun.send(&downlink).await.unwrap();
+        let received_len = timeout(Duration::from_secs(3), client_tun.recv(&mut received))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&received[..received_len], downlink);
+        timeout(Duration::from_secs(2), async {
+            loop {
+                if client_bridge.metrics_snapshot().oversized_device_packets == 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        let (client_report, server_report) =
+            tokio::join!(client_bridge.shutdown(), server_bridge.shutdown());
+        assert_eq!(
+            client_report.stop_reason,
+            VpnPacketBridgeStopReason::ShutdownRequested
+        );
+        assert_eq!(
+            server_report.stop_reason,
+            VpnPacketBridgeStopReason::ShutdownRequested
+        );
+        assert_eq!(client_report.metrics.device_read_packets, 2);
+        assert_eq!(client_report.metrics.oversized_device_packets, 1);
+        assert_eq!(client_report.metrics.device_written_packets, 1);
+        assert_eq!(server_report.metrics.device_read_packets, 1);
+        assert_eq!(server_report.metrics.device_written_packets, 1);
+        assert_eq!(
+            client_report.datagram_runtime.unwrap().stop_reason,
+            VpnDatagramRuntimeStopReason::ShutdownRequested
+        );
+        assert_eq!(
+            server_report.datagram_runtime.unwrap().stop_reason,
+            VpnDatagramRuntimeStopReason::ShutdownRequested
+        );
+
+        client_connection.close(0_u8.into(), b"test complete");
+        server_connection.close(0_u8.into(), b"test complete");
+        client_endpoint.close(0_u8.into(), b"test complete");
+        server_endpoint.close(0_u8.into(), b"test complete");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn packet_device_bridge_preserves_stale_generation_stop_reason() {
+        let _network_test_guard = crate::LOCAL_NETWORK_TEST_LOCK.lock().await;
+        let (server_endpoint, client_endpoint, server_connection, client_connection) =
+            connection_pair().await;
+        let server_path = active_data_path(1);
+        let server_runtime = start_vpn_datagram_runtime(
+            server_connection.clone(),
+            server_path.clone(),
+            VpnDatagramRuntimeConfig::new(VpnDatagramRole::Server, 1200)
+                .unwrap()
+                .with_reassembly_tick(Duration::from_millis(10))
+                .unwrap(),
+        )
+        .unwrap();
+        let client_runtime = start_vpn_datagram_runtime(
+            client_connection.clone(),
+            active_data_path(1),
+            VpnDatagramRuntimeConfig::new(VpnDatagramRole::Client, 1200).unwrap(),
+        )
+        .unwrap();
+        let (device, _tun_peer) = packet_device_pair();
+        let bridge = start_vpn_packet_bridge(
+            device,
+            server_runtime,
+            VpnPacketBridgeConfig::new(1500).unwrap(),
+        )
+        .unwrap();
+
+        server_path.deactivate();
+        let report = timeout(Duration::from_secs(3), bridge.wait())
+            .await
+            .unwrap();
+        assert_eq!(
+            report.stop_reason,
+            VpnPacketBridgeStopReason::DatagramRuntime(VpnDatagramRuntimeStopReason::DataPathStale)
+        );
+        assert_eq!(
+            report.datagram_runtime.unwrap().stop_reason,
+            VpnDatagramRuntimeStopReason::DataPathStale
+        );
+        assert_eq!(
+            client_runtime.shutdown().await.stop_reason,
+            VpnDatagramRuntimeStopReason::ShutdownRequested
+        );
+        client_connection.close(0_u8.into(), b"test complete");
+        server_connection.close(0_u8.into(), b"test complete");
+        client_endpoint.close(0_u8.into(), b"test complete");
+        server_endpoint.close(0_u8.into(), b"test complete");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn packet_device_bridge_stops_on_device_write_failure() {
+        let _network_test_guard = crate::LOCAL_NETWORK_TEST_LOCK.lock().await;
+        let (server_endpoint, client_endpoint, server_connection, client_connection) =
+            connection_pair().await;
+        let server_runtime = start_vpn_datagram_runtime(
+            server_connection.clone(),
+            active_data_path(1),
+            VpnDatagramRuntimeConfig::new(VpnDatagramRole::Server, 1200).unwrap(),
+        )
+        .unwrap();
+        let client_runtime = start_vpn_datagram_runtime(
+            client_connection.clone(),
+            active_data_path(1),
+            VpnDatagramRuntimeConfig::new(VpnDatagramRole::Client, 1200).unwrap(),
+        )
+        .unwrap();
+        let (device, tun_peer) = packet_device_pair();
+        drop(tun_peer);
+        let bridge = start_vpn_packet_bridge(
+            device,
+            server_runtime,
+            VpnPacketBridgeConfig::new(1500).unwrap(),
+        )
+        .unwrap();
+
+        client_runtime
+            .outbound()
+            .try_send(ipv4_packet(1280, "10.77.0.2", "198.51.100.8", 0x93))
+            .unwrap();
+        let report = timeout(Duration::from_secs(3), bridge.wait())
+            .await
+            .unwrap();
+        assert!(matches!(
+            report.stop_reason,
+            VpnPacketBridgeStopReason::DeviceWriteFailed(_)
+        ));
+        assert_eq!(report.metrics.device_written_packets, 0);
+        assert_eq!(
+            report.datagram_runtime.unwrap().stop_reason,
+            VpnDatagramRuntimeStopReason::ShutdownRequested
+        );
+        assert_eq!(
+            client_runtime.shutdown().await.stop_reason,
+            VpnDatagramRuntimeStopReason::ShutdownRequested
+        );
+        client_connection.close(0_u8.into(), b"test complete");
+        server_connection.close(0_u8.into(), b"test complete");
+        client_endpoint.close(0_u8.into(), b"test complete");
+        server_endpoint.close(0_u8.into(), b"test complete");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn packet_device_reader_drops_current_packet_when_runtime_queue_is_full() {
+        let outbound_budget = VpnPacketQueueBudget::new(1, VPN_MAX_IP_PACKET_LEN);
+        let runtime_metrics = VpnDatagramRuntimeMetrics::new(
+            VpnPacketQueueBudget::new(1, VPN_MAX_IP_PACKET_LEN),
+            outbound_budget.clone(),
+        );
+        let (sender, _receiver) = mpsc::channel(1);
+        let outbound = VpnPacketSender {
+            sender,
+            budget: outbound_budget,
+            metrics: runtime_metrics,
+        };
+        outbound.try_send(vec![0_u8; 1280]).unwrap();
+
+        let (device, tun_peer) = packet_device_pair();
+        let metrics = VpnPacketBridgeMetrics::default();
+        let (shutdown_sender, shutdown_receiver) = tokio::sync::watch::channel(false);
+        let reader = tokio::spawn(run_packet_reader(
+            device,
+            outbound,
+            VpnPacketBridgeConfig::new(1280).unwrap(),
+            shutdown_receiver,
+            metrics.clone(),
+        ));
+        tun_peer.send(&vec![0x94; 1280]).await.unwrap();
+        timeout(Duration::from_secs(1), async {
+            loop {
+                if metrics.snapshot().outbound_queue_dropped_packets == 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        shutdown_sender.send_replace(true);
+        assert!(matches!(
+            timeout(Duration::from_secs(1), reader)
+                .await
+                .unwrap()
+                .unwrap(),
+            VpnPacketReaderExit::Shutdown
+        ));
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.device_read_packets, 1);
+        assert_eq!(snapshot.outbound_queue_dropped_packets, 1);
+        assert_eq!(snapshot.outbound_queue_dropped_bytes, 1280);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1417,5 +1667,14 @@ mod tests {
         packet[8..24].copy_from_slice(&source);
         packet[24..40].copy_from_slice(&destination);
         packet
+    }
+
+    #[cfg(target_os = "linux")]
+    fn packet_device_pair() -> (VpnPacketDevice, UnixDatagram) {
+        let (device, peer) = StdUnixDatagram::pair().unwrap();
+        peer.set_nonblocking(true).unwrap();
+        let device = VpnPacketDevice::from_file(File::from(OwnedFd::from(device))).unwrap();
+        let peer = UnixDatagram::from_std(peer).unwrap();
+        (device, peer)
     }
 }

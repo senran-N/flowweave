@@ -21,6 +21,9 @@ subtle = "=2.6.1"
 tokio = { version = "=1.47.1", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-stream = "=0.1.18"
 
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "=0.2.186"
+
 [patch.crates-io]
 noq = { path = "third_party/noq" }
 noq-proto = { path = "third_party/noq-proto" }
