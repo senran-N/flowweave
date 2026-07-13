@@ -9,7 +9,7 @@ rust-version = "1.88"
 cargo-fuzz = true
 
 [dependencies]
-flowweave-lab = { path = ".." }
+flowweave-lab = { path = "..", features = ["fuzzing"] }
 libfuzzer-sys = "=0.4.13"
 
 [patch.crates-io]

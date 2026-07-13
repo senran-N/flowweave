@@ -34,6 +34,7 @@ mod scheduler;
 mod vpn;
 mod vpn_active_session;
 mod vpn_control;
+mod vpn_data_path;
 mod vpn_data_policy;
 mod vpn_identity;
 mod vpn_identity_config;
@@ -79,17 +80,18 @@ pub use scheduler::MultipathScheduler;
 pub use vpn::{
     VPN_DEFAULT_FRAGMENT_TIMEOUT, VPN_DEFAULT_MAX_INFLIGHT_PACKETS,
     VPN_DEFAULT_MAX_REASSEMBLY_BYTES, VPN_IP_DATAGRAM_HEADER_LEN, VPN_IP_DATAGRAM_MAGIC,
-    VPN_MAX_FRAGMENTS_PER_PACKET, VPN_MAX_IP_PACKET_LEN, VPN_MIN_QUIC_DATAGRAM_LEN, VpnFragment,
-    VpnIpPacketMeta, VpnPacketError, VpnReassembler, VpnReassemblyLimits, VpnReassemblyStats,
-    decode_vpn_ip_fragment, encode_vpn_ip_fragments, inspect_vpn_ip_packet,
+    VPN_MAX_FRAGMENTS_PER_PACKET, VPN_MAX_IP_DATAGRAM_LEN, VPN_MAX_IP_PACKET_LEN,
+    VPN_MIN_QUIC_DATAGRAM_LEN, VpnFragment, VpnIpPacketMeta, VpnPacketError, VpnReassembler,
+    VpnReassemblyLimits, VpnReassemblyStats, decode_vpn_ip_fragment, encode_vpn_ip_fragments,
+    inspect_vpn_ip_packet,
 };
 pub use vpn_active_session::{
     VPN_CLOSE_COMMIT_REJECTED, VPN_CLOSE_IDENTITY_REVOKED, VPN_CLOSE_POLICY_CHANGED,
     VPN_CLOSE_SERVER_SHUTDOWN, VPN_CLOSE_SESSION_REPLACED, VpnActiveSessionSnapshot,
-    VpnCoordinatorReloadReport, VpnManagedActiveSession, VpnManagedServerOutcome,
-    VpnManagedSessionError, VpnReassemblyReservation, VpnSessionCommitError,
-    VpnSessionCommitReport, VpnSessionCoordinator, VpnSessionCoordinatorMetrics,
-    VpnSessionReconcileReport, vpn_server_managed_control_handshake,
+    VpnCommittedSession, VpnCoordinatorReloadReport, VpnManagedActiveSession,
+    VpnManagedServerOutcome, VpnManagedSessionError, VpnSessionCommitError, VpnSessionCommitReport,
+    VpnSessionCoordinator, VpnSessionCoordinatorMetrics, VpnSessionReconcileReport,
+    vpn_server_managed_control_handshake,
 };
 pub use vpn_control::{
     VPN_ALPN, VPN_CAP_FRAGMENTATION, VPN_CAP_IPV4, VPN_CAP_IPV6, VPN_CAP_MULTIPATH_REQUIRED,
@@ -99,6 +101,9 @@ pub use vpn_control::{
     VpnRejectReason, decode_vpn_control_message, encode_vpn_control_message,
     select_vpn_wire_version,
 };
+#[cfg(feature = "fuzzing")]
+pub use vpn_data_path::fuzz_vpn_data_path;
+pub use vpn_data_path::{VpnDataPacket, VpnDataPathError, VpnDataPathHandle, VpnDataPathSnapshot};
 pub use vpn_data_policy::{
     VpnDataPolicyError, VpnDataPolicyMetricsSnapshot, validate_vpn_ip_packet_policy,
 };
@@ -115,8 +120,8 @@ pub use vpn_identity_config::{
     parse_vpn_identity_registry_json,
 };
 pub use vpn_quota::{
-    VPN_DEFAULT_GLOBAL_REASSEMBLY_BYTES, VPN_DEFAULT_GLOBAL_REASSEMBLY_RESERVATIONS,
-    VPN_MAX_GLOBAL_REASSEMBLY_BYTES, VPN_MAX_GLOBAL_REASSEMBLY_RESERVATIONS, VpnPacketDirection,
+    VPN_DEFAULT_GLOBAL_INFLIGHT_PACKETS, VPN_DEFAULT_GLOBAL_REASSEMBLY_BYTES,
+    VPN_MAX_GLOBAL_INFLIGHT_PACKETS, VPN_MAX_GLOBAL_REASSEMBLY_BYTES, VpnPacketDirection,
     VpnQuotaMetricsSnapshot, VpnQuotaRejection,
 };
 pub use vpn_session::{

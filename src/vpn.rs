@@ -9,6 +9,7 @@ use std::{
 pub const VPN_IP_DATAGRAM_MAGIC: &[u8; 4] = b"FWI1";
 pub const VPN_IP_DATAGRAM_HEADER_LEN: usize = 12;
 pub const VPN_MAX_IP_PACKET_LEN: usize = u16::MAX as usize;
+pub const VPN_MAX_IP_DATAGRAM_LEN: usize = VPN_IP_DATAGRAM_HEADER_LEN + VPN_MAX_IP_PACKET_LEN;
 pub const VPN_MAX_FRAGMENTS_PER_PACKET: usize = 64;
 pub const VPN_MIN_QUIC_DATAGRAM_LEN: usize =
     VPN_IP_DATAGRAM_HEADER_LEN + VPN_MAX_IP_PACKET_LEN.div_ceil(VPN_MAX_FRAGMENTS_PER_PACKET);
@@ -275,6 +276,76 @@ impl VpnReassembler {
 
     pub fn stats(&self) -> VpnReassemblyStats {
         self.stats
+    }
+
+    pub(crate) fn contains_packet(&self, packet_id: u32) -> bool {
+        self.packets.contains_key(&packet_id)
+    }
+
+    pub(crate) fn additional_buffered_bytes(
+        &self,
+        fragment: VpnFragment<'_>,
+    ) -> Result<usize, VpnPacketError> {
+        let Some(partial) = self.packets.get(&fragment.packet_id) else {
+            return Ok(fragment.payload.len());
+        };
+        if partial.total_len != fragment.total_len {
+            return Err(VpnPacketError::FragmentTotalChanged);
+        }
+
+        let fragment_end = fragment
+            .offset
+            .checked_add(fragment.payload.len())
+            .ok_or(VpnPacketError::FragmentBounds)?;
+        for (&existing_offset, existing_payload) in &partial.fragments {
+            let existing_end = existing_offset + existing_payload.len();
+            if existing_offset == fragment.offset && existing_payload.as_slice() == fragment.payload
+            {
+                return Ok(0);
+            }
+            if fragment.offset < existing_end && existing_offset < fragment_end {
+                return Err(VpnPacketError::FragmentOverlap);
+            }
+        }
+        if partial.fragments.len() >= VPN_MAX_FRAGMENTS_PER_PACKET {
+            return Err(VpnPacketError::FragmentLimitExceeded);
+        }
+        Ok(fragment.payload.len())
+    }
+
+    pub(crate) fn fragment_will_complete(&self, fragment: VpnFragment<'_>) -> bool {
+        let received_bytes = self
+            .packets
+            .get(&fragment.packet_id)
+            .map_or(0, |partial| partial.received_bytes);
+        received_bytes
+            .checked_add(fragment.payload.len())
+            .is_some_and(|received| received == fragment.total_len)
+    }
+
+    pub(crate) fn oldest_packet_updated_at(
+        &self,
+        excluded_packet_id: Option<u32>,
+    ) -> Option<(u32, Instant)> {
+        self.packets
+            .iter()
+            .filter(|(packet_id, _)| Some(**packet_id) != excluded_packet_id)
+            .min_by_key(|(_, partial)| partial.updated_at)
+            .map(|(&packet_id, partial)| (packet_id, partial.updated_at))
+    }
+
+    pub(crate) fn evict_packet(&mut self, packet_id: u32) -> bool {
+        if !self.packets.contains_key(&packet_id) {
+            return false;
+        }
+        self.remove_packet(packet_id);
+        self.stats.packets_evicted = self.stats.packets_evicted.saturating_add(1);
+        true
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.packets.clear();
+        self.buffered_bytes = 0;
     }
 
     pub fn expire(&mut self, now: Instant) -> usize {

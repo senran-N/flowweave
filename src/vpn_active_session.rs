@@ -4,7 +4,7 @@ use std::{
     fmt,
     path::Path,
     sync::{
-        Arc, Mutex, MutexGuard, Weak,
+        Arc, Mutex, MutexGuard,
         atomic::{AtomicU64, Ordering},
     },
     time::{Duration, Instant},
@@ -13,15 +13,17 @@ use std::{
 use noq::Connection;
 use tokio::time::timeout;
 
-use crate::vpn_quota::VpnQuotaBook;
 use crate::{
-    VPN_CLOSE_CONTROL_REJECTED, VPN_DEFAULT_GLOBAL_REASSEMBLY_BYTES,
-    VPN_DEFAULT_GLOBAL_REASSEMBLY_RESERVATIONS, VpnCertificateFingerprint, VpnDataPolicyError,
-    VpnDataPolicyMetricsSnapshot, VpnIdentityAuthorizationError, VpnIdentityConfigError,
-    VpnIdentityRegistry, VpnIdentityReloadReport, VpnIpPacketMeta, VpnNegotiatedSession,
-    VpnPacketDirection, VpnQuotaMetricsSnapshot, VpnQuotaRejection, VpnReject,
+    VPN_CLOSE_CONTROL_REJECTED, VPN_DEFAULT_GLOBAL_INFLIGHT_PACKETS,
+    VPN_DEFAULT_GLOBAL_REASSEMBLY_BYTES, VpnCertificateFingerprint, VpnDataPolicyMetricsSnapshot,
+    VpnIdentityAuthorizationError, VpnIdentityConfigError, VpnIdentityRegistry,
+    VpnIdentityReloadReport, VpnNegotiatedSession, VpnQuotaMetricsSnapshot, VpnReject,
     VpnServerControlOutcome, VpnServerNegotiationConfig, VpnSessionError, VpnSessionGeneration,
-    load_vpn_identity_registry, validate_vpn_ip_packet_policy, vpn_server_control_handshake,
+    load_vpn_identity_registry,
+    vpn_data_path::VpnDataPathHandle,
+    vpn_data_policy::VpnDataPolicyMetrics,
+    vpn_quota::{VpnGlobalReassemblyBudget, VpnIdentityRateLimiter, VpnQuotaMetrics},
+    vpn_server_control_handshake,
 };
 
 pub const VPN_CLOSE_SESSION_REPLACED: u32 = 0x100;
@@ -80,6 +82,32 @@ impl Error for VpnManagedSessionError {}
 pub struct VpnSessionCommitReport {
     pub session_generation: u64,
     pub replaced_generation: Option<u64>,
+}
+
+#[derive(Clone)]
+pub struct VpnCommittedSession {
+    report: VpnSessionCommitReport,
+    data_path: VpnDataPathHandle,
+}
+
+impl VpnCommittedSession {
+    pub const fn report(&self) -> VpnSessionCommitReport {
+        self.report
+    }
+
+    pub const fn data_path(&self) -> &VpnDataPathHandle {
+        &self.data_path
+    }
+}
+
+impl fmt::Debug for VpnCommittedSession {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("VpnCommittedSession")
+            .field("report", &self.report)
+            .field("data_path", &self.data_path)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -145,48 +173,13 @@ impl fmt::Debug for VpnActiveSessionSnapshot {
     }
 }
 
-pub struct VpnReassemblyReservation {
-    state: Weak<Mutex<CoordinatorState>>,
-    reservation_id: u64,
-    bytes: usize,
-}
-
-impl VpnReassemblyReservation {
-    pub const fn bytes(&self) -> usize {
-        self.bytes
-    }
-
-    pub fn release(self) {
-        drop(self);
-    }
-}
-
-impl fmt::Debug for VpnReassemblyReservation {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("VpnReassemblyReservation")
-            .field("bytes", &self.bytes)
-            .finish_non_exhaustive()
-    }
-}
-
-impl Drop for VpnReassemblyReservation {
-    fn drop(&mut self) {
-        let Some(state) = self.state.upgrade() else {
-            return;
-        };
-        state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .quotas
-            .release_reassembly(self.reservation_id);
-    }
-}
-
 #[derive(Clone)]
 pub struct VpnSessionCoordinator {
     state: Arc<Mutex<CoordinatorState>>,
     next_generation: Arc<AtomicU64>,
+    quota_metrics: VpnQuotaMetrics,
+    data_metrics: VpnDataPolicyMetrics,
+    global_budget: VpnGlobalReassemblyBudget,
 }
 
 impl VpnSessionCoordinator {
@@ -195,7 +188,7 @@ impl VpnSessionCoordinator {
             registry,
             1,
             VPN_DEFAULT_GLOBAL_REASSEMBLY_BYTES,
-            VPN_DEFAULT_GLOBAL_REASSEMBLY_RESERVATIONS,
+            VPN_DEFAULT_GLOBAL_INFLIGHT_PACKETS,
         )
         .expect("the fixed VPN coordinator limits are valid")
     }
@@ -208,7 +201,7 @@ impl VpnSessionCoordinator {
             registry,
             initial_generation,
             VPN_DEFAULT_GLOBAL_REASSEMBLY_BYTES,
-            VPN_DEFAULT_GLOBAL_REASSEMBLY_RESERVATIONS,
+            VPN_DEFAULT_GLOBAL_INFLIGHT_PACKETS,
         )
     }
 
@@ -216,22 +209,30 @@ impl VpnSessionCoordinator {
         registry: VpnIdentityRegistry,
         initial_generation: u64,
         global_reassembly_limit: usize,
-        global_reservation_limit: usize,
+        global_inflight_limit: usize,
     ) -> Result<Self, VpnManagedSessionError> {
         if initial_generation == 0 {
             return Err(VpnManagedSessionError::GenerationExhausted);
         }
-        let quotas = VpnQuotaBook::new(global_reassembly_limit, global_reservation_limit)
-            .ok_or(VpnManagedSessionError::InvalidResourceLimits)?;
+        let quota_metrics = VpnQuotaMetrics::default();
+        let data_metrics = VpnDataPolicyMetrics::default();
+        let global_budget = VpnGlobalReassemblyBudget::new(
+            global_reassembly_limit,
+            global_inflight_limit,
+            quota_metrics.clone(),
+        )
+        .ok_or(VpnManagedSessionError::InvalidResourceLimits)?;
         Ok(Self {
             state: Arc::new(Mutex::new(CoordinatorState {
                 registry: Arc::new(registry),
                 active: HashMap::new(),
                 metrics: VpnSessionCoordinatorMetrics::default(),
-                data_metrics: VpnDataPolicyMetricsSnapshot::default(),
-                quotas,
+                identity_quotas: HashMap::new(),
             })),
             next_generation: Arc::new(AtomicU64::new(initial_generation)),
+            quota_metrics,
+            data_metrics,
+            global_budget,
         })
     }
 
@@ -253,7 +254,7 @@ impl VpnSessionCoordinator {
         &self,
         session: VpnNegotiatedSession,
         connection: Connection,
-    ) -> Result<VpnSessionCommitReport, VpnSessionCommitError> {
+    ) -> Result<VpnCommittedSession, VpnSessionCommitError> {
         self.commit_with_handle_at(
             session,
             Arc::new(NoqConnectionHandle(connection)),
@@ -284,8 +285,11 @@ impl VpnSessionCoordinator {
         if !is_current {
             return false;
         }
-        state.active.remove(client_id);
-        state.quotas.deactivate(client_id, session_generation);
+        let active = state
+            .active
+            .remove(client_id)
+            .expect("current generation requires an active session");
+        active.data_path.deactivate();
         state.metrics.normal_releases = state.metrics.normal_releases.saturating_add(1);
         state.metrics.active_sessions = state.active.len();
         true
@@ -296,129 +300,11 @@ impl VpnSessionCoordinator {
     }
 
     pub fn quota_metrics_snapshot(&self) -> VpnQuotaMetricsSnapshot {
-        self.lock_state().quotas.metrics()
+        self.quota_metrics.snapshot()
     }
 
     pub fn data_policy_metrics_snapshot(&self) -> VpnDataPolicyMetricsSnapshot {
-        self.lock_state().data_metrics
-    }
-
-    pub fn authorize_ip_packet(
-        &self,
-        client_id: &str,
-        session_generation: u64,
-        direction: VpnPacketDirection,
-        packet: &[u8],
-        now: Instant,
-    ) -> Result<VpnIpPacketMeta, VpnDataPolicyError> {
-        let mut state = self.lock_state();
-        let is_current = state
-            .active
-            .get(client_id)
-            .is_some_and(|active| active.session.accept().session_generation == session_generation);
-        if !is_current {
-            state.quotas.record_stale_generation();
-            return Err(VpnDataPolicyError::StaleGeneration);
-        }
-        state
-            .quotas
-            .admit_packet(client_id, session_generation, direction, packet.len(), now)
-            .map_err(VpnDataPolicyError::Quota)?;
-        let result = validate_vpn_ip_packet_policy(
-            state
-                .active
-                .get(client_id)
-                .expect("current generation requires an active session")
-                .session
-                .identity(),
-            direction,
-            packet,
-        );
-        let bytes = u64::try_from(packet.len()).unwrap_or(u64::MAX);
-        match result {
-            Ok(_) => match direction {
-                VpnPacketDirection::Uplink => {
-                    state.data_metrics.forwarded_uplink_packets = state
-                        .data_metrics
-                        .forwarded_uplink_packets
-                        .saturating_add(1);
-                    state.data_metrics.forwarded_uplink_bytes = state
-                        .data_metrics
-                        .forwarded_uplink_bytes
-                        .saturating_add(bytes);
-                }
-                VpnPacketDirection::Downlink => {
-                    state.data_metrics.forwarded_downlink_packets = state
-                        .data_metrics
-                        .forwarded_downlink_packets
-                        .saturating_add(1);
-                    state.data_metrics.forwarded_downlink_bytes = state
-                        .data_metrics
-                        .forwarded_downlink_bytes
-                        .saturating_add(bytes);
-                }
-            },
-            Err(VpnDataPolicyError::Packet(_)) => {
-                state.data_metrics.malformed_packet_rejections = state
-                    .data_metrics
-                    .malformed_packet_rejections
-                    .saturating_add(1);
-            }
-            Err(VpnDataPolicyError::UplinkSourceSpoofed) => {
-                state.data_metrics.uplink_source_spoof_rejections = state
-                    .data_metrics
-                    .uplink_source_spoof_rejections
-                    .saturating_add(1);
-            }
-            Err(VpnDataPolicyError::DestinationPolicyRejected) => {
-                state.data_metrics.destination_policy_rejections = state
-                    .data_metrics
-                    .destination_policy_rejections
-                    .saturating_add(1);
-            }
-            Err(VpnDataPolicyError::DownlinkDestinationMismatch) => {
-                state.data_metrics.downlink_destination_rejections = state
-                    .data_metrics
-                    .downlink_destination_rejections
-                    .saturating_add(1);
-            }
-            Err(VpnDataPolicyError::StaleGeneration | VpnDataPolicyError::Quota(_)) => {}
-        }
-        result
-    }
-
-    pub fn admit_packet(
-        &self,
-        client_id: &str,
-        session_generation: u64,
-        direction: VpnPacketDirection,
-        packet_len: usize,
-        now: Instant,
-    ) -> Result<(), VpnQuotaRejection> {
-        self.lock_state().quotas.admit_packet(
-            client_id,
-            session_generation,
-            direction,
-            packet_len,
-            now,
-        )
-    }
-
-    pub fn reserve_reassembly(
-        &self,
-        client_id: &str,
-        session_generation: u64,
-        bytes: usize,
-    ) -> Result<VpnReassemblyReservation, VpnQuotaRejection> {
-        let reservation_id =
-            self.lock_state()
-                .quotas
-                .reserve_reassembly(client_id, session_generation, bytes)?;
-        Ok(VpnReassemblyReservation {
-            state: Arc::downgrade(&self.state),
-            reservation_id,
-            bytes,
-        })
+        self.data_metrics.snapshot()
     }
 
     pub fn reload_from_path(
@@ -469,6 +355,7 @@ impl VpnSessionCoordinator {
                         .active
                         .remove(&client_id)
                         .expect("reconcile decision references an active session");
+                    active.data_path.deactivate();
                     closed.push((active.connection, CloseReason::IdentityRevoked));
                     sessions.identity_revoked += 1;
                     state.metrics.identity_revocations =
@@ -479,6 +366,7 @@ impl VpnSessionCoordinator {
                         .active
                         .remove(&client_id)
                         .expect("reconcile decision references an active session");
+                    active.data_path.deactivate();
                     closed.push((active.connection, CloseReason::PolicyChanged));
                     sessions.policy_changed += 1;
                     state.metrics.policy_change_closes =
@@ -487,20 +375,18 @@ impl VpnSessionCoordinator {
             }
         }
         state.metrics.active_sessions = state.active.len();
-        let active_generations = state
-            .active
-            .iter()
-            .map(|(client_id, active)| {
-                (
-                    client_id.clone(),
-                    active.session.accept().session_generation,
-                )
-            })
-            .collect::<HashMap<_, _>>();
         let registry = state.registry.clone();
-        state
-            .quotas
-            .reconcile(&registry, &active_generations, Instant::now());
+        let now = Instant::now();
+        state.identity_quotas.retain(|client_id, limiter| {
+            let Some(identity) = registry
+                .identity_by_client_id(client_id)
+                .filter(|identity| identity.enabled())
+            else {
+                return false;
+            };
+            limiter.reconfigure(identity.limits(), now);
+            true
+        });
         drop(state);
         for (connection, reason) in closed {
             connection.close(reason.code(), reason.message());
@@ -524,10 +410,10 @@ impl VpnSessionCoordinator {
             .shutdown_closes
             .saturating_add(u64::try_from(active.len()).unwrap_or(u64::MAX));
         state.metrics.active_sessions = 0;
-        let registry = state.registry.clone();
-        state
-            .quotas
-            .reconcile(&registry, &HashMap::new(), Instant::now());
+        for session in &active {
+            session.data_path.deactivate();
+        }
+        state.identity_quotas.clear();
         drop(state);
         for session in &active {
             session
@@ -542,7 +428,7 @@ impl VpnSessionCoordinator {
         &self,
         session: VpnNegotiatedSession,
         connection: Arc<dyn VpnSessionConnection>,
-    ) -> Result<VpnSessionCommitReport, VpnSessionCommitError> {
+    ) -> Result<VpnCommittedSession, VpnSessionCommitError> {
         self.commit_with_handle_at(session, connection, Instant::now())
     }
 
@@ -551,18 +437,18 @@ impl VpnSessionCoordinator {
         session: VpnNegotiatedSession,
         connection: Arc<dyn VpnSessionConnection>,
         now: Instant,
-    ) -> Result<VpnSessionCommitReport, VpnSessionCommitError> {
+    ) -> Result<VpnCommittedSession, VpnSessionCommitError> {
         let client_id = session.identity().client_id().to_owned();
         let session_generation = session.accept().session_generation;
         let limits = session.identity().limits();
         let validation = {
             let mut state = self.lock_state();
-            let validation = match state.registry.authorize(session.fingerprint()) {
+            let identity = match state.registry.authorize(session.fingerprint()) {
                 Ok(identity)
                     if identity.client_id() == client_id
                         && session.identity().has_same_session_policy(identity) =>
                 {
-                    Ok(())
+                    Ok(identity.clone())
                 }
                 Ok(identity) if identity.client_id() == client_id => {
                     Err(VpnSessionCommitError::PolicyChanged)
@@ -573,43 +459,70 @@ impl VpnSessionCoordinator {
                     Err(VpnSessionCommitError::IdentityRevoked)
                 }
             };
-            if let Err(error) = validation {
-                state.metrics.commit_rejections = state.metrics.commit_rejections.saturating_add(1);
-                Err(error)
-            } else {
-                state
-                    .quotas
-                    .activate(&client_id, session_generation, limits, now);
-                let replaced = state.active.insert(
-                    client_id,
-                    ActiveVpnSession {
-                        session,
-                        connection: connection.clone(),
-                    },
-                );
-                state.metrics.total_committed = state.metrics.total_committed.saturating_add(1);
-                if replaced.is_some() {
-                    state.metrics.replacements = state.metrics.replacements.saturating_add(1);
+            match identity {
+                Err(error) => {
+                    state.metrics.commit_rejections =
+                        state.metrics.commit_rejections.saturating_add(1);
+                    Err(error)
                 }
-                state.metrics.active_sessions = state.active.len();
-                let report = VpnSessionCommitReport {
-                    session_generation,
-                    replaced_generation: replaced
-                        .as_ref()
-                        .map(|active| active.session.accept().session_generation),
-                };
-                Ok((report, replaced))
+                Ok(identity) => {
+                    let rate_limiter = state
+                        .identity_quotas
+                        .entry(client_id.clone())
+                        .or_insert_with(|| {
+                            Arc::new(VpnIdentityRateLimiter::new(
+                                limits,
+                                now,
+                                self.quota_metrics.clone(),
+                            ))
+                        })
+                        .clone();
+                    let data_path = VpnDataPathHandle::new_inactive(
+                        identity,
+                        session_generation,
+                        rate_limiter.clone(),
+                        self.global_budget.clone(),
+                        self.quota_metrics.clone(),
+                        self.data_metrics.clone(),
+                    )
+                    .expect("validated identity always has valid reassembly limits");
+                    let replaced = state.active.insert(
+                        client_id,
+                        ActiveVpnSession {
+                            session,
+                            connection: connection.clone(),
+                            data_path: data_path.clone(),
+                        },
+                    );
+                    if let Some(replaced) = &replaced {
+                        replaced.data_path.deactivate();
+                    }
+                    rate_limiter.reconfigure(limits, now);
+                    data_path.activate();
+                    state.metrics.total_committed = state.metrics.total_committed.saturating_add(1);
+                    if replaced.is_some() {
+                        state.metrics.replacements = state.metrics.replacements.saturating_add(1);
+                    }
+                    state.metrics.active_sessions = state.active.len();
+                    let report = VpnSessionCommitReport {
+                        session_generation,
+                        replaced_generation: replaced
+                            .as_ref()
+                            .map(|active| active.session.accept().session_generation),
+                    };
+                    Ok((VpnCommittedSession { report, data_path }, replaced))
+                }
             }
         };
 
         match validation {
-            Ok((report, replaced)) => {
+            Ok((committed, replaced)) => {
                 if let Some(replaced) = replaced {
                     replaced
                         .connection
                         .close(VPN_CLOSE_SESSION_REPLACED, SESSION_REPLACED_REASON);
                 }
-                Ok(report)
+                Ok(committed)
             }
             Err(error) => {
                 connection.close(VPN_CLOSE_COMMIT_REJECTED, COMMIT_REJECTED_REASON);
@@ -639,7 +552,7 @@ impl fmt::Debug for VpnSessionCoordinator {
 
 pub struct VpnManagedActiveSession {
     session: Box<VpnNegotiatedSession>,
-    commit: VpnSessionCommitReport,
+    commit: VpnCommittedSession,
 }
 
 impl VpnManagedActiveSession {
@@ -648,7 +561,11 @@ impl VpnManagedActiveSession {
     }
 
     pub const fn commit_report(&self) -> VpnSessionCommitReport {
-        self.commit
+        self.commit.report()
+    }
+
+    pub const fn data_path(&self) -> &VpnDataPathHandle {
+        self.commit.data_path()
     }
 }
 
@@ -702,13 +619,13 @@ struct CoordinatorState {
     registry: Arc<VpnIdentityRegistry>,
     active: HashMap<String, ActiveVpnSession>,
     metrics: VpnSessionCoordinatorMetrics,
-    data_metrics: VpnDataPolicyMetricsSnapshot,
-    quotas: VpnQuotaBook,
+    identity_quotas: HashMap<String, Arc<VpnIdentityRateLimiter>>,
 }
 
 struct ActiveVpnSession {
     session: VpnNegotiatedSession,
     connection: Arc<dyn VpnSessionConnection>,
+    data_path: VpnDataPathHandle,
 }
 
 impl ActiveVpnSession {
@@ -780,8 +697,9 @@ mod tests {
 
     use crate::{
         VPN_CAP_IPV4, VPN_CAP_IPV6, VPN_MAX_IP_PACKET_LEN, VPN_REQUIRED_CAPABILITIES,
-        VPN_WIRE_VERSION_V1, VpnHello, VpnIdentity, VpnIdentityLimits, VpnIpNetwork,
-        VpnServerNegotiationConfig, negotiate_vpn_hello,
+        VPN_WIRE_VERSION_V1, VpnDataPathError, VpnHello, VpnIdentity, VpnIdentityLimits,
+        VpnIpNetwork, VpnPacketDirection, VpnQuotaRejection, VpnServerNegotiationConfig,
+        encode_vpn_ip_fragments, negotiate_vpn_hello,
     };
 
     use super::*;
@@ -797,7 +715,8 @@ mod tests {
         assert_eq!(
             coordinator
                 .commit_with_handle(old_session, old_connection.clone())
-                .unwrap(),
+                .unwrap()
+                .report(),
             VpnSessionCommitReport {
                 session_generation: 1,
                 replaced_generation: None,
@@ -809,7 +728,8 @@ mod tests {
         assert_eq!(
             coordinator
                 .commit_with_handle(new_session, new_connection.clone())
-                .unwrap(),
+                .unwrap()
+                .report(),
             VpnSessionCommitReport {
                 session_generation: 2,
                 replaced_generation: Some(1),
@@ -922,17 +842,47 @@ mod tests {
         let original = registry(vec![fingerprint], true, "0.0.0.0/0");
         let coordinator = VpnSessionCoordinator::new(original.clone());
         let first = Arc::new(FakeConnection::new());
-        coordinator
+        let first_commit = coordinator
             .commit_with_handle(session(&original, fingerprint, 1), first.clone())
             .unwrap();
+        let partial = encode_vpn_ip_fragments(
+            1,
+            &ipv4_packet_len(1500, "10.77.0.2", "198.51.100.8", 0x33),
+            1200,
+        )
+        .unwrap()
+        .remove(0);
+        first_commit
+            .data_path()
+            .ingest_datagram(VpnPacketDirection::Uplink, &partial, Instant::now())
+            .unwrap();
+        assert!(
+            coordinator
+                .quota_metrics_snapshot()
+                .current_reassembly_bytes
+                > 0
+        );
         let report = coordinator.replace_registry(registry(vec![fingerprint], false, "0.0.0.0/0"));
         assert_eq!(report.sessions.identity_revoked, 1);
         assert_eq!(first.closes().len(), 1);
+        assert_eq!(
+            coordinator
+                .quota_metrics_snapshot()
+                .current_reassembly_bytes,
+            0
+        );
+        assert_eq!(
+            first_commit
+                .data_path()
+                .ingest_datagram(VpnPacketDirection::Uplink, &partial, Instant::now())
+                .unwrap_err(),
+            VpnDataPathError::StaleGeneration
+        );
 
         let enabled = registry(vec![fingerprint], true, "0.0.0.0/0");
         coordinator.replace_registry(enabled.clone());
         let second = Arc::new(FakeConnection::new());
-        coordinator
+        let second_commit = coordinator
             .commit_with_handle(session(&enabled, fingerprint, 2), second.clone())
             .unwrap();
         assert_eq!(coordinator.close_all(), 1);
@@ -941,6 +891,7 @@ mod tests {
             second.closes(),
             vec![(VPN_CLOSE_SERVER_SHUTDOWN, SERVER_SHUTDOWN_REASON.to_vec())]
         );
+        assert!(!second_commit.data_path().snapshot().active);
         assert_eq!(coordinator.metrics_snapshot().active_sessions, 0);
     }
 
@@ -971,22 +922,27 @@ mod tests {
             limits,
         );
         let coordinator = VpnSessionCoordinator::new(registry.clone());
-        coordinator
+        let old = coordinator
             .commit_with_handle_at(
                 session(&registry, old_fingerprint, 1),
                 Arc::new(FakeConnection::new()),
                 started,
             )
             .unwrap();
-        coordinator
-            .admit_packet("client-a", 1, VpnPacketDirection::Uplink, 1, started)
+        let datagram = encode_vpn_ip_fragments(1, &ipv4_packet("10.77.0.2", "198.51.100.8"), 1200)
+            .unwrap()
+            .remove(0);
+        old.data_path()
+            .ingest_datagram(VpnPacketDirection::Uplink, &datagram, started)
             .unwrap();
         assert_eq!(
-            coordinator.admit_packet("client-a", 1, VpnPacketDirection::Downlink, 1, started,),
-            Err(VpnQuotaRejection::PacketRateExceeded)
+            old.data_path()
+                .ingest_datagram(VpnPacketDirection::Downlink, &datagram, started)
+                .unwrap_err(),
+            VpnDataPathError::Quota(VpnQuotaRejection::PacketRateExceeded)
         );
 
-        coordinator
+        let current = coordinator
             .commit_with_handle_at(
                 session(&registry, new_fingerprint, 2),
                 Arc::new(FakeConnection::new()),
@@ -994,20 +950,26 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            coordinator.admit_packet("client-a", 1, VpnPacketDirection::Uplink, 1, started,),
-            Err(VpnQuotaRejection::StaleGeneration)
+            old.data_path()
+                .ingest_datagram(VpnPacketDirection::Uplink, &datagram, started)
+                .unwrap_err(),
+            VpnDataPathError::StaleGeneration
         );
         assert_eq!(
-            coordinator.admit_packet("client-a", 2, VpnPacketDirection::Uplink, 1, started,),
-            Err(VpnQuotaRejection::PacketRateExceeded)
+            current
+                .data_path()
+                .ingest_datagram(VpnPacketDirection::Uplink, &datagram, started)
+                .unwrap_err(),
+            VpnDataPathError::Quota(VpnQuotaRejection::PacketRateExceeded)
         );
 
         let refilled = started + Duration::from_secs(1);
-        coordinator
-            .admit_packet("client-a", 2, VpnPacketDirection::Uplink, 1, refilled)
+        current
+            .data_path()
+            .ingest_datagram(VpnPacketDirection::Uplink, &datagram, refilled)
             .unwrap();
         assert!(coordinator.release_if_current("client-a", 2));
-        coordinator
+        let reconnected = coordinator
             .commit_with_handle_at(
                 session(&registry, new_fingerprint, 3),
                 Arc::new(FakeConnection::new()),
@@ -1015,42 +977,46 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            coordinator.admit_packet("client-a", 3, VpnPacketDirection::Uplink, 1, refilled,),
-            Err(VpnQuotaRejection::PacketRateExceeded)
+            reconnected
+                .data_path()
+                .ingest_datagram(VpnPacketDirection::Uplink, &datagram, refilled)
+                .unwrap_err(),
+            VpnDataPathError::Quota(VpnQuotaRejection::PacketRateExceeded)
         );
         let metrics = coordinator.quota_metrics_snapshot();
-        assert_eq!(metrics.admitted_uplink_packets, 2);
+        assert_eq!(metrics.admitted_uplink_datagrams, 2);
         assert_eq!(metrics.packet_rate_rejections, 3);
         assert_eq!(metrics.stale_generation_rejections, 1);
     }
 
     #[test]
-    fn reassembly_reservation_survives_replacement_and_releases_on_drop() {
+    fn replacement_and_release_immediately_clear_old_reassembly() {
         let started = Instant::now();
         let fingerprint = fingerprint(1);
-        let limits = VpnIdentityLimits::new(1, 100, 100_000, 100_000).unwrap();
+        let limits = VpnIdentityLimits::new(1, 100, 1_000_000, 100_000).unwrap();
         let registry = registry_with_limits(vec![fingerprint], true, "0.0.0.0/0", limits);
         let coordinator =
             VpnSessionCoordinator::with_resource_limits(registry.clone(), 1, 80_000, 2).unwrap();
-        coordinator
+        let old = coordinator
             .commit_with_handle_at(
                 session(&registry, fingerprint, 1),
                 Arc::new(FakeConnection::new()),
                 started,
             )
             .unwrap();
-        let old_reservation = coordinator
-            .reserve_reassembly("client-a", 1, 60_000)
+        let large_packet = ipv4_packet_len(65_000, "10.77.0.2", "198.51.100.8", 0x44);
+        let first_fragment = encode_vpn_ip_fragments(1, &large_packet, 60_012).unwrap();
+        old.data_path()
+            .ingest_datagram(VpnPacketDirection::Uplink, &first_fragment[0], started)
             .unwrap();
-        assert_eq!(old_reservation.bytes(), 60_000);
         assert_eq!(
             coordinator
-                .reserve_reassembly("client-a", 1, 30_000)
-                .unwrap_err(),
-            VpnQuotaRejection::GlobalReassemblyLimit
+                .quota_metrics_snapshot()
+                .current_reassembly_bytes,
+            60_000
         );
 
-        coordinator
+        let current = coordinator
             .commit_with_handle_at(
                 session(&registry, fingerprint, 2),
                 Arc::new(FakeConnection::new()),
@@ -1059,19 +1025,22 @@ mod tests {
             .unwrap();
         assert_eq!(
             coordinator
-                .reserve_reassembly("client-a", 1, 1)
-                .unwrap_err(),
-            VpnQuotaRejection::StaleGeneration
+                .quota_metrics_snapshot()
+                .current_reassembly_bytes,
+            0
         );
         assert_eq!(
-            coordinator
-                .reserve_reassembly("client-a", 2, 30_000)
+            old.data_path()
+                .ingest_datagram(VpnPacketDirection::Uplink, &first_fragment[0], started)
                 .unwrap_err(),
-            VpnQuotaRejection::GlobalReassemblyLimit
+            VpnDataPathError::StaleGeneration
         );
-        old_reservation.release();
-        let current = coordinator
-            .reserve_reassembly("client-a", 2, 30_000)
+
+        let current_packet = ipv4_packet_len(40_000, "10.77.0.2", "198.51.100.8", 0x55);
+        let current_fragment = encode_vpn_ip_fragments(2, &current_packet, 30_012).unwrap();
+        current
+            .data_path()
+            .ingest_datagram(VpnPacketDirection::Uplink, &current_fragment[0], started)
             .unwrap();
         assert_eq!(
             coordinator
@@ -1079,10 +1048,10 @@ mod tests {
                 .current_reassembly_bytes,
             30_000
         );
-        drop(current);
+        assert!(coordinator.release_if_current("client-a", 2));
         let metrics = coordinator.quota_metrics_snapshot();
         assert_eq!(metrics.current_reassembly_bytes, 0);
-        assert_eq!(metrics.active_reassembly_reservations, 0);
+        assert_eq!(metrics.active_reassembly_packets, 0);
         assert_eq!(metrics.peak_reassembly_bytes, 60_000);
     }
 
@@ -1092,85 +1061,79 @@ mod tests {
         let fingerprint = fingerprint(1);
         let registry = registry(vec![fingerprint], true, "198.51.100.0/24");
         let coordinator = VpnSessionCoordinator::new(registry.clone());
-        coordinator
+        let committed = coordinator
             .commit_with_handle_at(
                 session(&registry, fingerprint, 1),
                 Arc::new(FakeConnection::new()),
                 started,
             )
             .unwrap();
+        let data_path = committed.data_path();
 
-        coordinator
-            .authorize_ip_packet(
-                "client-a",
-                1,
+        data_path
+            .ingest_datagram(
                 VpnPacketDirection::Uplink,
-                &ipv4_packet("10.77.0.2", "198.51.100.8"),
+                &single_datagram(1, &ipv4_packet("10.77.0.2", "198.51.100.8")),
                 started,
             )
             .unwrap();
         assert_eq!(
-            coordinator
-                .authorize_ip_packet(
-                    "client-a",
-                    1,
+            data_path
+                .ingest_datagram(
                     VpnPacketDirection::Uplink,
-                    &ipv4_packet("10.77.0.9", "198.51.100.8"),
+                    &single_datagram(2, &ipv4_packet("10.77.0.9", "198.51.100.8")),
                     started,
                 )
                 .unwrap_err(),
-            VpnDataPolicyError::UplinkSourceSpoofed
+            VpnDataPathError::Policy(crate::VpnDataPolicyError::UplinkSourceSpoofed)
         );
         assert_eq!(
-            coordinator
-                .authorize_ip_packet(
-                    "client-a",
-                    1,
+            data_path
+                .ingest_datagram(
                     VpnPacketDirection::Uplink,
-                    &ipv4_packet("10.77.0.2", "203.0.113.8"),
+                    &single_datagram(3, &ipv4_packet("10.77.0.2", "203.0.113.8")),
                     started,
                 )
                 .unwrap_err(),
-            VpnDataPolicyError::DestinationPolicyRejected
+            VpnDataPathError::Policy(crate::VpnDataPolicyError::DestinationPolicyRejected)
         );
-        coordinator
-            .authorize_ip_packet(
-                "client-a",
-                1,
+        data_path
+            .ingest_datagram(
                 VpnPacketDirection::Downlink,
-                &ipv4_packet("198.51.100.8", "10.77.0.2"),
+                &single_datagram(4, &ipv4_packet("198.51.100.8", "10.77.0.2")),
                 started,
             )
             .unwrap();
         assert_eq!(
-            coordinator
-                .authorize_ip_packet(
-                    "client-a",
-                    1,
+            data_path
+                .ingest_datagram(
                     VpnPacketDirection::Downlink,
-                    &ipv4_packet("198.51.100.8", "10.77.0.9"),
+                    &single_datagram(5, &ipv4_packet("198.51.100.8", "10.77.0.9")),
                     started,
                 )
                 .unwrap_err(),
-            VpnDataPolicyError::DownlinkDestinationMismatch
+            VpnDataPathError::Policy(crate::VpnDataPolicyError::DownlinkDestinationMismatch)
         );
         assert_eq!(
-            coordinator
-                .authorize_ip_packet("client-a", 1, VpnPacketDirection::Uplink, &[0x40], started,)
-                .unwrap_err(),
-            VpnDataPolicyError::Packet(crate::VpnPacketError::InvalidIpv4Header)
-        );
-        assert_eq!(
-            coordinator
-                .authorize_ip_packet(
-                    "client-a",
-                    2,
+            data_path
+                .ingest_datagram(
                     VpnPacketDirection::Uplink,
-                    &ipv4_packet("10.77.0.2", "198.51.100.8"),
+                    &raw_datagram(6, &[0x40]),
                     started,
                 )
                 .unwrap_err(),
-            VpnDataPolicyError::StaleGeneration
+            VpnDataPathError::Fragment(crate::VpnPacketError::InvalidIpv4Header)
+        );
+        assert!(coordinator.release_if_current("client-a", 1));
+        assert_eq!(
+            data_path
+                .ingest_datagram(
+                    VpnPacketDirection::Uplink,
+                    &single_datagram(7, &ipv4_packet("10.77.0.2", "198.51.100.8")),
+                    started,
+                )
+                .unwrap_err(),
+            VpnDataPathError::StaleGeneration
         );
 
         let data = coordinator.data_policy_metrics_snapshot();
@@ -1181,8 +1144,8 @@ mod tests {
         assert_eq!(data.downlink_destination_rejections, 1);
         assert_eq!(data.malformed_packet_rejections, 1);
         let quota = coordinator.quota_metrics_snapshot();
-        assert_eq!(quota.admitted_uplink_packets, 4);
-        assert_eq!(quota.admitted_downlink_packets, 2);
+        assert_eq!(quota.admitted_uplink_datagrams, 4);
+        assert_eq!(quota.admitted_downlink_datagrams, 2);
         assert_eq!(quota.stale_generation_rejections, 1);
     }
 
@@ -1193,20 +1156,26 @@ mod tests {
         let limits = VpnIdentityLimits::new(1, 10, 1_000_000, VPN_MAX_IP_PACKET_LEN).unwrap();
         let registry = registry_with_limits(vec![fingerprint], true, "0.0.0.0/0", limits);
         let coordinator = VpnSessionCoordinator::new(registry.clone());
-        coordinator
+        let committed = coordinator
             .commit_with_handle_at(
                 session(&registry, fingerprint, 1),
                 Arc::new(FakeConnection::new()),
                 started,
             )
             .unwrap();
+        let data_path = committed.data_path().clone();
+        let datagram = Arc::new(single_datagram(
+            1,
+            &ipv4_packet("10.77.0.2", "198.51.100.8"),
+        ));
 
         let workers = (0..32)
             .map(|_| {
-                let coordinator = coordinator.clone();
+                let data_path = data_path.clone();
+                let datagram = datagram.clone();
                 std::thread::spawn(move || {
-                    coordinator
-                        .admit_packet("client-a", 1, VpnPacketDirection::Uplink, 1, started)
+                    data_path
+                        .ingest_datagram(VpnPacketDirection::Uplink, &datagram, started)
                         .is_ok()
                 })
             })
@@ -1218,7 +1187,7 @@ mod tests {
             .count();
         assert_eq!(accepted, 10);
         let metrics = coordinator.quota_metrics_snapshot();
-        assert_eq!(metrics.admitted_uplink_packets, 10);
+        assert_eq!(metrics.admitted_uplink_datagrams, 10);
         assert_eq!(metrics.packet_rate_rejections, 22);
     }
 
@@ -1346,16 +1315,36 @@ mod tests {
     }
 
     fn ipv4_packet(source: &str, destination: &str) -> Vec<u8> {
+        ipv4_packet_len(20, source, destination, 0)
+    }
+
+    fn ipv4_packet_len(len: usize, source: &str, destination: &str, fill: u8) -> Vec<u8> {
         let source = source.parse::<Ipv4Addr>().unwrap().octets();
         let destination = destination.parse::<Ipv4Addr>().unwrap().octets();
-        let mut packet = vec![0_u8; 20];
+        let mut packet = vec![fill; len];
         packet[0] = 0x45;
-        packet[2..4].copy_from_slice(&20_u16.to_be_bytes());
+        packet[2..4].copy_from_slice(&(len as u16).to_be_bytes());
         packet[8] = 64;
         packet[9] = 17;
         packet[12..16].copy_from_slice(&source);
         packet[16..20].copy_from_slice(&destination);
         packet
+    }
+
+    fn single_datagram(packet_id: u32, packet: &[u8]) -> Vec<u8> {
+        encode_vpn_ip_fragments(packet_id, packet, 1200)
+            .unwrap()
+            .remove(0)
+    }
+
+    fn raw_datagram(packet_id: u32, payload: &[u8]) -> Vec<u8> {
+        let mut datagram = Vec::with_capacity(crate::VPN_IP_DATAGRAM_HEADER_LEN + payload.len());
+        datagram.extend_from_slice(crate::VPN_IP_DATAGRAM_MAGIC);
+        datagram.extend_from_slice(&packet_id.to_be_bytes());
+        datagram.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+        datagram.extend_from_slice(&0_u16.to_be_bytes());
+        datagram.extend_from_slice(payload);
+        datagram
     }
 
     fn write_private_identity_config(path: &Path, contents: &[u8]) {

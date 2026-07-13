@@ -9,12 +9,13 @@ use std::{
 use flowweave_lab::{
     VPN_MAX_IP_PACKET_LEN, VpnCertificateFingerprint, VpnIdentity, VpnIdentityLimits, VpnIpNetwork,
     VpnPacketDirection, VpnReassembler, VpnReassemblyLimits, decode_vpn_control_message,
-    decode_vpn_ip_fragment, inspect_vpn_ip_packet, parse_vpn_identity_registry_json,
-    validate_vpn_ip_packet_policy,
+    decode_vpn_ip_fragment, fuzz_vpn_data_path, inspect_vpn_ip_packet,
+    parse_vpn_identity_registry_json, validate_vpn_ip_packet_policy,
 };
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|input: &[u8]| {
+    fuzz_vpn_data_path(input);
     let limits = VpnReassemblyLimits {
         max_inflight_packets: 16,
         max_buffered_bytes: VPN_MAX_IP_PACKET_LEN * 4,

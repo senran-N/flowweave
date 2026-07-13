@@ -7,6 +7,9 @@ publish = false
 description = "FlowWeave experimental multipath QUIC transport and fixed-target TCP proxy"
 readme = "README.md"
 
+[features]
+fuzzing = []
+
 [dependencies]
 noq = { version = "=1.0.1", default-features = false, features = ["runtime-tokio", "rustls", "ring"] }
 noq-proto = { version = "=1.0.1", default-features = false }
