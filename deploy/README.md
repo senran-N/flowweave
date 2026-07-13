@@ -2,7 +2,16 @@
 
 当前入口只转发一个固定 TCP 目标：本地应用连接客户端 loopback TCP 端口，客户端通过标准 TLS 1.3 MPQUIC 连接服务端，服务端只允许配置中的唯一 `allowed_target`。它不是 TUN、SOCKS5、开放代理或 UDP 转发器。
 
-`vpn-identities.json.example` 只是未来 VPN 数据进程使用的严格身份文件样例，目前没有 systemd 单元或命令会读取它。不要因为该文件存在就修改宿主机 TUN、默认路由或 NAT；身份格式与剩余边界见 [VPN_IDENTITY.md](../VPN_IDENTITY.md) 和 [VPN_RESEARCH.md](../VPN_RESEARCH.md)。
+`vpn-server.json.example`、`vpn-client.json.example` 和 `vpn-identities.json.example` 已经是代码可严格校验的未来 VPN 配置合同，但目前没有 systemd 单元或产品命令会读取它们。仓库只在一次性隔离 network namespace 中验证了“封闭提权能力的非 root 进程附着已由管理身份准备好的 TUN”；尚未配置真实地址、默认路由、NAT 或 DNS。不要把这些样例当成可部署 VPN 入口；身份格式与剩余边界见 [VPN_IDENTITY.md](../VPN_IDENTITY.md) 和 [VPN_RESEARCH.md](../VPN_RESEARCH.md)。
+
+开发机可运行以下只读/隔离门控：
+
+```bash
+cargo test vpn_product_config -- --nocapture
+./scripts/run_vpn_tun_lab.sh
+```
+
+第二条命令需要 Linux 的 `unshare`、`ip`、`setpriv`、`jq` 以及当前用户的 `/etc/subuid`、`/etc/subgid` 映射。脚本会先证明已经离开主网络空间，临时创建 `fwvpn0`，验证 root、未设置 `NoNewPrivileges`、接口 down、MTU 不一致和不存在接口均被拒绝，再以无 capability 的设备 owner 完成附着；退出后整个网络空间消失。
 
 ## 1. 构建和安装
 

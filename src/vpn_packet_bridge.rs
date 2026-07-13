@@ -59,6 +59,8 @@ pub struct VpnPacketDevice {
 
 impl VpnPacketDevice {
     pub fn from_file(file: File) -> io::Result<Self> {
+        tokio::runtime::Handle::try_current()
+            .map_err(|_| io::Error::other("vpn packet device requires a Tokio runtime"))?;
         set_nonblocking(file.as_raw_fd())?;
         Ok(Self {
             io: Arc::new(AsyncFd::new(file)?),
@@ -548,6 +550,13 @@ mod tests {
             VpnPacketBridgeConfig::new(VPN_MAX_IP_PACKET_LEN + 1).unwrap_err(),
             VpnPacketBridgeConfigError::InvalidPacketLength
         );
+    }
+
+    #[test]
+    fn packet_device_without_tokio_runtime_returns_an_error_instead_of_panicking() {
+        let (device, _peer) = StdUnixDatagram::pair().unwrap();
+        let error = VpnPacketDevice::from_file(File::from(OwnedFd::from(device))).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Other);
     }
 
     #[tokio::test]

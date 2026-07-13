@@ -42,9 +42,12 @@ mod vpn_identity;
 mod vpn_identity_config;
 #[cfg(target_os = "linux")]
 mod vpn_packet_bridge;
+mod vpn_product_config;
 mod vpn_quota;
 mod vpn_session;
 mod vpn_tls;
+#[cfg(target_os = "linux")]
+mod vpn_tun;
 pub use b_ingress::{
     BIngressSmokeReport, run_b_ingress_observability_controller,
     run_b_ingress_observability_receiver, run_b_ingress_shaper_calibration,
@@ -141,6 +144,12 @@ pub use vpn_packet_bridge::{
     VpnPacketBridgeMetricsSnapshot, VpnPacketBridgeReport, VpnPacketBridgeStartError,
     VpnPacketBridgeStopReason, VpnPacketDevice, start_vpn_packet_bridge,
 };
+pub use vpn_product_config::{
+    VPN_PRODUCT_CONFIG_MAX_BYTES, VPN_PRODUCT_CONFIG_VERSION, VPN_PRODUCT_MAX_EXPLICIT_PATHS,
+    VPN_TUN_NAME_MAX_BYTES, VpnClientProductConfig, VpnProductConfigError, VpnServerProductConfig,
+    load_vpn_client_product_config, load_vpn_server_product_config,
+    parse_vpn_client_product_config_json, parse_vpn_server_product_config_json,
+};
 pub use vpn_quota::{
     VPN_DEFAULT_GLOBAL_INFLIGHT_PACKETS, VPN_DEFAULT_GLOBAL_REASSEMBLY_BYTES,
     VPN_MAX_GLOBAL_INFLIGHT_PACKETS, VPN_MAX_GLOBAL_REASSEMBLY_BYTES, VpnPacketDirection,
@@ -157,6 +166,8 @@ pub use vpn_tls::{
     vpn_certificate_fingerprint, vpn_certificate_sha256, vpn_peer_certificate_fingerprint,
     vpn_peer_certificate_sha256,
 };
+#[cfg(target_os = "linux")]
+pub use vpn_tun::{VpnAttachedTun, VpnTunAttachError, attach_existing_vpn_tun};
 
 pub type LabError = Box<dyn Error + Send + Sync + 'static>;
 pub type LabResult<T> = Result<T, LabError>;

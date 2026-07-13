@@ -1,0 +1,13 @@
+{
+  "config_version": 1,
+  "listen": "0.0.0.0:4433",
+  "certificate_der": "vpn-server.cert.der",
+  "private_key_der": "vpn-server.key.der",
+  "client_ca_der": "vpn-client-ca.cert.der",
+  "identity_file": "vpn-identities.json",
+  "tun_name": "fwvpn0",
+  "tun_mtu": 1500,
+  "max_datagram_len": 1200,
+  "global_reassembly_bytes": 67108864,
+  "global_inflight_packets": 8192
+}
