@@ -120,6 +120,9 @@ macro_rules! make_struct {
             /// Multipath extension
             pub(crate) initial_max_path_id: Option<PathId>,
 
+            /// Experimental FlowWeave data-level STREAM progress extension.
+            pub(crate) stream_progress: bool,
+
             /// Nat traversal draft
             pub max_remote_nat_traversal_addresses: Option<NonZeroU8>,
         }
@@ -147,6 +150,7 @@ macro_rules! make_struct {
                     write_order: None,
                     address_discovery_role: address_discovery::Role::default(),
                     initial_max_path_id: None,
+                    stream_progress: false,
                     max_remote_nat_traversal_addresses: None,
                 }
             }
@@ -197,6 +201,7 @@ impl TransportParameters {
             }),
             address_discovery_role: config.address_discovery_role,
             initial_max_path_id: config.get_initial_max_path_id(),
+            stream_progress: config.cross_path_stream_progress,
             max_remote_nat_traversal_addresses: config.max_remote_nat_traversal_addresses,
             ..Self::default()
         }
@@ -215,6 +220,7 @@ impl TransportParameters {
             || cached.max_datagram_frame_size > self.max_datagram_frame_size
             || cached.grease_quic_bit && !self.grease_quic_bit
             || cached.address_discovery_role != self.address_discovery_role
+            || cached.stream_progress && !self.stream_progress
             || cached.max_remote_nat_traversal_addresses != self.max_remote_nat_traversal_addresses
         {
             return Err(TransportError::PROTOCOL_VIOLATION(
@@ -416,6 +422,12 @@ impl TransportParameters {
                         w.write(val);
                     }
                 }
+                TransportParameterId::StreamProgress => {
+                    if self.stream_progress {
+                        w.write_var(id as u64);
+                        w.write_var(0);
+                    }
+                }
                 TransportParameterId::N0NatTraversal => {
                     if let Some(val) = self.max_remote_nat_traversal_addresses {
                         w.write_var(id as u64);
@@ -546,6 +558,10 @@ impl TransportParameters {
 
                     params.initial_max_path_id = Some(value);
                 }
+                TransportParameterId::StreamProgress => match len {
+                    0 if !params.stream_progress => params.stream_progress = true,
+                    _ => return Err(Error::Malformed),
+                },
                 TransportParameterId::N0NatTraversal => {
                     if params.max_remote_nat_traversal_addresses.is_some() {
                         return Err(Error::Malformed);
@@ -728,6 +744,9 @@ pub(crate) enum TransportParameterId {
     // https://datatracker.ietf.org/doc/html/draft-ietf-quic-multipath
     InitialMaxPathId = 0x3e,
 
+    // Experimental FlowWeave data-level acknowledgment capability.
+    StreamProgress = 0x3f50,
+
     // inspired by https://www.ietf.org/archive/id/draft-seemann-quic-nat-traversal-02.html,
     // simplified to n0's own protocol.
     N0NatTraversal = 0x3d7f91120401,
@@ -735,7 +754,7 @@ pub(crate) enum TransportParameterId {
 
 impl TransportParameterId {
     /// Array with all supported transport parameter IDs
-    const SUPPORTED: [Self; 24] = [
+    const SUPPORTED: [Self; 25] = [
         Self::MaxIdleTimeout,
         Self::MaxUdpPayloadSize,
         Self::InitialMaxData,
@@ -759,6 +778,7 @@ impl TransportParameterId {
         Self::MinAckDelayDraft07,
         Self::ObservedAddr,
         Self::InitialMaxPathId,
+        Self::StreamProgress,
         Self::N0NatTraversal,
     ];
 }
@@ -801,6 +821,7 @@ impl TryFrom<u64> for TransportParameterId {
             id if Self::MinAckDelayDraft07 == id => Self::MinAckDelayDraft07,
             id if Self::ObservedAddr == id => Self::ObservedAddr,
             id if Self::InitialMaxPathId == id => Self::InitialMaxPathId,
+            id if Self::StreamProgress == id => Self::StreamProgress,
             id if Self::N0NatTraversal == id => Self::N0NatTraversal,
             _ => return Err(()),
         };
@@ -842,6 +863,7 @@ mod test {
             min_ack_delay: Some(2_000u32.into()),
             address_discovery_role: address_discovery::Role::send_only(),
             initial_max_path_id: Some(PathId::MAX),
+            stream_progress: true,
             max_remote_nat_traversal_addresses: Some(5u8.try_into().unwrap()),
             ..TransportParameters::default()
         };

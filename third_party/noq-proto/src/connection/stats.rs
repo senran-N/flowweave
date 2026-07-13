@@ -4,6 +4,7 @@ use rustc_hash::FxHashMap;
 
 use crate::Duration;
 use crate::FrameType;
+use crate::Instant;
 use crate::StreamId;
 
 use super::PathId;
@@ -69,6 +70,7 @@ pub struct FrameStats {
     pub retire_connection_id: u64,
     pub path_retire_connection_id: u64,
     pub stream_data_blocked: u64,
+    pub stream_progress: u64,
     pub streams_blocked_bidi: u64,
     pub streams_blocked_uni: u64,
     pub stop_sending: u64,
@@ -111,6 +113,7 @@ impl FrameStats {
             DataBlocked => inc!(data_blocked),
             Stream(_) => inc!(stream),
             StreamDataBlocked => inc!(stream_data_blocked),
+            StreamProgress => inc!(stream_progress),
             StreamsBlockedUni => inc!(streams_blocked_uni),
             StreamsBlockedBidi => inc!(streams_blocked_bidi),
             NewConnectionId => inc!(new_connection_id),
@@ -167,6 +170,7 @@ impl std::fmt::Debug for FrameStats {
             retire_connection_id,
             path_retire_connection_id,
             stream_data_blocked,
+            stream_progress,
             streams_blocked_bidi,
             streams_blocked_uni,
             stop_sending,
@@ -218,6 +222,7 @@ impl std::fmt::Debug for FrameStats {
             .field("RESET_STREAM", reset_stream)
             .field("RETIRE_CONNECTION_ID", retire_connection_id)
             .field("STREAM_DATA_BLOCKED", stream_data_blocked)
+            .field("STREAM_PROGRESS", stream_progress)
             .field("STREAMS_BLOCKED_BIDI", streams_blocked_bidi)
             .field("STREAMS_BLOCKED_UNI", streams_blocked_uni)
             .field("STOP_SENDING", stop_sending)
@@ -240,6 +245,8 @@ pub struct PathStats {
     pub rtt: Duration,
     /// Current probe timeout for application data on this path.
     pub pto: Duration,
+    /// Most recent authenticated packet time for this path generation.
+    pub last_authenticated_at: Option<Instant>,
     /// Statistics about datagrams and bytes sent on this path.
     pub udp_tx: UdpStats,
     /// Statistics about datagrams and bytes received on this path.
@@ -252,6 +259,26 @@ pub struct PathStats {
     pub cwnd: u64,
     /// Bytes currently counted as in flight by this path's congestion controller.
     pub bytes_in_flight: u64,
+    /// Complete 250 ms cohorts fixed by the application-declared measurement epoch.
+    pub declared_epoch_cohorts: u64,
+    /// Declared cohorts whose fixed ACK drain has elapsed.
+    pub declared_epoch_settled_cohorts: u64,
+    /// Declared cohorts with no first-transmitted STREAM bytes on this path.
+    pub declared_epoch_empty_cohorts: u64,
+    /// First-transmitted STREAM bytes originating in the declared epoch on this path.
+    pub declared_epoch_fresh_bytes: u64,
+    /// Origin bytes globally first acknowledged before their fixed drain deadline.
+    pub declared_epoch_acked_bytes: u64,
+    /// Origin bytes globally first acknowledged after their fixed drain deadline.
+    pub declared_epoch_late_acked_bytes: u64,
+    /// Origin bytes still unacknowledged when their fixed drain deadline elapsed.
+    pub declared_epoch_bytes_missing_at_drain: u64,
+    /// Declared cohorts whose fixed drain has not elapsed yet.
+    pub declared_epoch_pending_cohorts: u64,
+    /// Origin bytes still awaiting their fixed drain deadline.
+    pub declared_epoch_pending_origin_bytes: u64,
+    /// Origin bytes retained for either timely or bounded late-ACK attribution.
+    pub declared_epoch_tracked_origin_bytes: u64,
     /// Ack-eliciting packets currently counted as in flight on this path.
     pub ack_eliciting_packets_in_flight: u64,
     /// Packets still retained in this path's application-data sent-packet table.
@@ -330,6 +357,18 @@ pub struct PathStats {
     pub ack_progress_feedback_probes: u64,
     /// STREAM payload bytes newly queued by bounded feedback probes.
     pub ack_progress_feedback_probe_bytes: u64,
+    /// Number of negotiated STREAM_PROGRESS updates received on this path.
+    pub stream_progress_updates: u64,
+    /// STREAM bytes newly retired by negotiated data-level progress updates.
+    pub stream_progress_acked_bytes: u64,
+    /// Number of stale blocked-credit signals which promoted their validated arrival path and
+    /// requeued a newer monotonic flow-control value.
+    pub blocked_credit_handoffs: u64,
+    /// Number of newer MAX_DATA values requeued in response to stale DATA_BLOCKED frames.
+    pub blocked_credit_max_data_requeues: u64,
+    /// Number of newer MAX_STREAM_DATA values requeued in response to stale STREAM_DATA_BLOCKED
+    /// frames.
+    pub blocked_credit_max_stream_data_requeues: u64,
     /// Number of one-datagram STREAM gap rescues armed while the sole usable path was
     /// congestion-window blocked.
     pub stream_gap_rescue_probes: u64,
@@ -337,6 +376,27 @@ pub struct PathStats {
     pub stream_gap_rescue_bytes: u64,
     /// Whether the independent ACK-progress recovery timer is currently armed.
     pub ack_progress_recovery_timer_armed: bool,
+    /// Current application-level STREAM obligation watched on this path.
+    pub ack_progress_stream_obligation: Option<(StreamId, u64)>,
+    /// Original send time from which the current obligation's age is measured.
+    pub ack_progress_start: Option<Instant>,
+    /// Current ACK-progress timer deadline, including a staged full-recovery fallback.
+    pub ack_progress_recovery_deadline: Option<Instant>,
+    /// Complete-recovery trigger after applying the optional service target.
+    pub ack_progress_full_recovery_deadline: Option<Instant>,
+    /// Configured application-level recovery service target, when enabled.
+    pub ack_progress_service_deadline: Option<Duration>,
+    /// Time reserved for alternative-path recovery after the complete-recovery trigger.
+    pub ack_progress_alternative_recovery_budget: Option<Duration>,
+    /// Whether a bounded feedback probe has run and the timer now represents its fixed complete
+    /// recovery fallback.
+    pub ack_progress_feedback_probe_staged: bool,
+    /// STREAM frame metadata entries currently retained on this path generation.
+    pub ack_progress_stream_frames_in_flight: u64,
+    /// Whether another validated path is currently eligible to carry recovery data.
+    pub ack_progress_has_cross_path_alternative: bool,
+    /// Whether ordinary PTO recovery has already marked this path as suspected.
+    pub ack_progress_pto_recovery_probe_active: bool,
     /// Largest UDP payload size the path currently supports.
     pub current_mtu: u16,
 }
@@ -441,12 +501,23 @@ impl std::ops::Add<PathStats> for ConnectionStats {
         let PathStats {
             rtt: _,
             pto: _,
+            last_authenticated_at: _,
             udp_tx,
             udp_rx,
             frame_tx,
             frame_rx,
             cwnd: _,
             bytes_in_flight: _,
+            declared_epoch_cohorts: _,
+            declared_epoch_settled_cohorts: _,
+            declared_epoch_empty_cohorts: _,
+            declared_epoch_fresh_bytes: _,
+            declared_epoch_acked_bytes: _,
+            declared_epoch_late_acked_bytes: _,
+            declared_epoch_bytes_missing_at_drain: _,
+            declared_epoch_pending_cohorts: _,
+            declared_epoch_pending_origin_bytes: _,
+            declared_epoch_tracked_origin_bytes: _,
             ack_eliciting_packets_in_flight: _,
             tracked_sent_packets: _,
             tracked_ack_eliciting_packets: _,
@@ -482,9 +553,24 @@ impl std::ops::Add<PathStats> for ConnectionStats {
             ack_progress_feedback_probe_timeouts: _,
             ack_progress_feedback_probes: _,
             ack_progress_feedback_probe_bytes: _,
+            stream_progress_updates: _,
+            stream_progress_acked_bytes: _,
+            blocked_credit_handoffs: _,
+            blocked_credit_max_data_requeues: _,
+            blocked_credit_max_stream_data_requeues: _,
             stream_gap_rescue_probes: _,
             stream_gap_rescue_bytes: _,
             ack_progress_recovery_timer_armed: _,
+            ack_progress_stream_obligation: _,
+            ack_progress_start: _,
+            ack_progress_recovery_deadline: _,
+            ack_progress_full_recovery_deadline: _,
+            ack_progress_service_deadline: _,
+            ack_progress_alternative_recovery_budget: _,
+            ack_progress_feedback_probe_staged: _,
+            ack_progress_stream_frames_in_flight: _,
+            ack_progress_has_cross_path_alternative: _,
+            ack_progress_pto_recovery_probe_active: _,
             current_mtu: _,
         } = rhs;
         Self {
@@ -507,12 +593,23 @@ impl std::ops::AddAssign<PathStats> for ConnectionStats {
         let PathStats {
             rtt: _,
             pto: _,
+            last_authenticated_at: _,
             udp_tx: path_udp_tx,
             udp_rx: path_udp_rx,
             frame_tx: path_frame_tx,
             frame_rx: path_frame_rx,
             cwnd: _,
             bytes_in_flight: _,
+            declared_epoch_cohorts: _,
+            declared_epoch_settled_cohorts: _,
+            declared_epoch_empty_cohorts: _,
+            declared_epoch_fresh_bytes: _,
+            declared_epoch_acked_bytes: _,
+            declared_epoch_late_acked_bytes: _,
+            declared_epoch_bytes_missing_at_drain: _,
+            declared_epoch_pending_cohorts: _,
+            declared_epoch_pending_origin_bytes: _,
+            declared_epoch_tracked_origin_bytes: _,
             ack_eliciting_packets_in_flight: _,
             tracked_sent_packets: _,
             tracked_ack_eliciting_packets: _,
@@ -548,9 +645,24 @@ impl std::ops::AddAssign<PathStats> for ConnectionStats {
             ack_progress_feedback_probe_timeouts: _,
             ack_progress_feedback_probes: _,
             ack_progress_feedback_probe_bytes: _,
+            stream_progress_updates: _,
+            stream_progress_acked_bytes: _,
+            blocked_credit_handoffs: _,
+            blocked_credit_max_data_requeues: _,
+            blocked_credit_max_stream_data_requeues: _,
             stream_gap_rescue_probes: _,
             stream_gap_rescue_bytes: _,
             ack_progress_recovery_timer_armed: _,
+            ack_progress_stream_obligation: _,
+            ack_progress_start: _,
+            ack_progress_recovery_deadline: _,
+            ack_progress_full_recovery_deadline: _,
+            ack_progress_service_deadline: _,
+            ack_progress_alternative_recovery_budget: _,
+            ack_progress_feedback_probe_staged: _,
+            ack_progress_stream_frames_in_flight: _,
+            ack_progress_has_cross_path_alternative: _,
+            ack_progress_pto_recovery_probe_active: _,
             current_mtu: _,
         } = rhs;
         let Self {

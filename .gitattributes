@@ -1,0 +1,4 @@
+# Vendored release archives are kept byte-for-byte except for the documented patch set.
+# Do not rewrite upstream whitespace merely to satisfy the root repository style check.
+third_party/noq/** -whitespace
+third_party/noq-proto/** -whitespace

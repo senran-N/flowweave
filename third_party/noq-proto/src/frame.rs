@@ -70,6 +70,8 @@ pub enum FrameType {
     DataBlocked,
     #[assoc(to_u64 = 0x15)]
     StreamDataBlocked,
+    #[assoc(to_u64 = 0x3f51)]
+    StreamProgress,
     #[assoc(to_u64 = 0x16)]
     StreamsBlockedBidi,
     #[assoc(to_u64 = 0x17)]
@@ -215,6 +217,9 @@ pub(super) enum EncodableFrame<'a> {
     StreamMeta(StreamMetaEncoder),
     MaxData(MaxData),
     MaxStreamData(MaxStreamData),
+    DataBlocked(DataBlocked),
+    StreamDataBlocked(StreamDataBlocked),
+    StreamProgress(StreamProgress),
     MaxStreams(MaxStreams),
     StreamsBlocked(StreamsBlocked),
 }
@@ -250,6 +255,9 @@ impl<'a> EncodableFrame<'a> {
             | EncodableFrame::StreamMeta(_)
             | EncodableFrame::MaxData(_)
             | EncodableFrame::MaxStreamData(_)
+            | EncodableFrame::DataBlocked(_)
+            | EncodableFrame::StreamDataBlocked(_)
+            | EncodableFrame::StreamProgress(_)
             | EncodableFrame::MaxStreams(_)
             | EncodableFrame::StreamsBlocked(_) => true,
         }
@@ -441,6 +449,7 @@ pub(crate) enum Frame {
     MaxStreams(MaxStreams),
     DataBlocked(DataBlocked),
     StreamDataBlocked(StreamDataBlocked),
+    StreamProgress(StreamProgress),
     StreamsBlocked(StreamsBlocked),
     NewConnectionId(NewConnectionId),
     RetireConnectionId(RetireConnectionId),
@@ -479,6 +488,7 @@ impl Frame {
             Ping => FrameType::Ping,
             DataBlocked(_) => FrameType::DataBlocked,
             StreamDataBlocked(sdb) => sdb.get_type(),
+            StreamProgress(progress) => progress.get_type(),
             StreamsBlocked(sb) => sb.get_type(),
             StopSending { .. } => FrameType::StopSending,
             RetireConnectionId(retire_frame) => retire_frame.get_type(),
@@ -531,7 +541,7 @@ impl Frame {
         // > If an endpoint receives a multipath-specific frame in a different packet type, it MUST close the
         // > connection with an error of type PROTOCOL_VIOLATION.
 
-        self.is_multipath_frame() || self.is_qad_frame()
+        self.is_multipath_frame() || self.is_qad_frame() || matches!(self, Self::StreamProgress(_))
     }
 
     fn is_qad_frame(&self) -> bool {
@@ -617,6 +627,12 @@ impl Encodable for PathResponse {
 #[display("DATA_BLOCKED offset: {_0}")]
 pub(crate) struct DataBlocked(#[cfg_attr(test, strategy(varint_u64()))] pub(crate) u64);
 
+impl DataBlocked {
+    const fn get_type(&self) -> FrameType {
+        FrameType::DataBlocked
+    }
+}
+
 impl Encodable for DataBlocked {
     fn encode<B: BufMut>(&self, buf: &mut B) {
         buf.write(FrameType::DataBlocked);
@@ -642,6 +658,33 @@ impl StreamDataBlocked {
 impl Encodable for StreamDataBlocked {
     fn encode<B: BufMut>(&self, buf: &mut B) {
         buf.write(FrameType::StreamDataBlocked);
+        buf.write(self.id);
+        buf.write_var(self.offset);
+    }
+}
+
+#[derive(Debug, Clone, Copy, derive_more::Display)]
+#[cfg_attr(test, derive(Arbitrary, PartialEq, Eq))]
+#[display("STREAM_PROGRESS id: {id} offset: {offset}")]
+pub(crate) struct StreamProgress {
+    pub(crate) id: StreamId,
+    #[cfg_attr(test, strategy(varint_u64()))]
+    pub(crate) offset: u64,
+}
+
+impl StreamProgress {
+    const fn get_type(&self) -> FrameType {
+        FrameType::StreamProgress
+    }
+}
+
+impl FrameStruct for StreamProgress {
+    const SIZE_BOUND: usize = FrameType::StreamProgress.size() + VarInt::MAX.size() * 2;
+}
+
+impl Encodable for StreamProgress {
+    fn encode<B: BufMut>(&self, buf: &mut B) {
+        buf.write(FrameType::StreamProgress);
         buf.write(self.id);
         buf.write_var(self.offset);
     }
@@ -1561,6 +1604,10 @@ impl Iter {
             FrameType::Ping => Frame::Ping,
             FrameType::DataBlocked => Frame::DataBlocked(DataBlocked(self.bytes.get_var()?)),
             FrameType::StreamDataBlocked => Frame::StreamDataBlocked(StreamDataBlocked {
+                id: self.bytes.get()?,
+                offset: self.bytes.get_var()?,
+            }),
+            FrameType::StreamProgress => Frame::StreamProgress(StreamProgress {
                 id: self.bytes.get()?,
                 offset: self.bytes.get_var()?,
             }),
@@ -2519,7 +2566,7 @@ impl<T: Display> Display for DisplayOption<T> {
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::coding::Encodable;
+    use crate::{Side, coding::Encodable};
     use assert_matches::assert_matches;
 
     #[test]
@@ -2655,6 +2702,22 @@ mod test {
         let frames = frames(buf);
         assert_eq!(frames.len(), 1);
         assert_matches!(&frames[0], Frame::ImmediateAck);
+    }
+
+    #[test]
+    fn stream_progress_coding() {
+        let original = StreamProgress {
+            id: StreamId::new(Side::Server, Dir::Bi, 17),
+            offset: 1_048_593,
+        };
+        let mut buf = Vec::new();
+        original.encode(&mut buf);
+        let frames = frames(buf);
+        assert_eq!(frames.len(), 1);
+        match frames[0] {
+            Frame::StreamProgress(decoded) => assert_eq!(decoded, original),
+            ref frame => panic!("incorrect frame {frame:?}"),
+        }
     }
 
     /// Test that encoding and decoding [`ObservedAddr`] produces the same result.

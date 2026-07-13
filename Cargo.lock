@@ -227,6 +227,7 @@ dependencies = [
  "noq",
  "noq-proto",
  "rcgen",
+ "subtle",
  "tokio",
 ]
 
@@ -391,8 +392,6 @@ dependencies = [
 [[package]]
 name = "noq"
 version = "1.0.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4bf95190af1bd4a00a10e8255ca0c8ddd9e9a9f5e79151d7a7eb6d56aff5dc89"
 dependencies = [
  "bytes",
  "cfg_aliases",
@@ -769,6 +768,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "89e49afdadebb872d3145a5638b59eb0691ea23e46ca484037cfab3b76b95038"
 dependencies = [
  "backtrace",
+ "bytes",
  "io-uring",
  "libc",
  "mio",

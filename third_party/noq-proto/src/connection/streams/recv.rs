@@ -16,6 +16,7 @@ pub(super) struct Recv {
     state: RecvState,
     pub(super) assembler: Assembler,
     sent_max_stream_data: u64,
+    reported_progress: u64,
     pub(super) end: u64,
     pub(super) stopped: bool,
 }
@@ -26,6 +27,7 @@ impl Recv {
             state: RecvState::default(),
             assembler: Assembler::new(),
             sent_max_stream_data: initial_max_data,
+            reported_progress: 0,
             end: 0,
             stopped: false,
         })
@@ -36,6 +38,7 @@ impl Recv {
         self.state = RecvState::default();
         self.assembler.reinit();
         self.sent_max_stream_data = initial_max_data;
+        self.reported_progress = 0;
         self.end = 0;
         self.stopped = false;
     }
@@ -258,6 +261,8 @@ pub struct Chunks<'a> {
     pending: &'a mut Retransmits,
     state: ChunksState,
     read: u64,
+    progress_offset: u64,
+    reported_progress: u64,
 }
 
 impl<'a> Chunks<'a> {
@@ -279,6 +284,8 @@ impl<'a> Chunks<'a> {
             };
 
         recv.assembler.ensure_ordering(ordered)?;
+        let progress_offset = recv.assembler.bytes_read();
+        let reported_progress = recv.reported_progress;
         Ok(Self {
             id,
             ordered,
@@ -286,6 +293,8 @@ impl<'a> Chunks<'a> {
             pending,
             state: ChunksState::Readable(recv),
             read: 0,
+            progress_offset,
+            reported_progress,
         })
     }
 
@@ -306,6 +315,9 @@ impl<'a> Chunks<'a> {
 
         if let Some(chunk) = rs.assembler.read(max_length, self.ordered) {
             self.read += chunk.bytes.len() as u64;
+            if self.ordered {
+                self.progress_offset = chunk.offset + chunk.bytes.len() as u64;
+            }
             return Ok(Some(chunk));
         }
 
@@ -365,10 +377,24 @@ impl<'a> Chunks<'a> {
         // We issue additional stream ID credit after the application is notified that a previously
         // open stream has finished or been reset and we've therefore disposed of its state, as
         // recorded by `stream_freed` calls in `next`.
+        let queue_progress = self.ordered
+            && self.streams.stream_progress_enabled
+            && self.progress_offset > self.reported_progress;
+        if queue_progress {
+            self.pending
+                .stream_progress
+                .entry(self.id)
+                .and_modify(|offset| *offset = (*offset).max(self.progress_offset))
+                .or_insert(self.progress_offset);
+            self.reported_progress = self.progress_offset;
+        }
+
         let mut should_transmit = self.streams.queue_max_stream_id(self.pending);
+        should_transmit |= queue_progress;
 
         // If the stream hasn't finished, we may need to issue stream-level flow control credit
         if let ChunksState::Readable(mut rs) = state {
+            rs.reported_progress = rs.reported_progress.max(self.reported_progress);
             let (_, max_stream_data) = rs.max_stream_data(self.streams.stream_receive_window);
             should_transmit |= max_stream_data.0;
             if max_stream_data.0 {

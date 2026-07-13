@@ -38,6 +38,7 @@ fn encode_frame<B: BufMut>(frame: &Frame, buf: &mut B) {
         Frame::MaxStreams(ms) => ms.encode(buf),
         Frame::DataBlocked(db) => db.encode(buf),
         Frame::StreamDataBlocked(sdb) => sdb.encode(buf),
+        Frame::StreamProgress(progress) => progress.encode(buf),
         Frame::StreamsBlocked(sb) => sb.encode(buf),
         Frame::NewConnectionId(nc) => nc.encode(buf),
         Frame::RetireConnectionId(rci) => rci.encode(buf),

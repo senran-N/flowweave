@@ -372,6 +372,133 @@ fn finish_stream_simple() {
 }
 
 #[test]
+fn stream_progress_requires_bilateral_negotiation() {
+    let _guard = subscribe();
+
+    for (client_enabled, server_enabled) in [(true, false), (false, true), (false, false)] {
+        let mut builder = ConnPair::builder();
+        builder
+            .client_transport_cfg
+            .cross_path_stream_progress(client_enabled);
+        builder
+            .server_transport_cfg
+            .cross_path_stream_progress(server_enabled);
+        let mut pair = builder.connect();
+
+        let stream = pair.streams(Client).open(Dir::Uni).unwrap();
+        pair.send_stream(Client, stream)
+            .write(b"unilateral negotiation must stay silent")
+            .unwrap();
+        pair.drive_client();
+        pair.drive_server();
+
+        assert_matches!(
+            pair.poll(Server),
+            Some(Event::Stream(StreamEvent::Opened { dir: Dir::Uni }))
+        );
+        assert_eq!(pair.streams(Server).accept(Dir::Uni), Some(stream));
+        let mut recv = pair.recv_stream(Server, stream);
+        let mut chunks = recv.read(true).unwrap();
+        assert!(chunks.next(usize::MAX).unwrap().is_some());
+        let _ = chunks.finalize();
+
+        let before = pair.conn_mut(Server).stats().frame_tx.stream_progress;
+        pair.drive_server();
+        let after = pair.conn_mut(Server).stats().frame_tx.stream_progress;
+        assert_eq!(
+            after, before,
+            "STREAM_PROGRESS must stay disabled for client={client_enabled}, server={server_enabled}",
+        );
+    }
+}
+
+#[test]
+fn negotiated_stream_progress_retires_data_without_packet_ack() {
+    let _guard = subscribe();
+    let mut builder = ConnPair::builder();
+    builder
+        .client_transport_cfg
+        .cross_path_stream_progress(true);
+    builder
+        .server_transport_cfg
+        .cross_path_stream_progress(true);
+    let mut pair = builder.connect();
+
+    const MESSAGE: &[u8] = &[0x5a; 4_096];
+    let stream = pair.streams(Client).open(Dir::Uni).unwrap();
+    pair.send_stream(Client, stream).write(MESSAGE).unwrap();
+
+    // CE forces an immediate ACK. Drop that packet after the server has emitted it, leaving the
+    // sender's byte state outstanding while preserving ordinary packet-level in-flight state.
+    pair.congestion_experienced = true;
+    for _ in 0..16 {
+        pair.drive_client();
+        pair.drive_server();
+        pair.client.inbound.clear();
+        let received = pair
+            .conn_mut(Server)
+            .stats()
+            .streams
+            .into_iter()
+            .find(|stats| stats.id == stream)
+            .and_then(|stats| stats.receive_highest_offset)
+            .unwrap_or_default();
+        if received == MESSAGE.len() as u64 {
+            break;
+        }
+    }
+    assert!(pair.conn_mut(Server).stats().frame_tx.acks > 0);
+    assert_eq!(
+        pair.conn_mut(Server)
+            .stats()
+            .streams
+            .into_iter()
+            .find(|stats| stats.id == stream)
+            .and_then(|stats| stats.receive_highest_offset),
+        Some(MESSAGE.len() as u64),
+    );
+    pair.congestion_experienced = false;
+
+    assert_matches!(
+        pair.poll(Server),
+        Some(Event::Stream(StreamEvent::Opened { dir: Dir::Uni }))
+    );
+    assert_eq!(pair.streams(Server).accept(Dir::Uni), Some(stream));
+    let mut recv = pair.recv_stream(Server, stream);
+    let mut chunks = recv.read(true).unwrap();
+    let mut bytes_read = 0;
+    while bytes_read < MESSAGE.len() {
+        bytes_read += chunks.next(usize::MAX).unwrap().unwrap().bytes.len();
+    }
+    assert_eq!(bytes_read, MESSAGE.len());
+    assert!(chunks.finalize().should_transmit());
+
+    let server_progress_before = pair.conn_mut(Server).stats().frame_tx.stream_progress;
+    pair.drive_server();
+    assert_eq!(
+        pair.conn_mut(Server).stats().frame_tx.stream_progress,
+        server_progress_before + 1,
+    );
+    pair.drive_client();
+
+    let path = pair.conn_mut(Client).path_stats(PathId::ZERO).unwrap();
+    assert_eq!(path.stream_progress_updates, 1);
+    assert_eq!(path.stream_progress_acked_bytes, MESSAGE.len() as u64);
+    let stream_stats = pair
+        .conn_mut(Client)
+        .stats()
+        .streams
+        .into_iter()
+        .find(|stats| stats.id == stream)
+        .unwrap();
+    assert_eq!(
+        stream_stats.send_fully_acked_offset,
+        Some(MESSAGE.len() as u64)
+    );
+    assert_eq!(stream_stats.send_unacknowledged_bytes, Some(0));
+}
+
+#[test]
 fn reset_stream() {
     let _guard = subscribe();
     let mut pair = Pair::default();

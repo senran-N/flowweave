@@ -66,13 +66,24 @@ pub struct TransportConfig {
     pub(crate) cross_path_pto_reinjection: bool,
     pub(crate) cross_path_abandon_reinjection: bool,
     pub(crate) cross_path_ack_progress_reinjection: bool,
+    pub(crate) cross_path_ack_progress_stream_obligation: bool,
+    pub(crate) cross_path_ack_progress_service_deadline: Option<Duration>,
+    pub(crate) cross_path_ack_progress_service_recovery_flights: u32,
+    pub(crate) cross_path_ack_progress_fresh_alternative: bool,
+    pub(crate) cross_path_ack_progress_feedback_stability: bool,
+    pub(crate) cross_path_ack_progress_alternative_stability: bool,
+    pub(crate) cross_path_stream_progress: bool,
     pub(crate) cross_path_ack_progress_feedback_probe: bool,
     pub(crate) cross_path_ack_progress_feedback_evidence_reinjection: bool,
     pub(crate) stream_gap_rescue: bool,
     pub(crate) stream_gap_watch_rescue: bool,
+    pub(crate) stream_gap_delivery_watch_rescue: bool,
     pub(crate) cross_path_ack_escape: bool,
     pub(crate) cross_path_feedback_handoff: bool,
     pub(crate) cross_path_feedback_credit_snapshot: bool,
+    pub(crate) cross_path_feedback_stream_progress_snapshot: bool,
+    pub(crate) cross_path_blocked_credit_handoff: bool,
+    pub(crate) declared_backlogged_epoch_sensor: bool,
 
     pub(crate) default_path_max_idle_timeout: Option<Duration>,
     pub(crate) default_path_keep_alive_interval: Option<Duration>,
@@ -449,6 +460,104 @@ impl TransportConfig {
         self
     }
 
+    /// Whether ACK-progress recovery should age the oldest retained STREAM obligation instead of
+    /// treating every newly acknowledged ack-eliciting packet as application progress.
+    ///
+    /// When enabled, ACKs for later packets do not postpone recovery while the same
+    /// `(stream_id, offset)` remains in the suspected path's sent-packet table. This option has no
+    /// effect unless ACK-progress reinjection is also enabled. Disabled by default so earlier
+    /// experiments retain their packet-level epoch semantics.
+    pub fn cross_path_ack_progress_stream_obligation(&mut self, enabled: bool) -> &mut Self {
+        self.cross_path_ack_progress_stream_obligation = enabled;
+        self
+    }
+
+    /// Sets an optional application-level service target for cross-path STREAM recovery.
+    ///
+    /// When configured, the complete-recovery trigger is capped so that one PTO on the selected
+    /// alternative path, plus timer granularity, remains before this duration has elapsed since
+    /// the watched STREAM obligation was originally sent. The ordinary per-path PTO remains an
+    /// upper bound, and standard QUIC loss detection, congestion control, path-idle handling, and
+    /// Multipath QUIC's packet-number-space drain are unchanged.
+    ///
+    /// This is a recovery scheduling target rather than a delivery guarantee: actual completion
+    /// still depends on the validated alternative path's service. Disabled by default.
+    pub fn cross_path_ack_progress_service_deadline(
+        &mut self,
+        deadline: Option<Duration>,
+    ) -> &mut Self {
+        self.cross_path_ack_progress_service_deadline = deadline;
+        self
+    }
+
+    /// Sets how many alternative-path PTO service intervals are reserved before an application
+    /// recovery target expires.
+    ///
+    /// A value of one preserves the historical single-flight budget. Larger values move only the
+    /// experimental complete-recovery trigger earlier; they do not alter RTT, congestion control,
+    /// path-idle handling, or Multipath QUIC's three-PTO packet-number-space drain. Values below
+    /// one are clamped to one. Defaults to one.
+    pub fn cross_path_ack_progress_service_recovery_flights(&mut self, flights: u32) -> &mut Self {
+        self.cross_path_ack_progress_service_recovery_flights = flights.max(1);
+        self
+    }
+
+    /// Whether ACK-progress recovery may only move toward an alternative path with strictly newer
+    /// authenticated feedback than the suspected path.
+    ///
+    /// This gives recovery a monotonic direction: a path that is still receiving authenticated
+    /// packets can rescue a path whose feedback version is older, while the healthy path cannot
+    /// immediately send speculative recovery back toward that stale route. It changes neither
+    /// path-idle abandonment nor Multipath QUIC's packet-number-space drain. Disabled by default.
+    pub fn cross_path_ack_progress_fresh_alternative(&mut self, enabled: bool) -> &mut Self {
+        self.cross_path_ack_progress_fresh_alternative = enabled;
+        self
+    }
+
+    /// Whether ACK-progress recovery must first observe a source-path feedback silence interval.
+    ///
+    /// The interval is the source path's smoothed RTT, plus the peer's advertised maximum ACK
+    /// delay and timer granularity, measured from the latest authenticated packet on that path.
+    /// Authenticated feedback refreshes the interval, and recovery actions recheck it before
+    /// probing or reinjecting. This prevents a transient ordering inversion between two live path
+    /// feedback versions from sending recovery toward the route that is actually stale.
+    ///
+    /// This option changes only the experimental ACK-progress recovery schedule. It does not
+    /// change standard loss detection, congestion control, path-idle handling, or Multipath
+    /// QUIC's three-PTO packet-number-space drain. Disabled by default.
+    pub fn cross_path_ack_progress_feedback_stability(&mut self, enabled: bool) -> &mut Self {
+        self.cross_path_ack_progress_feedback_stability = enabled;
+        self
+    }
+
+    /// Whether ACK-progress recovery must observe one continuously newer alternative path before
+    /// using it for a feedback probe or STREAM reinjection.
+    ///
+    /// The candidate is bound to the source path's authenticated-feedback version and current
+    /// ACK-progress obligation epoch. It must remain the same strictly newer validated path for
+    /// that candidate path's smoothed RTT, plus the peer's advertised maximum ACK delay and timer
+    /// granularity. Further authenticated packets on the same candidate do not restart the
+    /// interval; source feedback, a candidate change or disappearance, and an obligation-epoch
+    /// change do.
+    ///
+    /// This option changes only the experimental ACK-progress recovery schedule. It does not
+    /// change RTT estimation, congestion control, standard loss detection, path-idle handling, or
+    /// Multipath QUIC's three-PTO packet-number-space drain. Disabled by default.
+    pub fn cross_path_ack_progress_alternative_stability(&mut self, enabled: bool) -> &mut Self {
+        self.cross_path_ack_progress_alternative_stability = enabled;
+        self
+    }
+
+    /// Whether this endpoint advertises and, when negotiated, emits data-level STREAM progress.
+    ///
+    /// `STREAM_PROGRESS` reports only the contiguous prefix consumed by the receiving application.
+    /// It can retire duplicate STREAM retransmission debt across packet-number spaces while packet
+    /// ACK, RTT, congestion control, and loss accounting remain unchanged. Disabled by default.
+    pub fn cross_path_stream_progress(&mut self, enabled: bool) -> &mut Self {
+        self.cross_path_stream_progress = enabled;
+        self
+    }
+
     /// Whether ACK-progress recovery may first send one bounded STREAM feedback probe on the
     /// validated alternative path.
     ///
@@ -482,6 +591,22 @@ impl TransportConfig {
         self
     }
 
+    /// Whether a recovery feedback-path handoff also requeues the newest STREAM_PROGRESS value
+    /// already carried by an unacknowledged packet on another path.
+    ///
+    /// STREAM_PROGRESS is cumulative and monotonic. Reissuing its maximum in-flight offset on the
+    /// preferred feedback path lets the sender retire stale retransmission debt without waiting
+    /// for standard loss detection on a blackholed route. This option has no effect unless stream
+    /// progress and feedback-path handoff are also enabled.
+    ///
+    /// It changes neither packet acknowledgment, RTT estimation, congestion control, standard
+    /// loss detection, path-idle handling, nor Multipath QUIC's three-PTO drain. Disabled by
+    /// default.
+    pub fn cross_path_feedback_stream_progress_snapshot(&mut self, enabled: bool) -> &mut Self {
+        self.cross_path_feedback_stream_progress_snapshot = enabled;
+        self
+    }
+
     /// Whether loss detection may arm one congestion-exempt, pacing-limited STREAM rescue packet
     /// per newly advanced ACK frontier when no other validated path is usable.
     ///
@@ -505,6 +630,20 @@ impl TransportConfig {
     /// Disabled by default.
     pub fn stream_gap_watch_rescue(&mut self, enabled: bool) -> &mut Self {
         self.stream_gap_watch_rescue = enabled;
+        self
+    }
+
+    /// Whether a stable STREAM-gap watch remains active after the retransmit is packetized until
+    /// that exact byte obligation is acknowledged.
+    ///
+    /// The historical gap watch observes only retransmits still queued for transmission. This
+    /// extension also recognizes the same `(stream, offset)` in the path's sent-packet table. If
+    /// it remains outstanding for one RTT plus the peer's ACK delay, one paced loss-probe copy is
+    /// permitted. Each exact gap identity can trigger at most once before ordered progress exposes
+    /// a new gap. It does not acknowledge packets, change congestion-window accounting, or alter
+    /// standard loss detection. Disabled by default.
+    pub fn stream_gap_delivery_watch_rescue(&mut self, enabled: bool) -> &mut Self {
+        self.stream_gap_delivery_watch_rescue = enabled;
         self
     }
 
@@ -540,6 +679,25 @@ impl TransportConfig {
     /// using the earlier handoff behavior remain reproducible. Disabled by default.
     pub fn cross_path_feedback_credit_snapshot(&mut self, enabled: bool) -> &mut Self {
         self.cross_path_feedback_credit_snapshot = enabled;
+        self
+    }
+
+    /// Whether a stale `DATA_BLOCKED` or `STREAM_DATA_BLOCKED` frame received on a validated path
+    /// may promote that path for feedback and requeue the newest monotonic flow-control credit.
+    ///
+    /// A requeue occurs only when local credit is strictly greater than the limit reported by the
+    /// peer. The standard blocked frame therefore acts as an explicit negative acknowledgment for
+    /// already-generated credit; no new wire format or larger receive window is introduced.
+    /// Disabled by default.
+    pub fn cross_path_blocked_credit_handoff(&mut self, enabled: bool) -> &mut Self {
+        self.cross_path_blocked_credit_handoff = enabled;
+        self
+    }
+
+    /// Enables the default-off diagnostic sensor for an application-declared backlogged epoch.
+    /// The sensor records service observations but never changes scheduling or congestion control.
+    pub fn declared_backlogged_epoch_sensor(&mut self, enabled: bool) -> &mut Self {
+        self.declared_backlogged_epoch_sensor = enabled;
         self
     }
 
@@ -734,13 +892,24 @@ impl Default for TransportConfig {
             cross_path_pto_reinjection: false,
             cross_path_abandon_reinjection: false,
             cross_path_ack_progress_reinjection: false,
+            cross_path_ack_progress_stream_obligation: false,
+            cross_path_ack_progress_service_deadline: None,
+            cross_path_ack_progress_service_recovery_flights: 1,
+            cross_path_ack_progress_fresh_alternative: false,
+            cross_path_ack_progress_feedback_stability: false,
+            cross_path_ack_progress_alternative_stability: false,
+            cross_path_stream_progress: false,
             cross_path_ack_progress_feedback_probe: false,
             cross_path_ack_progress_feedback_evidence_reinjection: false,
             stream_gap_rescue: false,
             stream_gap_watch_rescue: false,
+            stream_gap_delivery_watch_rescue: false,
             cross_path_ack_escape: false,
             cross_path_feedback_handoff: false,
             cross_path_feedback_credit_snapshot: false,
+            cross_path_feedback_stream_progress_snapshot: false,
+            cross_path_blocked_credit_handoff: false,
+            declared_backlogged_epoch_sensor: false,
             default_path_max_idle_timeout: None,
             default_path_keep_alive_interval: None,
 
@@ -788,13 +957,24 @@ impl fmt::Debug for TransportConfig {
             cross_path_pto_reinjection,
             cross_path_abandon_reinjection,
             cross_path_ack_progress_reinjection,
+            cross_path_ack_progress_stream_obligation,
+            cross_path_ack_progress_service_deadline,
+            cross_path_ack_progress_service_recovery_flights,
+            cross_path_ack_progress_fresh_alternative,
+            cross_path_ack_progress_feedback_stability,
+            cross_path_ack_progress_alternative_stability,
+            cross_path_stream_progress,
             cross_path_ack_progress_feedback_probe,
             cross_path_ack_progress_feedback_evidence_reinjection,
             stream_gap_rescue,
             stream_gap_watch_rescue,
+            stream_gap_delivery_watch_rescue,
             cross_path_ack_escape,
             cross_path_feedback_handoff,
             cross_path_feedback_credit_snapshot,
+            cross_path_feedback_stream_progress_snapshot,
+            cross_path_blocked_credit_handoff,
+            declared_backlogged_epoch_sensor,
             default_path_max_idle_timeout,
             default_path_keep_alive_interval,
             max_remote_nat_traversal_addresses,
@@ -849,6 +1029,31 @@ impl fmt::Debug for TransportConfig {
                 cross_path_ack_progress_reinjection,
             )
             .field(
+                "cross_path_ack_progress_stream_obligation",
+                cross_path_ack_progress_stream_obligation,
+            )
+            .field(
+                "cross_path_ack_progress_service_deadline",
+                cross_path_ack_progress_service_deadline,
+            )
+            .field(
+                "cross_path_ack_progress_service_recovery_flights",
+                cross_path_ack_progress_service_recovery_flights,
+            )
+            .field(
+                "cross_path_ack_progress_fresh_alternative",
+                cross_path_ack_progress_fresh_alternative,
+            )
+            .field(
+                "cross_path_ack_progress_feedback_stability",
+                cross_path_ack_progress_feedback_stability,
+            )
+            .field(
+                "cross_path_ack_progress_alternative_stability",
+                cross_path_ack_progress_alternative_stability,
+            )
+            .field("cross_path_stream_progress", cross_path_stream_progress)
+            .field(
                 "cross_path_ack_progress_feedback_probe",
                 cross_path_ack_progress_feedback_probe,
             )
@@ -858,11 +1063,27 @@ impl fmt::Debug for TransportConfig {
             )
             .field("stream_gap_rescue", stream_gap_rescue)
             .field("stream_gap_watch_rescue", stream_gap_watch_rescue)
+            .field(
+                "stream_gap_delivery_watch_rescue",
+                stream_gap_delivery_watch_rescue,
+            )
             .field("cross_path_ack_escape", cross_path_ack_escape)
             .field("cross_path_feedback_handoff", cross_path_feedback_handoff)
             .field(
                 "cross_path_feedback_credit_snapshot",
                 cross_path_feedback_credit_snapshot,
+            )
+            .field(
+                "cross_path_feedback_stream_progress_snapshot",
+                cross_path_feedback_stream_progress_snapshot,
+            )
+            .field(
+                "cross_path_blocked_credit_handoff",
+                cross_path_blocked_credit_handoff,
+            )
+            .field(
+                "declared_backlogged_epoch_sensor",
+                declared_backlogged_epoch_sensor,
             )
             .field(
                 "default_path_max_idle_timeout",
@@ -959,6 +1180,36 @@ impl Default for AckFrequencyConfig {
             max_ack_delay: None,
             reordering_threshold: VarInt(2),
         }
+    }
+}
+
+#[cfg(test)]
+mod stream_progress_tests {
+    use super::TransportConfig;
+
+    #[test]
+    fn stream_progress_is_default_off_and_explicitly_enabled() {
+        let mut config = TransportConfig::default();
+        assert!(!config.cross_path_stream_progress);
+        assert_eq!(config.cross_path_ack_progress_service_recovery_flights, 1);
+        assert!(!config.cross_path_ack_progress_feedback_stability);
+        assert!(!config.cross_path_ack_progress_alternative_stability);
+        assert!(!config.cross_path_feedback_stream_progress_snapshot);
+        assert!(!config.stream_gap_delivery_watch_rescue);
+        config.cross_path_stream_progress(true);
+        config.cross_path_ack_progress_service_recovery_flights(3);
+        config.cross_path_ack_progress_feedback_stability(true);
+        config.cross_path_ack_progress_alternative_stability(true);
+        config.cross_path_feedback_stream_progress_snapshot(true);
+        config.stream_gap_delivery_watch_rescue(true);
+        assert!(config.cross_path_stream_progress);
+        assert_eq!(config.cross_path_ack_progress_service_recovery_flights, 3);
+        assert!(config.cross_path_ack_progress_feedback_stability);
+        assert!(config.cross_path_ack_progress_alternative_stability);
+        assert!(config.cross_path_feedback_stream_progress_snapshot);
+        assert!(config.stream_gap_delivery_watch_rescue);
+        config.cross_path_ack_progress_service_recovery_flights(0);
+        assert_eq!(config.cross_path_ack_progress_service_recovery_flights, 1);
     }
 }
 

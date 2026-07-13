@@ -4,12 +4,16 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.88"
 publish = false
+description = "FlowWeave experimental multipath QUIC transport and fixed-target TCP proxy"
+readme = "README.md"
 
 [dependencies]
 noq = { version = "=1.0.1", default-features = false, features = ["runtime-tokio", "rustls", "ring"] }
 noq-proto = { version = "=1.0.1", default-features = false }
 rcgen = { version = "=0.14.5", default-features = false, features = ["crypto", "ring"] }
-tokio = { version = "=1.47.1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+subtle = "=2.6.1"
+tokio = { version = "=1.47.1", features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
 
 [patch.crates-io]
+noq = { path = "third_party/noq" }
 noq-proto = { path = "third_party/noq-proto" }

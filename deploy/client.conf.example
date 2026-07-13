@@ -1,0 +1,11 @@
+# FlowWeave v1 client configuration. The TCP listen address must be loopback.
+listen=127.0.0.1:10022
+server=proxy.example.com:4433
+server_name=proxy.example.com
+ca_certificate_der=/etc/flowweave/ca.cert.der
+token_file=/etc/flowweave/token
+target=127.0.0.1:22
+
+# Optional. Every configured address must already exist on this host.
+# primary_local_ip=192.0.2.10
+# additional_local_ips=198.51.100.20

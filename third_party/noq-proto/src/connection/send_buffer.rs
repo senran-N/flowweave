@@ -352,9 +352,42 @@ impl SendBuffer {
         self.data.range().start
     }
 
+    /// First byte in `range` which has not been acknowledged by any transmitted copy.
+    ///
+    /// Sent-packet metadata can outlive the application obligation it once represented when a
+    /// redundant copy is acknowledged on another packet or path. Recovery observers must consult
+    /// the send buffer's byte-level ACK state instead of treating all retained metadata as debt.
+    pub(super) fn first_unacked_offset(&self, range: Range<u64>) -> Option<u64> {
+        let mut offset = range.start.max(self.fully_acked_offset());
+        if offset >= range.end {
+            return None;
+        }
+
+        for acked in self.acks.iter_range(offset..range.end) {
+            if acked.start > offset {
+                return Some(offset);
+            }
+            offset = offset.max(acked.end);
+            if offset >= range.end {
+                return None;
+            }
+        }
+        Some(offset)
+    }
+
     /// Lowest stream offset currently queued for retransmission.
     pub(super) fn lowest_retransmit_offset(&self) -> Option<u64> {
         self.retransmits.min()
+    }
+
+    /// Whether this exact STREAM offset is waiting in the retransmission queue.
+    ///
+    /// Recovery observers use this to preserve one application obligation's age while its
+    /// metadata moves atomically from a lost sent packet into the retransmission queue. This is
+    /// deliberately narrower than `has_retransmits`: an unrelated gap must not inherit another
+    /// path's recovery epoch.
+    pub(super) fn retransmit_contains(&self, offset: u64) -> bool {
+        self.retransmits.contains(offset)
     }
 
     /// Total STREAM payload bytes currently queued for retransmission.
@@ -366,6 +399,11 @@ impl SendBuffer {
     /// begin at
     pub(super) fn offset(&self) -> u64 {
         self.data.range().end
+    }
+
+    /// Highest stream offset which has been transmitted at least once.
+    pub(super) fn sent_offset(&self) -> u64 {
+        self.unsent
     }
 
     /// Whether all sent data has been acknowledged
@@ -625,6 +663,23 @@ mod tests {
         assert_eq!(buf.ack(5..MSG.len() as u64), MSG.len() as u64 - 5);
         assert_eq!(buf.poll_transmit(64).0, 0..5);
         assert!(!buf.has_retransmits());
+    }
+
+    #[test]
+    fn first_unacked_offset_ignores_acknowledged_redundant_ranges() {
+        let mut buf = SendBuffer::new();
+        const MSG: &[u8] = b"Hello, world!";
+        buf.write(MSG);
+        assert_eq!(buf.poll_transmit(64).0, 0..MSG.len() as u64);
+
+        assert_eq!(buf.first_unacked_offset(0..MSG.len() as u64), Some(0));
+        buf.ack(0..5);
+        assert_eq!(buf.first_unacked_offset(0..MSG.len() as u64), Some(5));
+        buf.ack(8..MSG.len() as u64);
+        assert_eq!(buf.first_unacked_offset(0..MSG.len() as u64), Some(5));
+        assert_eq!(buf.first_unacked_offset(8..MSG.len() as u64), None);
+        buf.ack(5..8);
+        assert_eq!(buf.first_unacked_offset(0..MSG.len() as u64), None);
     }
 
     #[test]

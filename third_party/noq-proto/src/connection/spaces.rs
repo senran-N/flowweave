@@ -154,6 +154,7 @@ impl PacketSpace {
             acks,
             close: false,
             space_specific,
+            path_data: false,
             other,
         }
     }
@@ -551,11 +552,14 @@ pub(super) struct LostPacket {
 #[derive(Debug, Default, Clone)]
 pub struct Retransmits {
     pub(super) max_data: bool,
+    pub(super) data_blocked: bool,
     pub(super) max_stream_id: [bool; 2],
     pub(super) streams_blocked: [bool; 2],
     pub(super) reset_stream: Vec<(StreamId, VarInt)>,
     pub(super) stop_sending: Vec<frame::StopSending>,
     pub(super) max_stream_data: FxHashSet<StreamId>,
+    pub(super) stream_data_blocked: FxHashSet<StreamId>,
+    pub(super) stream_progress: FxHashMap<StreamId, u64>,
     pub(super) crypto: VecDeque<frame::Crypto>,
     pub(super) new_cids: PendingNewCids,
     pub(super) retire_cids: Vec<(PathId, u64)>,
@@ -612,11 +616,14 @@ impl Retransmits {
     pub(super) fn is_empty(&self, streams: &StreamsState) -> bool {
         let Self {
             max_data,
+            data_blocked,
             max_stream_id,
             streams_blocked,
             reset_stream,
             stop_sending,
             max_stream_data,
+            stream_data_blocked,
+            stream_progress,
             crypto,
             new_cids,
             retire_cids,
@@ -633,6 +640,7 @@ impl Retransmits {
             reach_out,
         } = &self;
         !max_data
+            && !data_blocked
             && !max_stream_id.iter().any(|x| *x)
             && !streams_blocked.iter().any(|x| *x)
             && reset_stream.is_empty()
@@ -640,6 +648,8 @@ impl Retransmits {
             && max_stream_data
                 .iter()
                 .all(|&id| !streams.can_send_flow_control(id))
+            && stream_data_blocked.is_empty()
+            && stream_progress.is_empty()
             && crypto.is_empty()
             && new_cids.is_empty()
             && retire_cids.is_empty()
@@ -661,11 +671,14 @@ impl ::std::ops::BitOrAssign for Retransmits {
     fn bitor_assign(&mut self, rhs: Self) {
         let Self {
             max_data,
+            data_blocked,
             max_stream_id,
             streams_blocked,
             reset_stream,
             stop_sending,
             max_stream_data,
+            stream_data_blocked,
+            stream_progress,
             crypto,
             new_cids,
             retire_cids,
@@ -685,6 +698,7 @@ impl ::std::ops::BitOrAssign for Retransmits {
         // We reduce in-stream head-of-line blocking by queueing retransmits before other data for
         // STREAM and CRYPTO frames.
         self.max_data |= max_data;
+        self.data_blocked |= data_blocked;
         for dir in Dir::iter() {
             self.max_stream_id[dir as usize] |= max_stream_id[dir as usize];
             self.streams_blocked[dir as usize] |= streams_blocked[dir as usize];
@@ -692,6 +706,13 @@ impl ::std::ops::BitOrAssign for Retransmits {
         self.reset_stream.extend_from_slice(&reset_stream);
         self.stop_sending.extend_from_slice(&stop_sending);
         self.max_stream_data.extend(&max_stream_data);
+        self.stream_data_blocked.extend(&stream_data_blocked);
+        for (id, offset) in stream_progress {
+            self.stream_progress
+                .entry(id)
+                .and_modify(|current| *current = (*current).max(offset))
+                .or_insert(offset);
+        }
         for crypto in crypto.into_iter().rev() {
             self.crypto.push_front(crypto);
         }
@@ -1030,6 +1051,8 @@ pub(super) struct SendableFrames {
     /// These are ack-eliciting. Some frames are scheduled per path, e.g. PING,
     /// IMMEDIATE_ACK, PATH_CHALLENGE or PATH_RESPONSE.
     pub(super) space_specific: bool,
+    /// Whether congestion-controlled application data is explicitly bound to this path.
+    pub(super) path_data: bool,
     /// Whether there are any other frames to send, these are ack-eliciting.
     pub(super) other: bool,
 }
@@ -1041,6 +1064,7 @@ impl SendableFrames {
             acks: false,
             close: false,
             space_specific: false,
+            path_data: false,
             other: false,
         }
     }
@@ -1051,13 +1075,14 @@ impl SendableFrames {
             acks: _,
             close,
             space_specific,
+            path_data,
             other,
         } = *self;
         if close {
             // No ack-eliciting frames are included with a CONNECTION_CLOSE, only acks.
             return false;
         }
-        space_specific || other
+        space_specific || path_data || other
     }
 
     /// Whether no data is sendable.
@@ -1066,9 +1091,10 @@ impl SendableFrames {
             acks,
             close,
             space_specific,
+            path_data,
             other,
         } = *self;
-        !acks && !close && !space_specific && !other
+        !acks && !close && !space_specific && !path_data && !other
     }
 }
 
@@ -1078,12 +1104,14 @@ impl ::std::ops::BitOrAssign for SendableFrames {
             acks,
             close,
             space_specific,
+            path_data,
             other,
         } = rhs;
 
         self.acks |= acks;
         self.close |= close;
         self.space_specific |= space_specific;
+        self.path_data |= path_data;
         self.other |= other;
     }
 }

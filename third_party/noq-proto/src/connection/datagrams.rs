@@ -7,7 +7,7 @@ use tracing::{debug, trace};
 use super::Connection;
 use crate::{
     FrameStats, TransportError,
-    connection::PacketBuilder,
+    connection::{PacketBuilder, PathId},
     frame::{Datagram, FrameStruct},
 };
 
@@ -27,6 +27,66 @@ impl Datagrams<'_> {
     ///
     /// Returns `Err` iff a `len`-byte datagram cannot currently be sent.
     pub fn send(&mut self, data: Bytes, drop: bool) -> Result<(), SendDatagramError> {
+        self.send_inner(data, None, false, drop)
+    }
+
+    /// Queue an unreliable, unordered datagram for transmission on one exact local path.
+    ///
+    /// The target must already be validated and open. A targeted datagram may use a Backup path,
+    /// but remains subject to that path's congestion window, pacing and MTU. It is never silently
+    /// moved to another path if the target later closes.
+    pub fn send_on_path(
+        &mut self,
+        path_id: PathId,
+        data: Bytes,
+        drop: bool,
+    ) -> Result<(), SendDatagramOnPathError> {
+        let path_is_usable = self
+            .conn
+            .paths
+            .get(&path_id)
+            .is_some_and(|path| path.data.validated)
+            && !self.conn.abandoned_paths.contains(&path_id)
+            && self.conn.remote_cids.contains_key(&path_id);
+        if !path_is_usable {
+            return Err(SendDatagramOnPathError::PathUnavailable(path_id));
+        }
+        self.send_inner(data, Some(path_id), false, drop)?;
+        Ok(())
+    }
+
+    /// Queue a targeted datagram which must not share a QUIC packet with another application
+    /// DATAGRAM frame.
+    ///
+    /// ACK and control frames may still share the packet. The boundary changes neither path
+    /// selection nor congestion, pacing, MTU, anti-amplification, and buffering constraints.
+    pub fn send_on_path_separate(
+        &mut self,
+        path_id: PathId,
+        data: Bytes,
+        drop: bool,
+    ) -> Result<(), SendDatagramOnPathError> {
+        let path_is_usable = self
+            .conn
+            .paths
+            .get(&path_id)
+            .is_some_and(|path| path.data.validated)
+            && !self.conn.abandoned_paths.contains(&path_id)
+            && self.conn.remote_cids.contains_key(&path_id);
+        if !path_is_usable {
+            return Err(SendDatagramOnPathError::PathUnavailable(path_id));
+        }
+        self.send_inner(data, Some(path_id), true, drop)?;
+        Ok(())
+    }
+
+    fn send_inner(
+        &mut self,
+        data: Bytes,
+        path_id: Option<PathId>,
+        separate: bool,
+        drop: bool,
+    ) -> Result<(), SendDatagramError> {
         if self.conn.config.datagram_receive_buffer_size.is_none() {
             return Err(SendDatagramError::Disabled);
         }
@@ -44,8 +104,8 @@ impl Datagrams<'_> {
                     .outgoing
                     .pop_front()
                     .expect("datagrams.outgoing_total desynchronized");
-                trace!(len = prev.data.len(), "dropping outgoing datagram");
-                self.conn.datagrams.outgoing_total -= prev.data.len();
+                trace!(len = prev.frame.data.len(), "dropping outgoing datagram");
+                self.conn.datagrams.outgoing_total -= prev.frame.data.len();
             }
         } else if self.conn.datagrams.outgoing_total + data.len()
             > self.conn.config.datagram_send_buffer_size
@@ -54,7 +114,11 @@ impl Datagrams<'_> {
             return Err(SendDatagramError::Blocked(data));
         }
         self.conn.datagrams.outgoing_total += data.len();
-        self.conn.datagrams.outgoing.push_back(Datagram { data });
+        self.conn.datagrams.outgoing.push_back(OutgoingDatagram {
+            frame: Datagram { data },
+            path_id,
+            separate,
+        });
         Ok(())
     }
 
@@ -109,7 +173,7 @@ pub(super) struct DatagramState {
     /// delivered to the application
     pub(super) recv_buffered: usize,
     pub(super) incoming: VecDeque<Datagram>,
-    pub(super) outgoing: VecDeque<Datagram>,
+    pub(super) outgoing: VecDeque<OutgoingDatagram>,
     pub(super) outgoing_total: usize,
     pub(super) send_blocked: bool,
 }
@@ -153,19 +217,45 @@ impl DatagramState {
     pub(super) fn drop_oversized(&mut self, max_payload: usize) -> bool {
         let mut dropped_any = false;
         self.outgoing.retain(|datagram| {
-            let result = datagram.data.len() < max_payload;
+            let result = datagram.frame.data.len() < max_payload;
             if !result {
                 trace!(
                     "dropping {} byte datagram violating {} byte limit",
-                    datagram.data.len(),
+                    datagram.frame.data.len(),
                     max_payload
                 );
-                self.outgoing_total -= datagram.data.len();
+                self.outgoing_total -= datagram.frame.data.len();
                 dropped_any = true;
             }
             result
         });
         dropped_any
+    }
+
+    /// Drop queued copies bound to a path which can no longer transmit them.
+    pub(super) fn drop_targeted_path(&mut self, path_id: PathId) -> bool {
+        let mut dropped_bytes = 0usize;
+        self.outgoing.retain(|datagram| {
+            let keep = datagram.path_id != Some(path_id);
+            if !keep {
+                dropped_bytes = dropped_bytes.saturating_add(datagram.frame.data.len());
+            }
+            keep
+        });
+        self.outgoing_total = self.outgoing_total.saturating_sub(dropped_bytes);
+        dropped_bytes != 0
+    }
+
+    pub(super) fn has_untargeted(&self, max_size: usize) -> bool {
+        self.outgoing
+            .iter()
+            .any(|datagram| datagram.path_id.is_none() && datagram.frame.size(true) <= max_size)
+    }
+
+    pub(super) fn has_targeted(&self, path_id: PathId, max_size: usize) -> bool {
+        self.outgoing.iter().any(|datagram| {
+            datagram.path_id == Some(path_id) && datagram.frame.size(true) <= max_size
+        })
     }
 
     /// Attempt to write a datagram frame into `buf`, consuming it from `self.outgoing`
@@ -174,23 +264,36 @@ impl DatagramState {
     /// framing.
     pub(super) fn write<'a, 'b>(
         &mut self,
+        path_id: PathId,
+        allow_untargeted: bool,
+        application_datagrams_written: bool,
         buf: &mut PacketBuilder<'a, 'b>,
         stat: &mut FrameStats,
-    ) -> bool {
-        let Some(datagram) = self.outgoing.pop_front() else {
-            return false;
+    ) -> DatagramWriteStatus {
+        let Some(index) = self.outgoing.iter().position(|datagram| {
+            datagram.path_id == Some(path_id) || (allow_untargeted && datagram.path_id.is_none())
+        }) else {
+            return DatagramWriteStatus::Nothing;
         };
+        if application_datagrams_written && self.outgoing[index].separate {
+            return DatagramWriteStatus::NeedsFreshPacket;
+        }
+        let datagram = self
+            .outgoing
+            .remove(index)
+            .expect("selected outgoing datagram must still exist");
 
-        if buf.frame_space_remaining() < datagram.size(true) {
+        if buf.frame_space_remaining() < datagram.frame.size(true) {
             // Future work: we could be more clever about cramming small datagrams into
             // mostly-full packets when a larger one is queued first
-            self.outgoing.push_front(datagram);
-            return false;
+            self.outgoing.insert(index, datagram);
+            return DatagramWriteStatus::Nothing;
         }
 
-        self.outgoing_total -= datagram.data.len();
-        buf.write_frame(datagram, stat);
-        true
+        self.outgoing_total -= datagram.frame.data.len();
+        let stop_packet = datagram.separate;
+        buf.write_frame(datagram.frame, stat);
+        DatagramWriteStatus::Wrote { stop_packet }
     }
 
     pub(super) fn recv(&mut self) -> Option<Bytes> {
@@ -198,6 +301,20 @@ impl DatagramState {
         self.recv_buffered -= x.len();
         Some(x)
     }
+}
+
+#[derive(Debug)]
+pub(super) struct OutgoingDatagram {
+    frame: Datagram,
+    path_id: Option<PathId>,
+    separate: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum DatagramWriteStatus {
+    Nothing,
+    NeedsFreshPacket,
+    Wrote { stop_packet: bool },
 }
 
 /// Errors that can arise when sending a datagram
@@ -218,4 +335,15 @@ pub enum SendDatagramError {
     /// Send would block
     #[error("datagram send blocked")]
     Blocked(Bytes),
+}
+
+/// Errors that can arise when binding an application datagram to one exact local path.
+#[derive(Debug, Error, Clone, Eq, PartialEq)]
+pub enum SendDatagramOnPathError {
+    /// The ordinary DATAGRAM send constraints were not satisfied.
+    #[error(transparent)]
+    Datagram(#[from] SendDatagramError),
+    /// The requested path does not exist, is not validated, or has already been abandoned.
+    #[error("datagram target path {0} is unavailable")]
+    PathUnavailable(PathId),
 }

@@ -133,6 +133,22 @@ pub(super) struct SentChallengeInfo {
     pub(super) network_path: FourTuple,
 }
 
+/// One continuously newer target observed for a source path's exact ACK-progress epoch.
+///
+/// Recovery keeps this local-only identity separate from authenticated feedback timestamps. A
+/// later packet on the same candidate proves continued leadership without forgiving the elapsed
+/// stability interval, while any source-version, candidate-generation, or obligation-epoch change
+/// creates a new observation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct AckProgressAlternativeCandidate {
+    pub(super) path_id: PathId,
+    pub(super) path_generation: u64,
+    pub(super) since: Instant,
+    pub(super) source_feedback_version: Instant,
+    pub(super) source_stream_obligation: Option<(StreamId, u64)>,
+    pub(super) source_epoch_start: Instant,
+}
+
 /// State of particular network path 4-tuple within a [`PacketNumberSpace`].
 ///
 /// With QUIC-Multipath a path is identified by a [`PathId`] and it is possible to have
@@ -208,6 +224,11 @@ pub(super) struct PathData {
     pub(super) total_sent: u64,
     /// Total size of all UDP datagrams received on this path
     pub(super) total_recvd: u64,
+    /// Time of the most recent authenticated packet received on this path generation.
+    ///
+    /// Recovery uses this as a monotonic per-path feedback version; it does not change path-idle
+    /// or loss-detection semantics.
+    pub(super) last_authenticated_at: Instant,
     /// The state of the MTU discovery process
     pub(super) mtud: MtuDiscovery,
     /// Packet number of the first packet sent after an RTT sample was collected on this path
@@ -256,6 +277,19 @@ pub(super) struct PathData {
     /// deliberately separate from QUIC's standard PTO send-time clock.
     pub(super) ack_progress_start: Option<Instant>,
 
+    /// Oldest STREAM obligation currently retained by this exact path generation while the
+    /// application-progress recovery epoch is active.
+    ///
+    /// ACKs for later packet numbers do not change this identity. Removing the watched frame or
+    /// exposing a different oldest frame starts a new epoch.
+    pub(super) ack_progress_stream_obligation: Option<(StreamId, u64)>,
+
+    /// Strictly newer alternative currently being observed for this exact ACK-progress epoch.
+    ///
+    /// This is used only by the default-off alternative-stability recovery experiment. It does
+    /// not alter path validation, loss detection, congestion control, or peer-visible path state.
+    pub(super) ack_progress_alternative_candidate: Option<AckProgressAlternativeCandidate>,
+
     /// Original full-recovery deadline retained after a bounded feedback probe has fired.
     ///
     /// ACKs elicited by the probe may advance the ordinary ACK-progress epoch, but must not move
@@ -270,6 +304,12 @@ pub(super) struct PathData {
     /// STREAM retransmit gap whose stable identity is currently guarded by a delayed rescue
     /// timer. ACKs for unrelated later packets do not change this identity.
     pub(super) stream_gap_watch: Option<(StreamId, u64)>,
+
+    /// Exact STREAM gap already granted one delivery-watch rescue.
+    ///
+    /// The identity remains latched until acknowledgment exposes a different gap, bounding the
+    /// delivery extension to one probe per ordered obligation.
+    pub(super) stream_gap_watch_rescued: Option<(StreamId, u64)>,
 
     /// STREAM frame entries retained by in-flight packets on this exact path generation.
     ///
@@ -335,13 +375,14 @@ impl PathData {
             .congestion_controller_factory
             .clone()
             .build(now, config.get_initial_mtu());
+        let initial_window = congestion.initial_window();
         Self {
             network_path,
             rtt: RttEstimator::new(config.initial_rtt),
             sending_ecn: true,
             pacing: Pacer::new(
                 config.initial_rtt,
-                congestion.initial_window(),
+                initial_window,
                 config.get_initial_mtu(),
                 config.max_outgoing_bytes_per_second,
                 now,
@@ -354,6 +395,7 @@ impl PathData {
             validated: false,
             total_sent: 0,
             total_recvd: 0,
+            last_authenticated_at: now,
             mtud: config
                 .mtu_discovery_config
                 .as_ref()
@@ -378,9 +420,12 @@ impl PathData {
             pto_count: 0,
             pto_recovery_probe_start: None,
             ack_progress_start: None,
+            ack_progress_stream_obligation: None,
+            ack_progress_alternative_candidate: None,
             ack_progress_feedback_probe_full_deadline: None,
             ack_progress_feedback_probe_liveness_start: None,
             stream_gap_watch: None,
+            stream_gap_watch_rescued: None,
             stream_frames_in_flight: 0,
             idle_timeout: config.default_path_max_idle_timeout,
             keep_alive: config.default_path_keep_alive_interval,
@@ -403,13 +448,14 @@ impl PathData {
     ) -> Self {
         let congestion = prev.congestion.clone_box();
         let smoothed_rtt = prev.rtt.get();
+        let current_mtu = prev.current_mtu();
         Self {
             network_path,
             rtt: prev.rtt,
             pacing: Pacer::new(
                 smoothed_rtt,
                 congestion.window(),
-                prev.current_mtu(),
+                current_mtu,
                 prev.pacing.max_bytes_per_second(),
                 now,
             ),
@@ -422,6 +468,7 @@ impl PathData {
             validated: false,
             total_sent: 0,
             total_recvd: 0,
+            last_authenticated_at: now,
             mtud: prev.mtud.clone(),
             first_packet_after_rtt_sample: prev.first_packet_after_rtt_sample,
             in_flight: InFlight::new(),
@@ -432,9 +479,12 @@ impl PathData {
             pto_count: 0,
             pto_recovery_probe_start: None,
             ack_progress_start: None,
+            ack_progress_stream_obligation: None,
+            ack_progress_alternative_candidate: None,
             ack_progress_feedback_probe_full_deadline: None,
             ack_progress_feedback_probe_liveness_start: None,
             stream_gap_watch: None,
+            stream_gap_watch_rescued: None,
             stream_frames_in_flight: 0,
             idle_timeout: prev.idle_timeout,
             keep_alive: prev.keep_alive,

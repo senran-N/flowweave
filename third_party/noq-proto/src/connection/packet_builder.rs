@@ -36,6 +36,7 @@ pub(super) struct PacketBuilder<'a, 'b> {
     pub(super) _span: tracing::span::EnteredSpan,
     qlog: QlogSentPacket,
     sent_frames: SentFrames,
+    track_declared_epoch: bool,
 }
 
 impl<'a, 'b> PacketBuilder<'a, 'b> {
@@ -173,6 +174,7 @@ impl<'a, 'b> PacketBuilder<'a, 'b> {
             ack_eliciting: false,
             qlog,
             sent_frames: SentFrames::default(),
+            track_declared_epoch: conn.config.declared_backlogged_epoch_sensor,
             _span: span,
         })
     }
@@ -192,6 +194,7 @@ impl<'a, 'b> PacketBuilder<'a, 'b> {
             _span: trace_span!("test").entered(),
             qlog: QlogSentPacket::default(),
             sent_frames: SentFrames::default(),
+            track_declared_epoch: false,
             level: EncryptionLevel::Initial,
         }
     }
@@ -263,6 +266,17 @@ impl<'a, 'b> PacketBuilder<'a, 'b> {
         &self.sent_frames
     }
 
+    pub(super) fn record_declared_epoch_fresh_stream_frame(
+        &mut self,
+        frame: crate::frame::StreamMeta,
+    ) {
+        if self.track_declared_epoch {
+            self.sent_frames
+                .declared_epoch_fresh_stream_frames
+                .push(frame);
+        }
+    }
+
     pub(super) fn finish_and_track(
         mut self,
         now: Instant,
@@ -281,6 +295,11 @@ impl<'a, 'b> PacketBuilder<'a, 'b> {
         let space_id = self.space;
         let (size, padded, sent) = self.finish(conn, now);
         let contains_stream = !sent.stream_frames.is_empty();
+        conn.declared_backlogged_epoch_sensor.record_fresh_frames(
+            now,
+            path_id,
+            &sent.declared_epoch_fresh_stream_frames,
+        );
 
         let size = match padded || ack_eliciting {
             true => size as u16,

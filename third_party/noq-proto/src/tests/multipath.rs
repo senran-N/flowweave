@@ -6,13 +6,15 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use assert_matches::assert_matches;
+use bytes::Bytes;
 use testresult::TestResult;
 use tracing::info;
 
 use crate::{
     ClientConfig, ConnectionId, ConnectionIdGenerator, Endpoint, EndpointConfig, FourTuple,
     LOCAL_CID_COUNT, NetworkChangeHint, PathId, PathStatus, RandomConnectionIdGenerator,
-    ServerConfig, Side::*, TransportConfig, cid_queue::CidQueue,
+    SendDatagramError, SendDatagramOnPathError, ServerConfig, Side::*, TIMER_GRANULARITY,
+    TransportConfig, cid_queue::CidQueue, congestion::NewRenoConfig,
 };
 use crate::{
     ClosePathError, Dir, Event, PathAbandonReason, PathEvent, ReadError, StreamEvent,
@@ -25,6 +27,334 @@ use super::util::{
 };
 
 const MAX_PATHS: u32 = 3;
+
+fn open_available_second_path(pair: &mut ConnPair) -> Result<PathId, crate::PathError> {
+    let path_id = pair.open_path(
+        Client,
+        FourTuple::from_remote(pair.routes.public_server_addr()),
+        PathStatus::Available,
+    )?;
+    pair.drive();
+    while pair.poll(Client).is_some() {}
+    while pair.poll(Server).is_some() {}
+    Ok(path_id)
+}
+
+fn queue_scheduler_test_data(pair: &mut ConnPair) {
+    let stream = pair.streams(Client).open(Dir::Uni).unwrap();
+    let data = vec![42; 64 * 1024];
+    assert_eq!(
+        pair.send_stream(Client, stream).write(&data).unwrap(),
+        data.len()
+    );
+}
+
+fn poll_scheduler_data_path(pair: &mut ConnPair, paths: &[PathId]) -> PathId {
+    let before = paths
+        .iter()
+        .map(|path_id| {
+            (
+                *path_id,
+                pair.path_stats(Client, *path_id).unwrap().udp_tx.datagrams,
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut buf = Vec::new();
+    let _ = pair
+        .poll_transmit(Client, NonZeroUsize::MIN, &mut buf)
+        .expect("queued STREAM data should produce a transmit");
+    let used = before
+        .into_iter()
+        .filter_map(|(path_id, datagrams)| {
+            (pair.path_stats(Client, path_id).unwrap().udp_tx.datagrams > datagrams)
+                .then_some(path_id)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(used.len(), 1, "one transmit must use exactly one path");
+    used[0]
+}
+
+#[test]
+fn default_scheduler_remains_lowest_path_first() -> TestResult {
+    let _guard = subscribe();
+    let mut pair = ConnPair::builder()
+        .enable_multipath()
+        .disable_mtud_discovery()
+        .connect();
+    let second = open_available_second_path(&mut pair)?;
+    queue_scheduler_test_data(&mut pair);
+    assert_eq!(
+        poll_scheduler_data_path(&mut pair, &[PathId::ZERO, second]),
+        PathId::ZERO
+    );
+    assert_eq!(
+        poll_scheduler_data_path(&mut pair, &[PathId::ZERO, second]),
+        PathId::ZERO
+    );
+    Ok(())
+}
+
+#[test]
+fn targeted_datagram_can_use_backup_without_touching_primary() -> TestResult {
+    let _guard = subscribe();
+    let mut pair = ConnPair::builder()
+        .enable_multipath()
+        .disable_mtud_discovery()
+        .connect();
+    let backup = open_available_second_path(&mut pair)?;
+    pair.set_path_status(Client, backup, PathStatus::Backup)?;
+    pair.drive();
+    while pair.poll(Client).is_some() {}
+    while pair.poll(Server).is_some() {}
+
+    let primary_before = pair.path_stats(Client, PathId::ZERO).unwrap().frame_tx;
+    let backup_before = pair.path_stats(Client, backup).unwrap().frame_tx;
+    let payload = Bytes::from_static(b"targeted backup datagram");
+    pair.datagrams(Client)
+        .send_on_path(backup, payload.clone(), false)?;
+    pair.drive();
+
+    let primary_after = pair.path_stats(Client, PathId::ZERO).unwrap().frame_tx;
+    let backup_after = pair.path_stats(Client, backup).unwrap().frame_tx;
+    assert_eq!(primary_after.datagram, primary_before.datagram);
+    assert_eq!(backup_after.datagram, backup_before.datagram + 1);
+    assert_eq!(pair.datagrams(Server).recv(), Some(payload));
+    assert_eq!(pair.datagrams(Server).recv(), None);
+    Ok(())
+}
+
+#[test]
+fn same_datagram_can_be_targeted_once_per_path() -> TestResult {
+    let _guard = subscribe();
+    let mut pair = ConnPair::builder()
+        .enable_multipath()
+        .disable_mtud_discovery()
+        .connect();
+    let second = open_available_second_path(&mut pair)?;
+
+    let primary_before = pair.path_stats(Client, PathId::ZERO).unwrap().frame_tx;
+    let second_before = pair.path_stats(Client, second).unwrap().frame_tx;
+    let payload = Bytes::from_static(b"one logical payload, two path copies");
+    pair.datagrams(Client)
+        .send_on_path(PathId::ZERO, payload.clone(), false)?;
+    pair.datagrams(Client)
+        .send_on_path(second, payload.clone(), false)?;
+    pair.drive();
+
+    let primary_after = pair.path_stats(Client, PathId::ZERO).unwrap().frame_tx;
+    let second_after = pair.path_stats(Client, second).unwrap().frame_tx;
+    assert_eq!(primary_after.datagram, primary_before.datagram + 1);
+    assert_eq!(second_after.datagram, second_before.datagram + 1);
+    assert_eq!(pair.datagrams(Server).recv(), Some(payload.clone()));
+    assert_eq!(pair.datagrams(Server).recv(), Some(payload));
+    assert_eq!(pair.datagrams(Server).recv(), None);
+    Ok(())
+}
+
+#[test]
+fn ordinary_targeted_datagrams_keep_existing_packet_coalescing() -> TestResult {
+    let _guard = subscribe();
+    let mut pair = ConnPair::builder()
+        .enable_multipath()
+        .disable_mtud_discovery()
+        .connect();
+    while pair.poll(Client).is_some() {}
+    while pair.poll(Server).is_some() {}
+
+    let before = pair.path_stats(Client, PathId::ZERO).unwrap();
+    pair.datagrams(Client).send_on_path(
+        PathId::ZERO,
+        Bytes::from_static(b"ordinary one"),
+        false,
+    )?;
+    pair.datagrams(Client).send_on_path(
+        PathId::ZERO,
+        Bytes::from_static(b"ordinary two"),
+        false,
+    )?;
+    pair.drive();
+
+    let after = pair.path_stats(Client, PathId::ZERO).unwrap();
+    assert_eq!(after.frame_tx.datagram, before.frame_tx.datagram + 2);
+    assert_eq!(after.udp_tx.datagrams, before.udp_tx.datagrams + 1);
+    Ok(())
+}
+
+#[test]
+fn separate_targeted_datagrams_use_distinct_udp_packets() -> TestResult {
+    let _guard = subscribe();
+    let mut pair = ConnPair::builder()
+        .enable_multipath()
+        .disable_mtud_discovery()
+        .connect();
+    while pair.poll(Client).is_some() {}
+    while pair.poll(Server).is_some() {}
+
+    let before = pair.path_stats(Client, PathId::ZERO).unwrap();
+    pair.datagrams(Client).send_on_path(
+        PathId::ZERO,
+        Bytes::from_static(b"ordinary before boundary"),
+        false,
+    )?;
+    pair.datagrams(Client).send_on_path_separate(
+        PathId::ZERO,
+        Bytes::from_static(b"separate one"),
+        false,
+    )?;
+    pair.datagrams(Client).send_on_path_separate(
+        PathId::ZERO,
+        Bytes::from_static(b"separate two"),
+        false,
+    )?;
+    pair.drive();
+
+    let after = pair.path_stats(Client, PathId::ZERO).unwrap();
+    assert_eq!(after.frame_tx.datagram, before.frame_tx.datagram + 3);
+    assert_eq!(after.udp_tx.datagrams, before.udp_tx.datagrams + 3);
+    Ok(())
+}
+
+#[test]
+fn targeted_datagram_rejects_unknown_unvalidated_and_closed_paths() -> TestResult {
+    let _guard = subscribe();
+    let mut pair = ConnPair::builder()
+        .enable_multipath()
+        .disable_mtud_discovery()
+        .connect();
+
+    assert_matches!(
+        pair.datagrams(Client).send_on_path(
+            PathId::MAX,
+            Bytes::from_static(b"unknown"),
+            false,
+        ),
+        Err(SendDatagramOnPathError::PathUnavailable(id)) if id == PathId::MAX
+    );
+
+    let pending = pair.open_path(
+        Client,
+        FourTuple {
+            local_ip: None,
+            remote: SocketAddr::new([9, 8, 7, 6].into(), 5),
+        },
+        PathStatus::Available,
+    )?;
+    assert_matches!(
+        pair.datagrams(Client).send_on_path(
+            pending,
+            Bytes::from_static(b"unvalidated"),
+            false,
+        ),
+        Err(SendDatagramOnPathError::PathUnavailable(id)) if id == pending
+    );
+
+    let mut closed_pair = ConnPair::builder()
+        .enable_multipath()
+        .disable_mtud_discovery()
+        .connect();
+    let closed = open_available_second_path(&mut closed_pair)?;
+    closed_pair.close_path(Client, closed, 0u8.into())?;
+    assert_matches!(
+        closed_pair.datagrams(Client).send_on_path(
+            closed,
+            Bytes::from_static(b"closed"),
+            false,
+        ),
+        Err(SendDatagramOnPathError::PathUnavailable(id)) if id == closed
+    );
+    Ok(())
+}
+
+#[test]
+fn closing_path_releases_targeted_datagrams_and_backpressure() -> TestResult {
+    let _guard = subscribe();
+    const SEND_BUFFER_SIZE: usize = 4096;
+    let mut builder = ConnPair::builder()
+        .enable_multipath()
+        .disable_mtud_discovery();
+    builder
+        .client_transport_cfg
+        .datagram_send_buffer_size(SEND_BUFFER_SIZE);
+    let mut pair = builder.connect();
+    let second = open_available_second_path(&mut pair)?;
+    let payload = Bytes::from_static(&[0x5a; 1024]);
+
+    let mut queued = 0usize;
+    loop {
+        match pair
+            .datagrams(Client)
+            .send_on_path(second, payload.clone(), false)
+        {
+            Ok(()) => queued += 1,
+            Err(SendDatagramOnPathError::Datagram(SendDatagramError::Blocked(_))) => break,
+            Err(error) => panic!("unexpected targeted DATAGRAM error: {error}"),
+        }
+    }
+    assert!(queued > 0);
+    assert!(pair.datagrams(Client).send_buffer_space() < SEND_BUFFER_SIZE);
+
+    pair.close_path(Client, second, 0u8.into())?;
+    assert_eq!(pair.datagrams(Client).send_buffer_space(), SEND_BUFFER_SIZE);
+    let mut saw_unblocked = false;
+    while let Some(event) = pair.poll(Client) {
+        saw_unblocked |= matches!(event, Event::DatagramsUnblocked);
+    }
+    assert!(
+        saw_unblocked,
+        "dropping a blocked path queue must wake the sender"
+    );
+    Ok(())
+}
+
+#[test]
+fn targeted_datagram_respects_path_congestion_window() -> TestResult {
+    let _guard = subscribe();
+    const INITIAL_WINDOW: u64 = 4 * 1200;
+    let mut congestion = NewRenoConfig::default();
+    congestion.initial_window(INITIAL_WINDOW);
+    let mut builder = ConnPair::builder()
+        .enable_multipath()
+        .disable_mtud_discovery();
+    builder
+        .client_transport_cfg
+        .congestion_controller_factory(Arc::new(congestion));
+    let mut pair = builder.connect();
+    let backup = open_available_second_path(&mut pair)?;
+    pair.set_path_status(Client, backup, PathStatus::Backup)?;
+    pair.drive();
+    while pair.poll(Client).is_some() {}
+    while pair.poll(Server).is_some() {}
+
+    let payload = Bytes::from_static(&[0x7c; 1000]);
+    for _ in 0..16 {
+        pair.datagrams(Client)
+            .send_on_path(backup, payload.clone(), false)?;
+    }
+    let before = pair.path_stats(Client, backup).unwrap();
+    pair.drive_client();
+    pair.server.inbound.clear();
+    let filled = pair.path_stats(Client, backup).unwrap();
+    let mtu = u64::from(pair.current_mtu(Client));
+    assert!(filled.frame_tx.datagram > before.frame_tx.datagram);
+    assert_eq!(filled.cwnd, INITIAL_WINDOW);
+    assert!(
+        filled.bytes_in_flight + mtu >= filled.cwnd,
+        "test must fill the backup congestion window before checking the boundary"
+    );
+
+    let sent_before_blocked_poll = filled.frame_tx.datagram;
+    let mut buf = Vec::new();
+    assert_matches!(
+        pair.poll_transmit(Client, NonZeroUsize::new(10).unwrap(), &mut buf),
+        None
+    );
+    assert_eq!(
+        pair.path_stats(Client, backup).unwrap().frame_tx.datagram,
+        sent_before_blocked_poll,
+        "targeted application data must not be emitted beyond the path congestion window"
+    );
+    Ok(())
+}
 
 fn queue_path_stats_test_data(pair: &mut ConnPair) {
     let stream = pair.streams(Client).open(Dir::Uni).unwrap();
@@ -60,6 +390,8 @@ fn recovery_pair(
         false,
         false,
         false,
+        false,
+        false,
     )
 }
 
@@ -72,6 +404,50 @@ fn recovery_pair_with_ack_progress(
     feedback_credit_snapshot: bool,
     feedback_probe: bool,
     feedback_evidence_reinjection: bool,
+    stream_obligation_progress: bool,
+    blocked_credit_handoff: bool,
+) -> TestResult<(ConnPair, PathId)> {
+    recovery_pair_with_ack_progress_service_deadline(
+        pto_reinjection,
+        abandon_reinjection,
+        ack_progress_reinjection,
+        ack_escape,
+        feedback_handoff,
+        feedback_credit_snapshot,
+        feedback_probe,
+        feedback_evidence_reinjection,
+        stream_obligation_progress,
+        blocked_credit_handoff,
+        None,
+        1,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+    )
+}
+
+fn recovery_pair_with_ack_progress_service_deadline(
+    pto_reinjection: bool,
+    abandon_reinjection: bool,
+    ack_progress_reinjection: bool,
+    ack_escape: bool,
+    feedback_handoff: bool,
+    feedback_credit_snapshot: bool,
+    feedback_probe: bool,
+    feedback_evidence_reinjection: bool,
+    stream_obligation_progress: bool,
+    blocked_credit_handoff: bool,
+    service_deadline: Option<Duration>,
+    service_recovery_flights: u32,
+    fresh_alternative: bool,
+    feedback_stability: bool,
+    alternative_stability: bool,
+    stream_progress: bool,
+    feedback_stream_progress_snapshot: bool,
+    gap_delivery_watch: bool,
 ) -> TestResult<(ConnPair, PathId)> {
     let first_client_addr = Pair::CLIENT_ADDR;
     let first_server_addr = Pair::SERVER_ADDR;
@@ -91,22 +467,44 @@ fn recovery_pair_with_ack_progress(
         .cross_path_pto_reinjection(pto_reinjection)
         .cross_path_abandon_reinjection(abandon_reinjection)
         .cross_path_ack_progress_reinjection(ack_progress_reinjection)
+        .cross_path_ack_progress_stream_obligation(stream_obligation_progress)
+        .cross_path_ack_progress_service_deadline(service_deadline)
+        .cross_path_ack_progress_service_recovery_flights(service_recovery_flights)
+        .cross_path_ack_progress_fresh_alternative(fresh_alternative)
+        .cross_path_ack_progress_feedback_stability(feedback_stability)
+        .cross_path_ack_progress_alternative_stability(alternative_stability)
         .cross_path_ack_progress_feedback_probe(feedback_probe)
         .cross_path_ack_progress_feedback_evidence_reinjection(feedback_evidence_reinjection)
         .cross_path_ack_escape(ack_escape)
         .cross_path_feedback_handoff(feedback_handoff)
         .cross_path_feedback_credit_snapshot(feedback_credit_snapshot)
+        .cross_path_feedback_stream_progress_snapshot(feedback_stream_progress_snapshot)
+        .cross_path_blocked_credit_handoff(blocked_credit_handoff)
+        .cross_path_stream_progress(stream_progress)
+        .stream_gap_watch_rescue(gap_delivery_watch)
+        .stream_gap_delivery_watch_rescue(gap_delivery_watch)
         .default_path_max_idle_timeout(Some(Duration::from_secs(60)));
     builder
         .server_transport_cfg
         .cross_path_pto_reinjection(pto_reinjection)
         .cross_path_abandon_reinjection(abandon_reinjection)
         .cross_path_ack_progress_reinjection(ack_progress_reinjection)
+        .cross_path_ack_progress_stream_obligation(stream_obligation_progress)
+        .cross_path_ack_progress_service_deadline(service_deadline)
+        .cross_path_ack_progress_service_recovery_flights(service_recovery_flights)
+        .cross_path_ack_progress_fresh_alternative(fresh_alternative)
+        .cross_path_ack_progress_feedback_stability(feedback_stability)
+        .cross_path_ack_progress_alternative_stability(alternative_stability)
         .cross_path_ack_progress_feedback_probe(feedback_probe)
         .cross_path_ack_progress_feedback_evidence_reinjection(feedback_evidence_reinjection)
         .cross_path_ack_escape(ack_escape)
         .cross_path_feedback_handoff(feedback_handoff)
         .cross_path_feedback_credit_snapshot(feedback_credit_snapshot)
+        .cross_path_feedback_stream_progress_snapshot(feedback_stream_progress_snapshot)
+        .cross_path_blocked_credit_handoff(blocked_credit_handoff)
+        .cross_path_stream_progress(stream_progress)
+        .stream_gap_watch_rescue(gap_delivery_watch)
+        .stream_gap_delivery_watch_rescue(gap_delivery_watch)
         .default_path_max_idle_timeout(Some(Duration::from_secs(60)));
     let mut pair = builder.connect();
 
@@ -135,35 +533,236 @@ fn abandon_recovery_pair(enabled: bool) -> TestResult<(ConnPair, PathId)> {
 }
 
 fn ack_progress_recovery_pair(enabled: bool) -> TestResult<(ConnPair, PathId)> {
-    recovery_pair_with_ack_progress(false, false, enabled, false, false, false, false, false)
+    recovery_pair_with_ack_progress(
+        false, false, enabled, false, false, false, false, false, false, false,
+    )
+}
+
+fn stream_obligation_recovery_pair(enabled: bool) -> TestResult<(ConnPair, PathId)> {
+    recovery_pair_with_ack_progress(
+        false, false, true, false, false, false, false, false, enabled, false,
+    )
 }
 
 fn ack_escape_recovery_pair(enabled: bool) -> TestResult<(ConnPair, PathId)> {
-    recovery_pair_with_ack_progress(false, false, true, enabled, false, false, false, false)
+    recovery_pair_with_ack_progress(
+        false, false, true, enabled, false, false, false, false, false, false,
+    )
 }
 
 fn feedback_handoff_recovery_pair() -> TestResult<(ConnPair, PathId)> {
-    recovery_pair_with_ack_progress(false, false, true, true, true, false, false, false)
+    recovery_pair_with_ack_progress(
+        false, false, true, true, true, false, false, false, false, false,
+    )
 }
 
 fn full_feedback_handoff_recovery_pair() -> TestResult<(ConnPair, PathId)> {
-    recovery_pair_with_ack_progress(true, true, true, true, true, false, false, false)
+    recovery_pair_with_ack_progress(
+        true, true, true, true, true, false, false, false, false, false,
+    )
 }
 
 fn full_feedback_snapshot_recovery_pair() -> TestResult<(ConnPair, PathId)> {
-    recovery_pair_with_ack_progress(true, true, true, true, true, true, false, false)
+    recovery_pair_with_ack_progress(
+        true, true, true, true, true, true, false, false, false, false,
+    )
 }
 
 fn feedback_probe_recovery_pair() -> TestResult<(ConnPair, PathId)> {
-    recovery_pair_with_ack_progress(false, false, true, true, true, true, true, false)
+    recovery_pair_with_ack_progress(
+        false, false, true, true, true, true, true, false, false, false,
+    )
 }
 
 fn feedback_evidence_recovery_pair() -> TestResult<(ConnPair, PathId)> {
-    recovery_pair_with_ack_progress(false, false, true, true, true, true, true, true)
+    recovery_pair_with_ack_progress(
+        false, false, true, true, true, true, true, true, false, false,
+    )
+}
+
+fn application_progress_recovery_pair() -> TestResult<(ConnPair, PathId)> {
+    recovery_pair_with_ack_progress(true, true, true, true, true, true, true, true, true, true)
+}
+
+fn application_progress_deadline_recovery_pair(
+    service_deadline: Duration,
+) -> TestResult<(ConnPair, PathId)> {
+    recovery_pair_with_ack_progress_service_deadline(
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        Some(service_deadline),
+        1,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+    )
+}
+
+fn application_progress_version_aware_recovery_pair(
+    service_deadline: Duration,
+) -> TestResult<(ConnPair, PathId)> {
+    recovery_pair_with_ack_progress_service_deadline(
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        Some(service_deadline),
+        1,
+        true,
+        false,
+        false,
+        false,
+        false,
+        false,
+    )
+}
+
+fn application_progress_multi_flight_recovery_pair(
+    service_deadline: Duration,
+) -> TestResult<(ConnPair, PathId)> {
+    recovery_pair_with_ack_progress_service_deadline(
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        Some(service_deadline),
+        3,
+        true,
+        false,
+        false,
+        true,
+        false,
+        false,
+    )
+}
+
+fn application_progress_stable_multi_flight_recovery_pair(
+    service_deadline: Duration,
+) -> TestResult<(ConnPair, PathId)> {
+    recovery_pair_with_ack_progress_service_deadline(
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        Some(service_deadline),
+        3,
+        true,
+        true,
+        false,
+        true,
+        false,
+        false,
+    )
+}
+
+fn application_progress_delivery_watch_recovery_pair(
+    service_deadline: Duration,
+) -> TestResult<(ConnPair, PathId)> {
+    recovery_pair_with_ack_progress_service_deadline(
+        false,
+        false,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        Some(service_deadline),
+        3,
+        true,
+        true,
+        false,
+        true,
+        false,
+        true,
+    )
+}
+
+fn application_progress_alternative_stability_recovery_pair(
+    service_deadline: Duration,
+) -> TestResult<(ConnPair, PathId)> {
+    recovery_pair_with_ack_progress_service_deadline(
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        Some(service_deadline),
+        3,
+        true,
+        true,
+        true,
+        true,
+        false,
+        true,
+    )
+}
+
+fn application_progress_stream_progress_snapshot_recovery_pair(
+    service_deadline: Duration,
+) -> TestResult<(ConnPair, PathId)> {
+    recovery_pair_with_ack_progress_service_deadline(
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        Some(service_deadline),
+        3,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+    )
 }
 
 fn pto_ack_escape_pair() -> TestResult<(ConnPair, PathId)> {
-    recovery_pair_with_ack_progress(true, false, false, true, false, false, false, false)
+    recovery_pair_with_ack_progress(
+        true, false, false, true, false, false, false, false, false, false,
+    )
 }
 
 fn blackhole_primary_path(pair: &mut ConnPair) -> (SocketAddr, SocketAddr) {
@@ -665,6 +1264,143 @@ fn recovery_feedback_handoff_routes_stream_credit_on_backup() -> TestResult {
     Ok(())
 }
 
+#[test]
+fn stale_stream_data_blocked_reissues_credit_on_its_arrival_path() -> TestResult {
+    let _guard = subscribe();
+    let (mut pair, backup) = application_progress_recovery_pair()?;
+    let stream = pair.streams(Client).open(Dir::Uni).unwrap();
+    let initial = vec![0x41; 200_000];
+    write_stream_data(&mut pair, stream, &initial);
+    pair.drive();
+
+    assert_matches!(pair.streams(Server).accept(Dir::Uni), Some(id) if id == stream);
+    let mut receive = pair.recv_stream(Server, stream);
+    let mut chunks = receive.read(false)?;
+    let mut read = 0usize;
+    loop {
+        match chunks.next(usize::MAX) {
+            Ok(Some(chunk)) => read += chunk.bytes.len(),
+            Err(ReadError::Blocked) => break,
+            Ok(None) => panic!("unfinished credit-escape stream unexpectedly reached FIN"),
+            Err(error) => panic!("failed reading credit-escape setup data: {error}"),
+        }
+    }
+    assert_eq!(read, initial.len());
+    assert!(chunks.finalize().should_transmit());
+
+    let server_primary_before = pair.path_stats(Server, PathId::ZERO).unwrap();
+    let server_backup_before = pair.path_stats(Server, backup).unwrap();
+    pair.drive_server();
+    let server_primary_with_credit = pair.path_stats(Server, PathId::ZERO).unwrap();
+    assert!(
+        server_primary_with_credit.frame_tx.max_stream_data
+            > server_primary_before.frame_tx.max_stream_data,
+        "the stale-credit counterexample requires MAX_STREAM_DATA on the old primary"
+    );
+    assert_eq!(
+        pair.path_stats(Server, backup)
+            .unwrap()
+            .frame_tx
+            .max_stream_data,
+        server_backup_before.frame_tx.max_stream_data
+    );
+    pair.client.inbound.clear();
+
+    blackhole_primary_path(&mut pair);
+    pair.set_path_status(Client, PathId::ZERO, PathStatus::Backup)?;
+    pair.set_path_status(Client, backup, PathStatus::Available)?;
+
+    let fill_old_limit = vec![0x52; 2_000_000];
+    let written = pair
+        .send_stream(Client, stream)
+        .write(&fill_old_limit)
+        .expect("the sender should fill its last known stream credit");
+    assert!(written > 0 && written < fill_old_limit.len());
+    pair.drive_client();
+    assert_eq!(
+        pair.send_stream(Client, stream).write(b"still blocked"),
+        Err(crate::WriteError::Blocked)
+    );
+
+    let backup_before_blocked = pair.path_stats(Server, backup).unwrap();
+    // The first backup-path flight fills the congestion window. Let its ACK return before
+    // expecting the congestion-controlled STREAM_DATA_BLOCKED signal to leave the sender.
+    pair.drive_server();
+    pair.drive_client();
+    pair.drive_server();
+    let backup_after_blocked = pair.path_stats(Server, backup).unwrap();
+    let held_credit_response = pair.client.inbound.drain(..).collect::<Vec<_>>();
+    assert!(
+        !held_credit_response.is_empty(),
+        "the first blocked signal must produce a response to hold in flight"
+    );
+    assert!(
+        backup_after_blocked.blocked_credit_handoffs
+            > backup_before_blocked.blocked_credit_handoffs
+    );
+    assert!(
+        backup_after_blocked.blocked_credit_max_stream_data_requeues
+            > backup_before_blocked.blocked_credit_max_stream_data_requeues
+    );
+    assert!(
+        backup_after_blocked.frame_tx.max_stream_data
+            > backup_before_blocked.frame_tx.max_stream_data,
+        "the arrival path of stale STREAM_DATA_BLOCKED must carry the latest credit"
+    );
+    assert_eq!(pair.path_status(Server, PathId::ZERO)?, PathStatus::Backup);
+    assert_eq!(pair.path_status(Server, backup)?, PathStatus::Available);
+
+    assert_eq!(
+        pair.send_stream(Client, stream)
+            .write(b"still blocked again"),
+        Err(crate::WriteError::Blocked)
+    );
+    pair.drive_client();
+    pair.drive_server();
+    let backup_after_duplicate = pair.path_stats(Server, backup).unwrap();
+    assert_eq!(
+        backup_after_duplicate.blocked_credit_handoffs,
+        backup_after_blocked.blocked_credit_handoffs,
+        "a credit response already in flight on this path must absorb duplicate BLOCKED signals"
+    );
+    assert_eq!(
+        backup_after_duplicate.frame_tx.max_stream_data,
+        backup_after_blocked.frame_tx.max_stream_data,
+        "normal loss recovery owns an in-flight MAX_STREAM_DATA; do not create parallel copies"
+    );
+
+    pair.client.inbound.extend(held_credit_response);
+    pair.drive_client();
+    assert_eq!(pair.send_stream(Client, stream).write(b"u"), Ok(1));
+    Ok(())
+}
+
+#[test]
+fn blocked_credit_handoff_rejects_an_unvalidated_path() -> TestResult {
+    let _guard = subscribe();
+    let (mut pair, backup) = application_progress_recovery_pair()?;
+    assert!(
+        pair.conn(Client).blocked_credit_handoff_eligible(backup),
+        "the established backup is the positive control"
+    );
+
+    let unvalidated = pair.open_path(
+        Client,
+        FourTuple {
+            remote: SocketAddr::new([9, 8, 7, 6].into(), 5),
+            local_ip: None,
+        },
+        PathStatus::Available,
+    )?;
+    assert!(
+        !pair
+            .conn(Client)
+            .blocked_credit_handoff_eligible(unvalidated),
+        "authenticated flow-control state must not be reflected onto an unvalidated path"
+    );
+    Ok(())
+}
+
 struct InFlightCreditHandoff {
     pair: ConnPair,
     backup: PathId,
@@ -777,6 +1513,132 @@ fn recovery_feedback_handoff_reissues_credit_already_in_flight_on_primary() -> T
 
     let second = vec![0x52; 1_200_000];
     write_stream_data(&mut pair, stream, &second);
+    Ok(())
+}
+
+struct InFlightStreamProgressHandoff {
+    pair: ConnPair,
+    backup: PathId,
+    stream: crate::StreamId,
+    consumed: u64,
+    backup_stream_progress_before: u64,
+}
+
+fn prepare_in_flight_stream_progress_handoff(
+    snapshot: bool,
+) -> TestResult<InFlightStreamProgressHandoff> {
+    let (mut pair, backup) = if snapshot {
+        application_progress_stream_progress_snapshot_recovery_pair(Duration::from_secs(1))?
+    } else {
+        application_progress_alternative_stability_recovery_pair(Duration::from_secs(1))?
+    };
+
+    let stream = pair.streams(Client).open(Dir::Uni).unwrap();
+    let data = vec![0x73; 8 * 1024];
+    write_stream_data(&mut pair, stream, &data);
+    pair.drive_client();
+    assert!(!pair.server.inbound.is_empty());
+    pair.drive_server();
+
+    assert_matches!(pair.streams(Server).accept(Dir::Uni), Some(id) if id == stream);
+    let mut receive = pair.recv_stream(Server, stream);
+    let mut chunks = receive.read(true)?;
+    let mut consumed = 0_u64;
+    loop {
+        match chunks.next(usize::MAX) {
+            Ok(Some(chunk)) => consumed = consumed.saturating_add(chunk.bytes.len() as u64),
+            Err(ReadError::Blocked) => break,
+            Ok(None) => panic!("unfinished progress-snapshot stream unexpectedly reached FIN"),
+            Err(error) => panic!("failed reading progress-snapshot stream: {error}"),
+        }
+    }
+    assert_eq!(consumed, data.len() as u64);
+    assert!(chunks.finalize().should_transmit());
+
+    let primary_before = pair.path_stats(Server, PathId::ZERO).unwrap();
+    let backup_before = pair.path_stats(Server, backup).unwrap();
+    pair.drive_server();
+    let primary_with_progress = pair.path_stats(Server, PathId::ZERO).unwrap();
+    assert_eq!(
+        primary_with_progress.frame_tx.stream_progress,
+        primary_before.frame_tx.stream_progress + 1,
+        "the counterexample requires the newest STREAM_PROGRESS to be owned by the old primary"
+    );
+    assert_eq!(
+        pair.path_stats(Server, backup)
+            .unwrap()
+            .frame_tx
+            .stream_progress,
+        backup_before.frame_tx.stream_progress
+    );
+    pair.client.inbound.clear();
+
+    blackhole_primary_path(&mut pair);
+    advance_client_until_hedge(&mut pair, PathId::ZERO);
+    pair.drive_server();
+    assert_eq!(pair.path_status(Server, PathId::ZERO)?, PathStatus::Backup);
+    assert_eq!(pair.path_status(Server, backup)?, PathStatus::Available);
+
+    Ok(InFlightStreamProgressHandoff {
+        pair,
+        backup,
+        stream,
+        consumed,
+        backup_stream_progress_before: backup_before.frame_tx.stream_progress,
+    })
+}
+
+#[test]
+fn historical_v6_8_does_not_snapshot_in_flight_stream_progress() -> TestResult {
+    let _guard = subscribe();
+    let mut prepared = prepare_in_flight_stream_progress_handoff(false)?;
+    assert_eq!(
+        prepared
+            .pair
+            .path_stats(Server, prepared.backup)
+            .unwrap()
+            .frame_tx
+            .stream_progress,
+        prepared.backup_stream_progress_before,
+        "v6.8 must remain reproducible without the isolated progress-snapshot switch"
+    );
+    Ok(())
+}
+
+#[test]
+fn feedback_handoff_snapshots_in_flight_stream_progress_on_backup() -> TestResult {
+    let _guard = subscribe();
+    let InFlightStreamProgressHandoff {
+        mut pair,
+        backup,
+        stream,
+        consumed,
+        backup_stream_progress_before,
+    } = prepare_in_flight_stream_progress_handoff(true)?;
+
+    assert!(
+        pair.path_stats(Server, backup)
+            .unwrap()
+            .frame_tx
+            .stream_progress
+            > backup_stream_progress_before,
+        "handoff must reissue the maximum in-flight STREAM_PROGRESS on the healthy path"
+    );
+    pair.drive_client();
+
+    let backup_after = pair.path_stats(Client, backup).unwrap();
+    assert_eq!(backup_after.stream_progress_updates, 1);
+    assert!(backup_after.stream_progress_acked_bytes <= consumed);
+    let stream_stats = pair
+        .conn_mut(Client)
+        .stats()
+        .streams
+        .into_iter()
+        .find(|stats| stats.id == stream)
+        .unwrap();
+    assert_eq!(stream_stats.send_fully_acked_offset, Some(consumed));
+    assert_eq!(stream_stats.send_unacknowledged_bytes, Some(0));
+    assert_eq!(stream_stats.send_retransmit_bytes, Some(0));
     Ok(())
 }
 
@@ -1242,6 +2104,522 @@ fn feedback_probe_reserves_one_alternative_pto_before_full_recovery() -> TestRes
 }
 
 #[test]
+fn service_deadline_reserves_alternative_recovery_budget_before_target() -> TestResult {
+    let _guard = subscribe();
+    let service_deadline = Duration::from_millis(500);
+    let (mut pair, backup) = application_progress_deadline_recovery_pair(service_deadline)?;
+    set_feedback_probe_test_rtts(&mut pair, backup);
+    let sent_at = pair.time;
+    let backup_before = pair.path_stats(Client, backup).unwrap();
+
+    let stream = pair.streams(Client).open(Dir::Uni).unwrap();
+    write_stream_data(&mut pair, stream, &[0x6d; 64 * 1024]);
+    blackhole_primary_path(&mut pair);
+    pair.drive_client();
+
+    let primary_before = pair.path_stats(Client, PathId::ZERO).unwrap();
+    let alternative_budget = backup_before.pto + TIMER_GRANULARITY;
+    let expected_full_deadline = sent_at + service_deadline.saturating_sub(alternative_budget);
+    assert!(expected_full_deadline < sent_at + primary_before.pto);
+    assert_eq!(
+        primary_before.ack_progress_full_recovery_deadline,
+        Some(expected_full_deadline)
+    );
+    assert_eq!(
+        primary_before.ack_progress_service_deadline,
+        Some(service_deadline)
+    );
+    assert_eq!(
+        primary_before.ack_progress_alternative_recovery_budget,
+        Some(alternative_budget)
+    );
+    assert!(!primary_before.ack_progress_feedback_probe_staged);
+
+    advance_client_until_feedback_probe(&mut pair, PathId::ZERO);
+    let primary_after_probe = pair.path_stats(Client, PathId::ZERO).unwrap();
+    assert!(pair.time < expected_full_deadline);
+    assert!(primary_after_probe.ack_progress_feedback_probe_staged);
+    assert_eq!(
+        pair.conn(Client)
+            .ack_progress_recovery_deadline(PathId::ZERO),
+        Some(expected_full_deadline),
+        "the staged fallback must preserve the service-budgeted complete-recovery trigger"
+    );
+    Ok(())
+}
+
+#[test]
+fn multi_flight_service_budget_reserves_three_alternative_ptos() -> TestResult {
+    let _guard = subscribe();
+    let service_deadline = Duration::from_secs(1);
+    let (mut pair, backup) = application_progress_multi_flight_recovery_pair(service_deadline)?;
+    set_feedback_probe_test_rtts(&mut pair, backup);
+    pair.time += Duration::from_millis(1);
+    pair.ping_path(Client, backup)?;
+    pair.drive();
+    let sent_at = pair.time;
+    let backup_before = pair.path_stats(Client, backup).unwrap();
+
+    let stream = pair.streams(Client).open(Dir::Uni).unwrap();
+    write_stream_data(&mut pair, stream, &[0x3f; 64 * 1024]);
+    blackhole_primary_path(&mut pair);
+    pair.drive_client();
+
+    let primary = pair.path_stats(Client, PathId::ZERO).unwrap();
+    let alternative_budget = backup_before
+        .pto
+        .saturating_mul(3)
+        .saturating_add(TIMER_GRANULARITY);
+    assert_eq!(
+        primary.ack_progress_alternative_recovery_budget,
+        Some(alternative_budget)
+    );
+    assert_eq!(
+        primary.ack_progress_full_recovery_deadline,
+        Some(
+            (sent_at + primary.pto)
+                .min(sent_at + service_deadline.saturating_sub(alternative_budget)),
+        )
+    );
+    Ok(())
+}
+
+#[test]
+fn feedback_stability_gate_eventually_recovers_a_silent_source() -> TestResult {
+    let _guard = subscribe();
+    let service_deadline = Duration::from_millis(100);
+    let (mut pair, backup) =
+        application_progress_stable_multi_flight_recovery_pair(service_deadline)?;
+    set_feedback_probe_test_rtts(&mut pair, backup);
+    pair.time += Duration::from_millis(1);
+    pair.ping_path(Client, backup)?;
+    pair.drive();
+
+    let stream = pair.streams(Client).open(Dir::Uni).unwrap();
+    write_stream_data(&mut pair, stream, &[0x5a; 64 * 1024]);
+    blackhole_primary_path(&mut pair);
+    pair.drive_client();
+
+    let primary = pair.path_stats(Client, PathId::ZERO).unwrap();
+    let stability_deadline = pair
+        .conn(Client)
+        .ack_progress_feedback_stability_deadline_for_test(PathId::ZERO)
+        .expect("the isolated v6.6 variant must expose a source-feedback stability floor");
+    assert!(
+        primary
+            .ack_progress_full_recovery_deadline
+            .is_some_and(|deadline| deadline <= stability_deadline),
+        "the short service target should make feedback stability the active safety floor"
+    );
+    assert_eq!(
+        pair.conn(Client)
+            .ack_progress_recovery_deadline(PathId::ZERO),
+        Some(stability_deadline)
+    );
+
+    pair.time = stability_deadline;
+    pair.drive_client();
+    let recovered = pair.path_stats(Client, PathId::ZERO).unwrap();
+    assert_eq!(recovered.ack_progress_feedback_probe_timeouts, 0);
+    assert_eq!(recovered.ack_progress_feedback_probes, 0);
+    assert_eq!(recovered.ack_progress_recovery_timeouts, 1);
+    assert_eq!(recovered.ack_progress_recovery_attempts, 1);
+    assert_eq!(recovered.ack_progress_reinjections, 1);
+    assert!(recovered.ack_progress_reinjected_bytes > 0);
+    Ok(())
+}
+
+#[test]
+fn feedback_stability_gate_blocks_transient_reverse_recovery() -> TestResult {
+    let _guard = subscribe();
+    let (mut pair, backup) =
+        application_progress_stable_multi_flight_recovery_pair(Duration::from_millis(100))?;
+    set_feedback_probe_test_rtts(&mut pair, backup);
+    pair.set_path_status(Client, PathId::ZERO, PathStatus::Backup)?;
+    pair.set_path_status(Client, backup, PathStatus::Available)?;
+    pair.drive();
+
+    deliver_primary_stream_and_drop_ack(
+        &mut pair,
+        b"healthy secondary data must not recover toward a stale primary",
+    )?;
+    assert!(
+        pair.path_stats(Client, backup)
+            .unwrap()
+            .ack_progress_stream_frames_in_flight
+            > 0,
+        "the healthy secondary must retain an ACK-progress obligation for the race"
+    );
+
+    // Model the v6.5 inversion: a delayed authenticated packet makes the stale primary appear
+    // one tick newer than the healthy secondary, so version ordering alone arms reverse recovery.
+    let source_feedback = pair.time;
+    pair.conn_mut(Client)
+        .set_test_path_last_authenticated_at(backup, source_feedback);
+    pair.time += Duration::from_millis(1);
+    let inversion_time = pair.time;
+    pair.conn_mut(Client)
+        .set_test_path_last_authenticated_at(PathId::ZERO, inversion_time);
+    pair.conn_mut(Client)
+        .rearm_ack_progress_recovery_for_test(inversion_time, backup);
+    assert_eq!(
+        pair.conn(Client)
+            .ack_progress_recovery_alternative_for_test(backup),
+        Some(PathId::ZERO)
+    );
+
+    let stale_timer_deadline = pair
+        .conn(Client)
+        .ack_progress_recovery_deadline(backup)
+        .expect("the transient version inversion should arm a guarded timer");
+    assert_eq!(
+        pair.conn(Client)
+            .ack_progress_feedback_stability_deadline_for_test(backup),
+        Some(stale_timer_deadline)
+    );
+
+    // Refresh the secondary just before the already queued wakeup, then let one delayed primary
+    // packet keep the version ordering inverted at that exact instant. The timeout must recheck
+    // silence before incrementing counters, probing, or reinjecting.
+    pair.time = stale_timer_deadline - Duration::from_millis(1);
+    let refreshed_source_time = pair.time;
+    pair.conn_mut(Client)
+        .set_test_path_last_authenticated_at(backup, refreshed_source_time);
+    pair.time += Duration::from_millis(1);
+    let delayed_primary_time = pair.time;
+    pair.conn_mut(Client)
+        .set_test_path_last_authenticated_at(PathId::ZERO, delayed_primary_time);
+    pair.time += Duration::from_millis(1);
+    let stale_wakeup_time = pair.time;
+    pair.conn_mut(Client)
+        .fire_ack_progress_recovery_timeout_for_test(stale_wakeup_time, backup);
+
+    let guarded = pair.path_stats(Client, backup).unwrap();
+    assert_eq!(guarded.ack_progress_feedback_probe_timeouts, 0);
+    assert_eq!(guarded.ack_progress_feedback_probes, 0);
+    assert_eq!(guarded.ack_progress_recovery_timeouts, 0);
+    assert_eq!(guarded.ack_progress_recovery_attempts, 0);
+    assert_eq!(guarded.ack_progress_reinjections, 0);
+    let refreshed_deadline = pair
+        .conn(Client)
+        .ack_progress_feedback_stability_deadline_for_test(backup)
+        .unwrap();
+    assert_eq!(
+        pair.conn(Client).ack_progress_recovery_deadline(backup),
+        Some(refreshed_deadline)
+    );
+    assert!(refreshed_deadline > stale_timer_deadline);
+
+    // The next healthy-secondary feedback version becomes newest and removes the reverse target
+    // altogether. Production authenticated-packet handling performs this same timer refresh.
+    pair.time += Duration::from_millis(1);
+    let newest_secondary_time = pair.time;
+    pair.conn_mut(Client)
+        .set_test_path_last_authenticated_at(backup, newest_secondary_time);
+    pair.conn_mut(Client)
+        .rearm_ack_progress_recovery_for_test(newest_secondary_time, backup);
+    assert_eq!(
+        pair.conn(Client)
+            .ack_progress_recovery_alternative_for_test(backup),
+        None
+    );
+    assert_eq!(
+        pair.conn(Client).ack_progress_recovery_deadline(backup),
+        None
+    );
+    let final_stats = pair.path_stats(Client, backup).unwrap();
+    assert_eq!(final_stats.ack_progress_feedback_probes, 0);
+    assert_eq!(final_stats.ack_progress_reinjections, 0);
+    Ok(())
+}
+
+#[test]
+fn alternative_stability_gate_rejects_an_isolated_delayed_target_packet() -> TestResult {
+    let _guard = subscribe();
+    let (mut pair, backup) =
+        application_progress_alternative_stability_recovery_pair(Duration::from_millis(100))?;
+    set_feedback_probe_test_rtts(&mut pair, backup);
+    pair.set_path_status(Client, PathId::ZERO, PathStatus::Backup)?;
+    pair.set_path_status(Client, backup, PathStatus::Available)?;
+    pair.drive();
+
+    deliver_primary_stream_and_drop_ack(
+        &mut pair,
+        b"one delayed primary packet must not prove a continuously healthy recovery target",
+    )?;
+    assert!(
+        pair.path_stats(Client, backup)
+            .unwrap()
+            .ack_progress_stream_frames_in_flight
+            > 0
+    );
+
+    let source_feedback = pair.time;
+    pair.conn_mut(Client)
+        .set_test_path_last_authenticated_at(backup, source_feedback);
+    pair.time += Duration::from_millis(1);
+    let isolated_target_feedback = pair.time;
+    pair.conn_mut(Client)
+        .set_test_path_last_authenticated_at(PathId::ZERO, isolated_target_feedback);
+    pair.conn_mut(Client)
+        .rearm_ack_progress_recovery_for_test(isolated_target_feedback, backup);
+
+    assert_eq!(
+        pair.conn(Client)
+            .ack_progress_alternative_candidate_for_test(backup),
+        Some((PathId::ZERO, isolated_target_feedback))
+    );
+    let source_stability_deadline = pair
+        .conn(Client)
+        .ack_progress_feedback_stability_deadline_for_test(backup)
+        .unwrap();
+    let alternative_stability_deadline = pair
+        .conn(Client)
+        .ack_progress_alternative_stability_deadline_for_test(backup)
+        .unwrap();
+    assert!(source_stability_deadline < alternative_stability_deadline);
+    assert_eq!(
+        pair.conn(Client).ack_progress_recovery_deadline(backup),
+        Some(alternative_stability_deadline)
+    );
+
+    // Source silence is already stable here. Only the new target-continuity gate prevents the
+    // isolated delayed primary packet from causing reverse probing or reinjection.
+    pair.time = alternative_stability_deadline - Duration::from_millis(1);
+    let guarded_wakeup = pair.time;
+    pair.conn_mut(Client)
+        .fire_ack_progress_recovery_timeout_for_test(guarded_wakeup, backup);
+    let guarded = pair.path_stats(Client, backup).unwrap();
+    assert_eq!(guarded.ack_progress_feedback_probe_timeouts, 0);
+    assert_eq!(guarded.ack_progress_feedback_probes, 0);
+    assert_eq!(guarded.ack_progress_recovery_timeouts, 0);
+    assert_eq!(guarded.ack_progress_recovery_attempts, 0);
+    assert_eq!(guarded.ack_progress_reinjections, 0);
+    assert_eq!(
+        pair.conn(Client).ack_progress_recovery_deadline(backup),
+        Some(alternative_stability_deadline)
+    );
+
+    // The healthy secondary refreshes before the candidate interval completes. It becomes newest,
+    // which must erase both the candidate and the guarded reverse timer.
+    pair.time += Duration::from_millis(1);
+    let healthy_source_feedback = pair.time;
+    pair.conn_mut(Client)
+        .set_test_path_last_authenticated_at(backup, healthy_source_feedback);
+    pair.conn_mut(Client)
+        .rearm_ack_progress_recovery_for_test(healthy_source_feedback, backup);
+    assert_eq!(
+        pair.conn(Client)
+            .ack_progress_recovery_alternative_for_test(backup),
+        None
+    );
+    assert_eq!(
+        pair.conn(Client)
+            .ack_progress_alternative_candidate_for_test(backup),
+        None
+    );
+    assert_eq!(
+        pair.conn(Client).ack_progress_recovery_deadline(backup),
+        None
+    );
+    let cancelled = pair.path_stats(Client, backup).unwrap();
+    assert_eq!(cancelled.ack_progress_feedback_probes, 0);
+    assert_eq!(cancelled.ack_progress_reinjections, 0);
+    Ok(())
+}
+
+#[test]
+fn alternative_stability_candidate_does_not_slide_and_recovers_a_blackhole() -> TestResult {
+    let _guard = subscribe();
+    let (mut pair, backup) =
+        application_progress_alternative_stability_recovery_pair(Duration::from_millis(100))?;
+    set_feedback_probe_test_rtts(&mut pair, backup);
+
+    let stream = pair.streams(Client).open(Dir::Uni).unwrap();
+    write_stream_data(&mut pair, stream, &[0x68; 64 * 1024]);
+    blackhole_primary_path(&mut pair);
+    pair.drive_client();
+    assert!(
+        pair.path_stats(Client, PathId::ZERO)
+            .unwrap()
+            .ack_progress_stream_frames_in_flight
+            > 0
+    );
+
+    let source_feedback = pair.time;
+    pair.conn_mut(Client)
+        .set_test_path_last_authenticated_at(PathId::ZERO, source_feedback);
+    pair.time += Duration::from_millis(1);
+    let candidate_since = pair.time;
+    pair.conn_mut(Client)
+        .set_test_path_last_authenticated_at(backup, candidate_since);
+    pair.conn_mut(Client)
+        .rearm_ack_progress_recovery_for_test(candidate_since, PathId::ZERO);
+    assert_eq!(
+        pair.conn(Client)
+            .ack_progress_recovery_alternative_for_test(PathId::ZERO),
+        Some(backup)
+    );
+    assert_eq!(
+        pair.conn(Client)
+            .ack_progress_alternative_candidate_for_test(PathId::ZERO),
+        Some((backup, candidate_since))
+    );
+    let first_candidate_deadline = pair
+        .conn(Client)
+        .ack_progress_alternative_stability_deadline_for_test(PathId::ZERO)
+        .unwrap();
+
+    // More authenticated packets on the same healthy target prove continuity. They must not move
+    // candidate_since and turn sustained health into a perpetually receding deadline.
+    pair.time += Duration::from_millis(5);
+    let later_candidate_feedback = pair.time;
+    pair.conn_mut(Client)
+        .set_test_path_last_authenticated_at(backup, later_candidate_feedback);
+    pair.conn_mut(Client)
+        .rearm_ack_progress_recovery_for_test(later_candidate_feedback, PathId::ZERO);
+    assert_eq!(
+        pair.conn(Client)
+            .ack_progress_alternative_candidate_for_test(PathId::ZERO),
+        Some((backup, candidate_since))
+    );
+    assert_eq!(
+        pair.conn(Client)
+            .ack_progress_alternative_stability_deadline_for_test(PathId::ZERO),
+        Some(first_candidate_deadline)
+    );
+
+    let recovery_deadline = pair
+        .conn(Client)
+        .ack_progress_recovery_deadline(PathId::ZERO)
+        .unwrap();
+    assert!(recovery_deadline >= first_candidate_deadline);
+    pair.time = recovery_deadline;
+    pair.conn_mut(Client)
+        .fire_ack_progress_recovery_timeout_for_test(recovery_deadline, PathId::ZERO);
+
+    let recovered = pair.path_stats(Client, PathId::ZERO).unwrap();
+    assert_eq!(recovered.ack_progress_feedback_probe_timeouts, 0);
+    assert_eq!(recovered.ack_progress_feedback_probes, 0);
+    assert_eq!(recovered.ack_progress_recovery_timeouts, 1);
+    assert_eq!(recovered.ack_progress_recovery_attempts, 1);
+    assert_eq!(recovered.ack_progress_reinjections, 1);
+    assert!(recovered.ack_progress_reinjected_bytes > 0);
+    Ok(())
+}
+
+#[test]
+fn delivery_gap_watch_rescues_a_packetized_obligation_only_once() -> TestResult {
+    let _guard = subscribe();
+    let (mut pair, backup) =
+        application_progress_delivery_watch_recovery_pair(Duration::from_secs(1))?;
+    pair.set_path_status(Client, PathId::ZERO, PathStatus::Backup)?;
+    pair.set_path_status(Client, backup, PathStatus::Available)?;
+    pair.drive();
+
+    let stream = deliver_primary_stream_and_drop_ack(
+        &mut pair,
+        b"delivery watch must survive retransmit packetization",
+    )?;
+    assert!(
+        pair.path_stats(Client, backup)
+            .unwrap()
+            .ack_progress_stream_frames_in_flight
+            > 0
+    );
+
+    // The healthy backup is the newest feedback path, so recovery must stay on-path even while
+    // the older primary remains structurally open.
+    let primary_version = pair.time;
+    pair.conn_mut(Client)
+        .set_test_path_last_authenticated_at(PathId::ZERO, primary_version);
+    pair.time += Duration::from_millis(1);
+    let backup_version = pair.time;
+    pair.conn_mut(Client)
+        .set_test_path_last_authenticated_at(backup, backup_version);
+    assert_eq!(
+        pair.conn(Client)
+            .ack_progress_recovery_alternative_for_test(backup),
+        None
+    );
+
+    let before = pair.path_stats(Client, backup).unwrap();
+    pair.conn_mut(Client)
+        .set_stream_gap_watch_for_test(backup, (stream, 0));
+    pair.conn_mut(Client)
+        .fire_stream_gap_watch_timeout_for_test(backup_version, backup);
+    let armed = pair.path_stats(Client, backup).unwrap();
+    assert_eq!(
+        armed.stream_gap_rescue_probes,
+        before.stream_gap_rescue_probes + 1
+    );
+    assert!(armed.stream_gap_rescue_bytes > before.stream_gap_rescue_bytes);
+
+    pair.drive_client();
+    let sent = pair.path_stats(Client, backup).unwrap();
+    assert!(
+        sent.frame_tx.stream_retransmit_bytes > before.frame_tx.stream_retransmit_bytes,
+        "the delivery rescue must packetize another copy on the healthy path"
+    );
+
+    pair.conn_mut(Client)
+        .set_stream_gap_watch_for_test(backup, (stream, 0));
+    let second_timeout = pair.time;
+    pair.conn_mut(Client)
+        .fire_stream_gap_watch_timeout_for_test(second_timeout, backup);
+    let bounded = pair.path_stats(Client, backup).unwrap();
+    assert_eq!(
+        bounded.stream_gap_rescue_probes,
+        armed.stream_gap_rescue_probes
+    );
+    assert_eq!(
+        bounded.stream_gap_rescue_bytes,
+        armed.stream_gap_rescue_bytes
+    );
+    Ok(())
+}
+
+#[test]
+fn version_aware_recovery_only_moves_toward_newer_authenticated_feedback() -> TestResult {
+    let _guard = subscribe();
+    let service_deadline = Duration::from_secs(1);
+
+    let (mut historical, historical_backup) =
+        application_progress_deadline_recovery_pair(service_deadline)?;
+    historical.time += Duration::from_millis(1);
+    historical.ping_path(Client, historical_backup)?;
+    historical.drive();
+    assert_eq!(
+        historical
+            .conn(Client)
+            .ack_progress_recovery_alternative_for_test(historical_backup),
+        Some(PathId::ZERO),
+        "the recorded v6.2 behavior must remain reproducible without the freshness switch"
+    );
+
+    let (mut version_aware, backup) =
+        application_progress_version_aware_recovery_pair(service_deadline)?;
+    version_aware.time += Duration::from_millis(1);
+    version_aware.ping_path(Client, backup)?;
+    version_aware.drive();
+    assert_eq!(
+        version_aware
+            .conn(Client)
+            .ack_progress_recovery_alternative_for_test(PathId::ZERO),
+        Some(backup),
+        "the stale primary may recover toward the path with newer authenticated feedback"
+    );
+    assert_eq!(
+        version_aware
+            .conn(Client)
+            .ack_progress_recovery_alternative_for_test(backup),
+        None,
+        "the freshest path must not send deadline-driven recovery back toward a stale route"
+    );
+    Ok(())
+}
+
+#[test]
 fn feedback_probe_ack_cancels_full_snapshot_of_already_delivered_data() -> TestResult {
     let _guard = subscribe();
     let (mut pair, backup) = feedback_probe_recovery_pair()?;
@@ -1501,6 +2879,164 @@ fn new_ack_progress_resets_the_recovery_deadline() -> TestResult {
     assert_eq!(
         reset_deadline,
         pair.time + pair.path_stats(Client, PathId::ZERO).unwrap().pto
+    );
+    Ok(())
+}
+
+fn deliver_later_same_stream_packet_and_observe_deadline(
+    stream_obligation_progress: bool,
+) -> TestResult<(crate::Instant, crate::Instant)> {
+    let (mut pair, _backup) = stream_obligation_recovery_pair(stream_obligation_progress)?;
+    let stream = pair.streams(Client).open(Dir::Uni).unwrap();
+
+    write_stream_data(&mut pair, stream, b"hold the oldest stream range");
+    pair.drive_client();
+    let held_oldest = pair.server.inbound.drain(..).collect::<Vec<_>>();
+    assert!(!held_oldest.is_empty());
+    let first_deadline = pair
+        .conn(Client)
+        .ack_progress_recovery_deadline(PathId::ZERO)
+        .unwrap();
+    if stream_obligation_progress {
+        assert_eq!(
+            pair.conn(Client)
+                .ack_progress_stream_obligation(PathId::ZERO),
+            Some((stream, 0))
+        );
+    }
+
+    let pto = pair.path_stats(Client, PathId::ZERO).unwrap().pto;
+    pair.time += pto / 4;
+    write_stream_data(&mut pair, stream, b"ack this later range out of order");
+    pair.drive_client();
+    let later = pair.server.inbound.drain(..).collect::<Vec<_>>();
+    assert!(!later.is_empty());
+    deliver_inbound_group(&mut pair, later);
+
+    let deadline_after_later_ack = pair
+        .conn(Client)
+        .ack_progress_recovery_deadline(PathId::ZERO)
+        .expect("the held oldest range must keep recovery armed");
+    if stream_obligation_progress {
+        assert_eq!(
+            pair.conn(Client)
+                .ack_progress_stream_obligation(PathId::ZERO),
+            Some((stream, 0)),
+            "an ACK for a later range must not change the retained obligation identity"
+        );
+    }
+
+    Ok((first_deadline, deadline_after_later_ack))
+}
+
+#[test]
+fn retained_stream_obligation_ignores_later_packet_ack_progress() -> TestResult {
+    let _guard = subscribe();
+    let (historical_deadline, historical_after_ack) =
+        deliver_later_same_stream_packet_and_observe_deadline(false)?;
+    assert!(
+        historical_after_ack > historical_deadline,
+        "the historical packet-level epoch must remain reproducible"
+    );
+
+    let (obligation_deadline, obligation_after_ack) =
+        deliver_later_same_stream_packet_and_observe_deadline(true)?;
+    assert_eq!(
+        obligation_after_ack, obligation_deadline,
+        "later packet ACKs must not postpone the same oldest STREAM obligation"
+    );
+    Ok(())
+}
+
+#[test]
+fn newly_exposed_stream_obligation_keeps_its_original_send_age() -> TestResult {
+    let _guard = subscribe();
+    let (mut pair, _backup) = stream_obligation_recovery_pair(true)?;
+
+    let first = pair.streams(Client).open(Dir::Uni).unwrap();
+    write_stream_data(&mut pair, first, b"ack the first obligation later");
+    pair.drive_client();
+    let first_packets = pair.server.inbound.drain(..).collect::<Vec<_>>();
+    assert!(!first_packets.is_empty());
+
+    let pto = pair.path_stats(Client, PathId::ZERO).unwrap().pto;
+    pair.time += pto / 4;
+    let second_sent = pair.time;
+    let second = pair.streams(Client).open(Dir::Uni).unwrap();
+    write_stream_data(
+        &mut pair,
+        second,
+        b"this obligation is already aging while hidden",
+    );
+    pair.drive_client();
+    let held_second_packets = pair.server.inbound.drain(..).collect::<Vec<_>>();
+    assert!(!held_second_packets.is_empty());
+    assert_eq!(
+        pair.conn(Client)
+            .ack_progress_stream_obligation(PathId::ZERO),
+        Some((first, 0))
+    );
+
+    pair.time += pto / 4;
+    deliver_inbound_group(&mut pair, first_packets);
+
+    let current_pto = pair.path_stats(Client, PathId::ZERO).unwrap().pto;
+    let deadline = pair
+        .conn(Client)
+        .ack_progress_recovery_deadline(PathId::ZERO)
+        .expect("the already-sent second obligation must keep recovery armed");
+    assert_eq!(
+        pair.conn(Client)
+            .ack_progress_stream_obligation(PathId::ZERO),
+        Some((second, 0))
+    );
+    assert_eq!(
+        deadline,
+        second_sent + current_pto,
+        "revealing an older retained obligation must not restart its age at ACK arrival"
+    );
+    assert!(deadline < pair.time + current_pto);
+    Ok(())
+}
+
+#[test]
+fn alternative_copy_ack_refreshes_the_original_path_obligation() -> TestResult {
+    let _guard = subscribe();
+    let (mut pair, backup) = application_progress_recovery_pair()?;
+    set_feedback_probe_test_rtts(&mut pair, backup);
+
+    let stream = pair.streams(Client).open(Dir::Uni).unwrap();
+    write_stream_data(
+        &mut pair,
+        stream,
+        b"only the alternative-path copy reaches the receiver",
+    );
+    blackhole_primary_path(&mut pair);
+    pair.drive_client();
+    assert_eq!(
+        pair.conn(Client)
+            .ack_progress_stream_obligation(PathId::ZERO),
+        Some((stream, 0))
+    );
+
+    advance_client_until_feedback_probe(&mut pair, PathId::ZERO);
+    pair.drive_server();
+    assert!(
+        !pair.client.inbound.is_empty(),
+        "the alternative-path copy should produce same-path acknowledgment traffic"
+    );
+    pair.drive_client();
+
+    assert_eq!(
+        pair.conn(Client)
+            .ack_progress_stream_obligation(PathId::ZERO),
+        None,
+        "ACKing a retransmitted copy must retire stale original-path obligation metadata"
+    );
+    assert!(
+        pair.conn(Client)
+            .ack_progress_recovery_deadline(PathId::ZERO)
+            .is_none()
     );
     Ok(())
 }

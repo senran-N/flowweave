@@ -281,11 +281,21 @@ impl<'a> SendStream<'a> {
                 stream.connection_blocked = true;
                 self.state.connection_blocked.push(self.id);
             }
+            if self.state.max_data == self.state.data_sent {
+                self.pending.data_blocked = true;
+            }
             return Err(WriteError::Blocked);
         }
 
         let was_pending = stream.is_pending();
-        let written = stream.write(source, limit)?;
+        let written = match stream.write(source, limit) {
+            Ok(written) => written,
+            Err(WriteError::Blocked) => {
+                self.pending.stream_data_blocked.insert(self.id);
+                return Err(WriteError::Blocked);
+            }
+            Err(error) => return Err(error),
+        };
         self.state.data_sent += written.bytes as u64;
         self.state.unacked_data += written.bytes as u64;
         trace!(stream = %self.id, "wrote {} bytes", written.bytes);

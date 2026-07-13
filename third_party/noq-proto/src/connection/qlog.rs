@@ -703,6 +703,16 @@ impl ToQlog for frame::MaxData {
 }
 
 #[cfg(feature = "qlog")]
+impl ToQlog for frame::DataBlocked {
+    fn to_qlog(&self) -> QuicFrame {
+        QuicFrame::DataBlocked {
+            limit: self.0,
+            raw: None,
+        }
+    }
+}
+
+#[cfg(feature = "qlog")]
 impl ToQlog for frame::MaxPathId {
     fn to_qlog(&self) -> QuicFrame {
         QuicFrame::MaxPathId {
@@ -718,6 +728,27 @@ impl ToQlog for frame::MaxStreamData {
         QuicFrame::MaxStreamData {
             stream_id: self.id.into(),
             maximum: self.offset,
+            raw: None,
+        }
+    }
+}
+
+#[cfg(feature = "qlog")]
+impl ToQlog for frame::StreamDataBlocked {
+    fn to_qlog(&self) -> QuicFrame {
+        QuicFrame::StreamDataBlocked {
+            stream_id: self.id.into(),
+            limit: self.offset,
+            raw: None,
+        }
+    }
+}
+
+#[cfg(feature = "qlog")]
+impl ToQlog for frame::StreamProgress {
+    fn to_qlog(&self) -> QuicFrame {
+        QuicFrame::Unknown {
+            frame_type_bytes: Some(frame::FrameType::StreamProgress.to_u64()),
             raw: None,
         }
     }
@@ -1046,6 +1077,7 @@ impl Frame {
                     raw: None,
                 }
             }
+            Self::StreamProgress(progress) => progress.to_qlog(),
             Self::StreamsBlocked(StreamsBlocked { dir, limit }) => QuicFrame::StreamsBlocked {
                 stream_type: (*dir).into(),
                 limit: *limit,

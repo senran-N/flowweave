@@ -13,6 +13,7 @@ use std::{
 use noq::{
     ClientConfig, Connection, ConnectionError, Endpoint, FourTuple, Path, PathError, PathId,
     PathStats, PathStatus, ServerConfig, StreamId, TransportConfig,
+    congestion::{Bbr3Config, CubicConfig},
     rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer},
 };
 use tokio::{
@@ -21,11 +22,66 @@ use tokio::{
     time::{sleep, timeout},
 };
 
+mod b_ingress;
+mod hysteria;
+mod proxy;
+mod realtime;
+mod realtime_controller;
+mod realtime_v3;
 mod scheduler;
+pub use b_ingress::{
+    BIngressSmokeReport, run_b_ingress_observability_controller,
+    run_b_ingress_observability_receiver, run_b_ingress_shaper_calibration,
+};
+pub use hysteria::{
+    HysteriaCongestion, HysteriaFailoverConfig, HysteriaFailoverReport, HysteriaLine,
+    HysteriaRealtimeConfig, HysteriaRealtimeReport, HysteriaThroughputConfig,
+    HysteriaThroughputReport, run_hysteria_failover, run_hysteria_realtime,
+    run_hysteria_throughput, verify_hysteria_binary,
+};
+pub use proxy::{
+    ProxyClientConfig, ProxyRuntime, ProxyServerConfig, run_proxy_client, run_proxy_server,
+    start_proxy_client, start_proxy_server,
+};
+pub use realtime::{
+    RealtimeDatagramConfig, RealtimeDatagramReport, run_batched_duplication_realtime,
+};
+pub use realtime_controller::{
+    RealtimeControllerGateConfig, RealtimeControllerGateReport, run_realtime_controller_gate,
+};
+pub use realtime_v3::{
+    RealtimeV3WireConfig, RealtimeV3WireReport, RealtimeV4Config, RealtimeV4Report,
+    RealtimeV12Config, RealtimeV12Report, run_v3_wire_latency_probe, run_v4_bbr3_coding_realtime,
+    run_v12_bbr3_two_of_three_realtime,
+};
 pub use scheduler::MultipathScheduler;
 
 pub type LabError = Box<dyn Error + Send + Sync + 'static>;
 pub type LabResult<T> = Result<T, LabError>;
+
+// Real local MPQUIC tests share loopback sockets, timers, and several Tokio runtimes. Running
+// them concurrently can stall a 10 ms realtime generator beyond its deliberately narrow wire
+// timestamp range, which tests host scheduling rather than transport behavior.
+#[cfg(test)]
+pub(crate) static LOCAL_NETWORK_TEST_LOCK: tokio::sync::Mutex<()> =
+    tokio::sync::Mutex::const_new(());
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuicCongestion {
+    Cubic,
+    Bbr3,
+}
+
+impl QuicCongestion {
+    pub const ALL: [Self; 2] = [Self::Cubic, Self::Bbr3];
+
+    pub const fn description(self) -> &'static str {
+        match self {
+            Self::Cubic => "Cubic",
+            Self::Bbr3 => "BBR3",
+        }
+    }
+}
 
 const MAGIC: &[u8; 4] = b"FWL1";
 const FAILOVER_MAGIC: &[u8; 4] = b"FWP1";
@@ -50,6 +106,8 @@ const DATAGRAM_SEND_INTERVAL: Duration = Duration::from_millis(5);
 const DATAGRAM_RECEIVE_GRACE: Duration = Duration::from_millis(1_500);
 const MAX_SUSTAINED_WARMUP: Duration = Duration::from_secs(30);
 const MAX_SUSTAINED_MEASUREMENT: Duration = Duration::from_secs(120);
+const DECLARED_EPOCH_COHORT_DURATION: Duration = Duration::from_millis(250);
+const DECLARED_EPOCH_SETTLE_WAIT: Duration = Duration::from_millis(1_500);
 const LINE_ONE_IP: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 1);
 const LINE_TWO_IP: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 2);
 
@@ -98,6 +156,15 @@ pub enum PtoRecovery {
     CrossPathRecoveryWithFeedbackEvidence,
     CrossPathRecoveryWithFeedbackEvidenceAndGapRescue,
     CrossPathRecoveryWithFeedbackEvidenceAndGapWatch,
+    CrossPathRecoveryWithApplicationProgressWatch,
+    CrossPathRecoveryWithApplicationProgressDeadline,
+    CrossPathRecoveryWithVersionAwareDeadline,
+    CrossPathRecoveryWithStreamProgress,
+    CrossPathRecoveryWithMultiFlightBudget,
+    CrossPathRecoveryWithStableMultiFlightBudget,
+    CrossPathRecoveryWithDeliveryGapWatch,
+    CrossPathRecoveryWithAlternativeStability,
+    CrossPathRecoveryWithStreamProgressSnapshot,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -154,6 +221,33 @@ impl PtoRecovery {
             Self::CrossPathRecoveryWithFeedbackEvidenceAndGapWatch => {
                 "FlowWeave 证据恢复 + 稳定缺口计时救援"
             }
+            Self::CrossPathRecoveryWithApplicationProgressWatch => {
+                "FlowWeave 应用义务时钟 + 阻塞信用逃生"
+            }
+            Self::CrossPathRecoveryWithApplicationProgressDeadline => {
+                "FlowWeave 应用义务时钟 + 服务截止预算"
+            }
+            Self::CrossPathRecoveryWithVersionAwareDeadline => {
+                "FlowWeave 应用义务时钟 + 版本感知服务预算"
+            }
+            Self::CrossPathRecoveryWithStreamProgress => {
+                "FlowWeave 版本感知服务预算 + 数据级流进度"
+            }
+            Self::CrossPathRecoveryWithMultiFlightBudget => {
+                "FlowWeave 数据级流进度 + 三航次服务预算"
+            }
+            Self::CrossPathRecoveryWithStableMultiFlightBudget => {
+                "FlowWeave 三航次服务预算 + 认证反馈稳定门控"
+            }
+            Self::CrossPathRecoveryWithDeliveryGapWatch => {
+                "FlowWeave 认证反馈稳定门控 + 重传交付缺口监视"
+            }
+            Self::CrossPathRecoveryWithAlternativeStability => {
+                "FlowWeave 重传交付缺口监视 + 替代目标持续领先门控"
+            }
+            Self::CrossPathRecoveryWithStreamProgressSnapshot => {
+                "FlowWeave 替代目标持续领先门控 + 在途流进度快照"
+            }
         }
     }
 
@@ -170,6 +264,15 @@ impl PtoRecovery {
                 | Self::CrossPathRecoveryWithFeedbackEvidence
                 | Self::CrossPathRecoveryWithFeedbackEvidenceAndGapRescue
                 | Self::CrossPathRecoveryWithFeedbackEvidenceAndGapWatch
+                | Self::CrossPathRecoveryWithApplicationProgressWatch
+                | Self::CrossPathRecoveryWithApplicationProgressDeadline
+                | Self::CrossPathRecoveryWithVersionAwareDeadline
+                | Self::CrossPathRecoveryWithStreamProgress
+                | Self::CrossPathRecoveryWithMultiFlightBudget
+                | Self::CrossPathRecoveryWithStableMultiFlightBudget
+                | Self::CrossPathRecoveryWithDeliveryGapWatch
+                | Self::CrossPathRecoveryWithAlternativeStability
+                | Self::CrossPathRecoveryWithStreamProgressSnapshot
         )
     }
 
@@ -185,6 +288,15 @@ impl PtoRecovery {
                 | Self::CrossPathRecoveryWithFeedbackEvidence
                 | Self::CrossPathRecoveryWithFeedbackEvidenceAndGapRescue
                 | Self::CrossPathRecoveryWithFeedbackEvidenceAndGapWatch
+                | Self::CrossPathRecoveryWithApplicationProgressWatch
+                | Self::CrossPathRecoveryWithApplicationProgressDeadline
+                | Self::CrossPathRecoveryWithVersionAwareDeadline
+                | Self::CrossPathRecoveryWithStreamProgress
+                | Self::CrossPathRecoveryWithMultiFlightBudget
+                | Self::CrossPathRecoveryWithStableMultiFlightBudget
+                | Self::CrossPathRecoveryWithDeliveryGapWatch
+                | Self::CrossPathRecoveryWithAlternativeStability
+                | Self::CrossPathRecoveryWithStreamProgressSnapshot
         )
     }
 
@@ -199,6 +311,15 @@ impl PtoRecovery {
                 | Self::CrossPathRecoveryWithFeedbackEvidence
                 | Self::CrossPathRecoveryWithFeedbackEvidenceAndGapRescue
                 | Self::CrossPathRecoveryWithFeedbackEvidenceAndGapWatch
+                | Self::CrossPathRecoveryWithApplicationProgressWatch
+                | Self::CrossPathRecoveryWithApplicationProgressDeadline
+                | Self::CrossPathRecoveryWithVersionAwareDeadline
+                | Self::CrossPathRecoveryWithStreamProgress
+                | Self::CrossPathRecoveryWithMultiFlightBudget
+                | Self::CrossPathRecoveryWithStableMultiFlightBudget
+                | Self::CrossPathRecoveryWithDeliveryGapWatch
+                | Self::CrossPathRecoveryWithAlternativeStability
+                | Self::CrossPathRecoveryWithStreamProgressSnapshot
         )
     }
 
@@ -212,6 +333,15 @@ impl PtoRecovery {
                 | Self::CrossPathRecoveryWithFeedbackEvidence
                 | Self::CrossPathRecoveryWithFeedbackEvidenceAndGapRescue
                 | Self::CrossPathRecoveryWithFeedbackEvidenceAndGapWatch
+                | Self::CrossPathRecoveryWithApplicationProgressWatch
+                | Self::CrossPathRecoveryWithApplicationProgressDeadline
+                | Self::CrossPathRecoveryWithVersionAwareDeadline
+                | Self::CrossPathRecoveryWithStreamProgress
+                | Self::CrossPathRecoveryWithMultiFlightBudget
+                | Self::CrossPathRecoveryWithStableMultiFlightBudget
+                | Self::CrossPathRecoveryWithDeliveryGapWatch
+                | Self::CrossPathRecoveryWithAlternativeStability
+                | Self::CrossPathRecoveryWithStreamProgressSnapshot
         )
     }
 
@@ -224,6 +354,15 @@ impl PtoRecovery {
                 | Self::CrossPathRecoveryWithFeedbackEvidence
                 | Self::CrossPathRecoveryWithFeedbackEvidenceAndGapRescue
                 | Self::CrossPathRecoveryWithFeedbackEvidenceAndGapWatch
+                | Self::CrossPathRecoveryWithApplicationProgressWatch
+                | Self::CrossPathRecoveryWithApplicationProgressDeadline
+                | Self::CrossPathRecoveryWithVersionAwareDeadline
+                | Self::CrossPathRecoveryWithStreamProgress
+                | Self::CrossPathRecoveryWithMultiFlightBudget
+                | Self::CrossPathRecoveryWithStableMultiFlightBudget
+                | Self::CrossPathRecoveryWithDeliveryGapWatch
+                | Self::CrossPathRecoveryWithAlternativeStability
+                | Self::CrossPathRecoveryWithStreamProgressSnapshot
         )
     }
 
@@ -235,6 +374,15 @@ impl PtoRecovery {
                 | Self::CrossPathRecoveryWithFeedbackEvidence
                 | Self::CrossPathRecoveryWithFeedbackEvidenceAndGapRescue
                 | Self::CrossPathRecoveryWithFeedbackEvidenceAndGapWatch
+                | Self::CrossPathRecoveryWithApplicationProgressWatch
+                | Self::CrossPathRecoveryWithApplicationProgressDeadline
+                | Self::CrossPathRecoveryWithVersionAwareDeadline
+                | Self::CrossPathRecoveryWithStreamProgress
+                | Self::CrossPathRecoveryWithMultiFlightBudget
+                | Self::CrossPathRecoveryWithStableMultiFlightBudget
+                | Self::CrossPathRecoveryWithDeliveryGapWatch
+                | Self::CrossPathRecoveryWithAlternativeStability
+                | Self::CrossPathRecoveryWithStreamProgressSnapshot
         )
     }
 
@@ -245,6 +393,15 @@ impl PtoRecovery {
                 | Self::CrossPathRecoveryWithFeedbackEvidence
                 | Self::CrossPathRecoveryWithFeedbackEvidenceAndGapRescue
                 | Self::CrossPathRecoveryWithFeedbackEvidenceAndGapWatch
+                | Self::CrossPathRecoveryWithApplicationProgressWatch
+                | Self::CrossPathRecoveryWithApplicationProgressDeadline
+                | Self::CrossPathRecoveryWithVersionAwareDeadline
+                | Self::CrossPathRecoveryWithStreamProgress
+                | Self::CrossPathRecoveryWithMultiFlightBudget
+                | Self::CrossPathRecoveryWithStableMultiFlightBudget
+                | Self::CrossPathRecoveryWithDeliveryGapWatch
+                | Self::CrossPathRecoveryWithAlternativeStability
+                | Self::CrossPathRecoveryWithStreamProgressSnapshot
         )
     }
 
@@ -254,6 +411,15 @@ impl PtoRecovery {
             Self::CrossPathRecoveryWithFeedbackEvidence
                 | Self::CrossPathRecoveryWithFeedbackEvidenceAndGapRescue
                 | Self::CrossPathRecoveryWithFeedbackEvidenceAndGapWatch
+                | Self::CrossPathRecoveryWithApplicationProgressWatch
+                | Self::CrossPathRecoveryWithApplicationProgressDeadline
+                | Self::CrossPathRecoveryWithVersionAwareDeadline
+                | Self::CrossPathRecoveryWithStreamProgress
+                | Self::CrossPathRecoveryWithMultiFlightBudget
+                | Self::CrossPathRecoveryWithStableMultiFlightBudget
+                | Self::CrossPathRecoveryWithDeliveryGapWatch
+                | Self::CrossPathRecoveryWithAlternativeStability
+                | Self::CrossPathRecoveryWithStreamProgressSnapshot
         )
     }
 
@@ -265,7 +431,135 @@ impl PtoRecovery {
     }
 
     fn stream_gap_watch_rescue_enabled(self) -> bool {
-        matches!(self, Self::CrossPathRecoveryWithFeedbackEvidenceAndGapWatch)
+        matches!(
+            self,
+            Self::CrossPathRecoveryWithFeedbackEvidenceAndGapWatch
+                | Self::CrossPathRecoveryWithApplicationProgressWatch
+                | Self::CrossPathRecoveryWithApplicationProgressDeadline
+                | Self::CrossPathRecoveryWithVersionAwareDeadline
+                | Self::CrossPathRecoveryWithStreamProgress
+                | Self::CrossPathRecoveryWithMultiFlightBudget
+                | Self::CrossPathRecoveryWithStableMultiFlightBudget
+                | Self::CrossPathRecoveryWithDeliveryGapWatch
+                | Self::CrossPathRecoveryWithAlternativeStability
+                | Self::CrossPathRecoveryWithStreamProgressSnapshot
+        )
+    }
+
+    fn ack_progress_stream_obligation_enabled(self) -> bool {
+        matches!(
+            self,
+            Self::CrossPathRecoveryWithApplicationProgressWatch
+                | Self::CrossPathRecoveryWithApplicationProgressDeadline
+                | Self::CrossPathRecoveryWithVersionAwareDeadline
+                | Self::CrossPathRecoveryWithStreamProgress
+                | Self::CrossPathRecoveryWithMultiFlightBudget
+                | Self::CrossPathRecoveryWithStableMultiFlightBudget
+                | Self::CrossPathRecoveryWithDeliveryGapWatch
+                | Self::CrossPathRecoveryWithAlternativeStability
+                | Self::CrossPathRecoveryWithStreamProgressSnapshot
+        )
+    }
+
+    fn blocked_credit_handoff_enabled(self) -> bool {
+        matches!(
+            self,
+            Self::CrossPathRecoveryWithApplicationProgressWatch
+                | Self::CrossPathRecoveryWithApplicationProgressDeadline
+                | Self::CrossPathRecoveryWithVersionAwareDeadline
+                | Self::CrossPathRecoveryWithStreamProgress
+                | Self::CrossPathRecoveryWithMultiFlightBudget
+                | Self::CrossPathRecoveryWithStableMultiFlightBudget
+                | Self::CrossPathRecoveryWithDeliveryGapWatch
+                | Self::CrossPathRecoveryWithAlternativeStability
+                | Self::CrossPathRecoveryWithStreamProgressSnapshot
+        )
+    }
+
+    fn ack_progress_service_deadline(self) -> Option<Duration> {
+        matches!(
+            self,
+            Self::CrossPathRecoveryWithApplicationProgressDeadline
+                | Self::CrossPathRecoveryWithVersionAwareDeadline
+                | Self::CrossPathRecoveryWithStreamProgress
+                | Self::CrossPathRecoveryWithMultiFlightBudget
+                | Self::CrossPathRecoveryWithStableMultiFlightBudget
+                | Self::CrossPathRecoveryWithDeliveryGapWatch
+                | Self::CrossPathRecoveryWithAlternativeStability
+                | Self::CrossPathRecoveryWithStreamProgressSnapshot
+        )
+        .then_some(Duration::from_millis(1_000))
+    }
+
+    fn ack_progress_fresh_alternative_enabled(self) -> bool {
+        matches!(
+            self,
+            Self::CrossPathRecoveryWithVersionAwareDeadline
+                | Self::CrossPathRecoveryWithStreamProgress
+                | Self::CrossPathRecoveryWithMultiFlightBudget
+                | Self::CrossPathRecoveryWithStableMultiFlightBudget
+                | Self::CrossPathRecoveryWithDeliveryGapWatch
+                | Self::CrossPathRecoveryWithAlternativeStability
+                | Self::CrossPathRecoveryWithStreamProgressSnapshot
+        )
+    }
+
+    fn stream_progress_enabled(self) -> bool {
+        matches!(
+            self,
+            Self::CrossPathRecoveryWithStreamProgress
+                | Self::CrossPathRecoveryWithMultiFlightBudget
+                | Self::CrossPathRecoveryWithStableMultiFlightBudget
+                | Self::CrossPathRecoveryWithDeliveryGapWatch
+                | Self::CrossPathRecoveryWithAlternativeStability
+                | Self::CrossPathRecoveryWithStreamProgressSnapshot
+        )
+    }
+
+    fn ack_progress_service_recovery_flights(self) -> u32 {
+        if matches!(
+            self,
+            Self::CrossPathRecoveryWithMultiFlightBudget
+                | Self::CrossPathRecoveryWithStableMultiFlightBudget
+                | Self::CrossPathRecoveryWithDeliveryGapWatch
+                | Self::CrossPathRecoveryWithAlternativeStability
+                | Self::CrossPathRecoveryWithStreamProgressSnapshot
+        ) {
+            3
+        } else {
+            1
+        }
+    }
+
+    fn ack_progress_feedback_stability_enabled(self) -> bool {
+        matches!(
+            self,
+            Self::CrossPathRecoveryWithStableMultiFlightBudget
+                | Self::CrossPathRecoveryWithDeliveryGapWatch
+                | Self::CrossPathRecoveryWithAlternativeStability
+                | Self::CrossPathRecoveryWithStreamProgressSnapshot
+        )
+    }
+
+    fn stream_gap_delivery_watch_rescue_enabled(self) -> bool {
+        matches!(
+            self,
+            Self::CrossPathRecoveryWithDeliveryGapWatch
+                | Self::CrossPathRecoveryWithAlternativeStability
+                | Self::CrossPathRecoveryWithStreamProgressSnapshot
+        )
+    }
+
+    fn ack_progress_alternative_stability_enabled(self) -> bool {
+        matches!(
+            self,
+            Self::CrossPathRecoveryWithAlternativeStability
+                | Self::CrossPathRecoveryWithStreamProgressSnapshot
+        )
+    }
+
+    fn feedback_stream_progress_snapshot_enabled(self) -> bool {
+        matches!(self, Self::CrossPathRecoveryWithStreamProgressSnapshot)
     }
 }
 
@@ -273,6 +567,7 @@ impl PtoRecovery {
 pub struct NetworkBenchmarkConfig {
     pub mode: PathMode,
     pub scheduler: MultipathScheduler,
+    pub congestion: QuicCongestion,
     pub pto_recovery: PtoRecovery,
     pub transfer_size: usize,
     pub datagram_count: usize,
@@ -288,6 +583,7 @@ impl NetworkBenchmarkConfig {
         Self {
             mode,
             scheduler,
+            congestion: QuicCongestion::Cubic,
             pto_recovery: PtoRecovery::Disabled,
             transfer_size,
             datagram_count,
@@ -296,6 +592,11 @@ impl NetworkBenchmarkConfig {
 
     pub fn with_pto_recovery(mut self, pto_recovery: PtoRecovery) -> Self {
         self.pto_recovery = pto_recovery;
+        self
+    }
+
+    pub fn with_congestion(mut self, congestion: QuicCongestion) -> Self {
+        self.congestion = congestion;
         self
     }
 
@@ -321,6 +622,7 @@ impl NetworkBenchmarkConfig {
 pub struct SustainedBenchmarkConfig {
     pub mode: PathMode,
     pub scheduler: MultipathScheduler,
+    pub congestion: QuicCongestion,
     pub pto_recovery: PtoRecovery,
     pub warmup_duration: Duration,
     pub measurement_duration: Duration,
@@ -338,6 +640,7 @@ impl SustainedBenchmarkConfig {
         Self {
             mode,
             scheduler,
+            congestion: QuicCongestion::Cubic,
             pto_recovery: PtoRecovery::Disabled,
             warmup_duration,
             measurement_duration,
@@ -347,6 +650,11 @@ impl SustainedBenchmarkConfig {
 
     pub fn with_pto_recovery(mut self, pto_recovery: PtoRecovery) -> Self {
         self.pto_recovery = pto_recovery;
+        self
+    }
+
+    pub fn with_congestion(mut self, congestion: QuicCongestion) -> Self {
+        self.congestion = congestion;
         self
     }
 
@@ -369,6 +677,110 @@ impl SustainedBenchmarkConfig {
             return Err(other_error(format!(
                 "持续实验单块大小必须大于 0 且不超过 {MAX_PAYLOAD_SIZE} 字节"
             )));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ContinuousBenchmarkConfig {
+    pub mode: PathMode,
+    pub scheduler: MultipathScheduler,
+    pub congestion: QuicCongestion,
+    pub pto_recovery: PtoRecovery,
+    pub warmup_duration: Duration,
+    pub measurement_duration: Duration,
+    pub chunk_size: usize,
+}
+
+impl ContinuousBenchmarkConfig {
+    pub fn new(
+        mode: PathMode,
+        scheduler: MultipathScheduler,
+        warmup_duration: Duration,
+        measurement_duration: Duration,
+        chunk_size: usize,
+    ) -> Self {
+        Self {
+            mode,
+            scheduler,
+            congestion: QuicCongestion::Cubic,
+            pto_recovery: PtoRecovery::Disabled,
+            warmup_duration,
+            measurement_duration,
+            chunk_size,
+        }
+    }
+
+    pub fn with_pto_recovery(mut self, pto_recovery: PtoRecovery) -> Self {
+        self.pto_recovery = pto_recovery;
+        self
+    }
+
+    pub fn with_congestion(mut self, congestion: QuicCongestion) -> Self {
+        self.congestion = congestion;
+        self
+    }
+
+    fn validate(self) -> LabResult<()> {
+        SustainedBenchmarkConfig::new(
+            self.mode,
+            self.scheduler,
+            self.warmup_duration,
+            self.measurement_duration,
+            self.chunk_size,
+        )
+        .with_congestion(self.congestion)
+        .with_pto_recovery(self.pto_recovery)
+        .validate()
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct DeclaredBackloggedEpochConfig {
+    pub mode: PathMode,
+    pub warmup_duration: Duration,
+    pub measurement_duration: Duration,
+    pub chunk_size: usize,
+}
+
+impl DeclaredBackloggedEpochConfig {
+    pub fn new(
+        mode: PathMode,
+        warmup_duration: Duration,
+        measurement_duration: Duration,
+        chunk_size: usize,
+    ) -> Self {
+        Self {
+            mode,
+            warmup_duration,
+            measurement_duration,
+            chunk_size,
+        }
+    }
+
+    fn validate(self) -> LabResult<()> {
+        if self.mode == PathMode::MultipathAvailable {
+            return Err(other_error(
+                "declared backlogged epoch 门控只允许独立测量一条线路",
+            ));
+        }
+        SustainedBenchmarkConfig::new(
+            self.mode,
+            MultipathScheduler::NoqDefault,
+            self.warmup_duration,
+            self.measurement_duration,
+            self.chunk_size,
+        )
+        .validate()?;
+        if !self
+            .measurement_duration
+            .as_nanos()
+            .is_multiple_of(DECLARED_EPOCH_COHORT_DURATION.as_nanos())
+        {
+            return Err(other_error(
+                "declared backlogged epoch 时长必须是 250 ms 的整数倍",
+            ));
         }
         Ok(())
     }
@@ -434,8 +846,7 @@ impl SustainedFailoverConfig {
         }
         if self.chunk_size < SUSTAINED_RECORD_HEADER_SIZE || self.chunk_size > MAX_PAYLOAD_SIZE {
             return Err(other_error(format!(
-                "正式换网实验记录载荷必须在 {} 到 {} 字节之间",
-                SUSTAINED_RECORD_HEADER_SIZE, MAX_PAYLOAD_SIZE
+                "正式换网实验记录载荷必须在 {SUSTAINED_RECORD_HEADER_SIZE} 到 {MAX_PAYLOAD_SIZE} 字节之间"
             )));
         }
         Ok(())
@@ -461,6 +872,16 @@ pub struct PathMeasurement {
     pub udp_datagrams_sent: u64,
     pub fresh_stream_bytes_sent: u64,
     pub retransmitted_stream_bytes_sent: u64,
+    pub declared_epoch_cohorts: u64,
+    pub declared_epoch_settled_cohorts: u64,
+    pub declared_epoch_empty_cohorts: u64,
+    pub declared_epoch_fresh_bytes: u64,
+    pub declared_epoch_acked_bytes: u64,
+    pub declared_epoch_late_acked_bytes: u64,
+    pub declared_epoch_bytes_missing_at_drain: u64,
+    pub declared_epoch_pending_cohorts: u64,
+    pub declared_epoch_pending_origin_bytes: u64,
+    pub declared_epoch_tracked_origin_bytes: u64,
     pub path_acks_same_path: u64,
     pub path_acks_cross_path: u64,
     pub path_ack_escape_requests: u64,
@@ -487,6 +908,11 @@ pub struct PathMeasurement {
     pub ack_progress_feedback_probe_timeouts: u64,
     pub ack_progress_feedback_probes: u64,
     pub ack_progress_feedback_probe_bytes: u64,
+    pub stream_progress_updates: u64,
+    pub stream_progress_acked_bytes: u64,
+    pub blocked_credit_handoffs: u64,
+    pub blocked_credit_max_data_requeues: u64,
+    pub blocked_credit_max_stream_data_requeues: u64,
     pub stream_gap_rescue_probes: u64,
     pub stream_gap_rescue_bytes: u64,
     pub ack_eliciting_packet_number_advance: u64,
@@ -499,6 +925,50 @@ pub struct PathMeasurement {
     pub final_tracked_ack_eliciting_packets: u64,
     pub final_loss_detection_timer_armed: bool,
     pub final_ack_progress_recovery_timer_armed: bool,
+}
+
+impl PathMeasurement {
+    pub fn declared_epoch_service_rate_mbps(&self) -> f64 {
+        if self.declared_epoch_cohorts == 0 {
+            return 0.0;
+        }
+        let observed = DECLARED_EPOCH_COHORT_DURATION
+            .saturating_mul(u32::try_from(self.declared_epoch_cohorts).unwrap_or(u32::MAX))
+            .as_secs_f64();
+        self.declared_epoch_acked_bytes as f64 * 8.0 / observed / 1_000_000.0
+    }
+
+    pub fn declared_epoch_ack_coverage_ratio(&self) -> f64 {
+        if self.declared_epoch_fresh_bytes == 0 {
+            return 0.0;
+        }
+        self.declared_epoch_acked_bytes as f64 / self.declared_epoch_fresh_bytes as f64
+    }
+
+    pub fn declared_epoch_late_ack_ratio(&self) -> f64 {
+        if self.declared_epoch_fresh_bytes == 0 {
+            return 0.0;
+        }
+        self.declared_epoch_late_acked_bytes as f64 / self.declared_epoch_fresh_bytes as f64
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct DeclaredBackloggedEpochReport {
+    pub mode: PathMode,
+    pub multipath_negotiated: bool,
+    pub data_intact: bool,
+    pub writer_alive_at_epoch_start: bool,
+    pub writer_alive_at_epoch_end: bool,
+    pub transfer_size: usize,
+    pub transfer_duration: Duration,
+    pub throughput_mbps: f64,
+    pub path: PathMeasurement,
+    pub total_udp_bytes_sent: u64,
+    pub cpu_time: Duration,
+    pub cpu_utilization_percent: f64,
+    pub peak_rss_kib: u64,
+    pub path_open: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -523,6 +993,7 @@ impl DatagramMeasurement {
 pub struct NetworkBenchmarkReport {
     pub mode: PathMode,
     pub scheduler: MultipathScheduler,
+    pub congestion: QuicCongestion,
     pub pto_recovery: PtoRecovery,
     pub multipath_negotiated: bool,
     pub transfer_size: usize,
@@ -538,6 +1009,48 @@ pub struct NetworkBenchmarkReport {
     pub peak_rss_kib: u64,
     pub all_configured_paths_open: bool,
     pub any_configured_path_open: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct ContinuousBenchmarkReport {
+    pub mode: PathMode,
+    pub scheduler: MultipathScheduler,
+    pub congestion: QuicCongestion,
+    pub pto_recovery: PtoRecovery,
+    pub multipath_negotiated: bool,
+    pub data_intact: bool,
+    pub writer_alive_at_measurement_start: bool,
+    pub writer_alive_at_measurement_end: bool,
+    pub transfer_size: usize,
+    pub transfer_duration: Duration,
+    pub throughput_mbps: f64,
+    pub records_received_in_window: u64,
+    pub total_records_received: u64,
+    pub total_application_bytes_received: u64,
+    pub line_one: PathMeasurement,
+    pub line_two: PathMeasurement,
+    pub total_udp_bytes_sent: u64,
+    pub extra_udp_bytes_sent: u64,
+    pub cpu_time: Duration,
+    pub cpu_utilization_percent: f64,
+    pub peak_rss_kib: u64,
+    pub all_configured_paths_open: bool,
+    pub any_configured_path_open: bool,
+}
+
+impl ContinuousBenchmarkReport {
+    pub fn both_paths_carried_minimum_effective_share(&self) -> bool {
+        if self.mode != PathMode::MultipathAvailable {
+            return false;
+        }
+        let total = self
+            .line_one
+            .fresh_stream_bytes_sent
+            .saturating_add(self.line_two.fresh_stream_bytes_sent);
+        total != 0
+            && self.line_one.fresh_stream_bytes_sent.saturating_mul(10) >= total
+            && self.line_two.fresh_stream_bytes_sent.saturating_mul(10) >= total
+    }
 }
 
 impl NetworkBenchmarkReport {
@@ -656,6 +1169,25 @@ pub struct StreamStateSample {
     pub response_sender_connection_blocked: Option<bool>,
     pub response_receiver_contiguous_offset: Option<u64>,
     pub response_receiver_highest_offset: Option<u64>,
+    pub primary_ack_progress_obligation_stream_id: Option<StreamId>,
+    pub primary_ack_progress_obligation_offset: Option<u64>,
+    pub primary_ack_progress_obligation_age: Option<Duration>,
+    pub primary_ack_progress_deadline_remaining: Option<Duration>,
+    pub primary_ack_progress_full_recovery_deadline_remaining: Option<Duration>,
+    pub primary_ack_progress_service_deadline: Option<Duration>,
+    pub primary_ack_progress_alternative_recovery_budget: Option<Duration>,
+    pub primary_ack_progress_feedback_probe_staged: bool,
+    pub primary_ack_progress_timer_armed: bool,
+    pub primary_ack_progress_stream_frames_in_flight: u64,
+    pub primary_ack_progress_has_cross_path_alternative: bool,
+    pub primary_ack_progress_pto_recovery_probe_active: bool,
+    pub primary_authenticated_feedback_age: Option<Duration>,
+    pub secondary_authenticated_feedback_age: Option<Duration>,
+    pub primary_stream_progress_updates: u64,
+    pub primary_stream_progress_acked_bytes: u64,
+    pub secondary_stream_progress_updates: u64,
+    pub secondary_stream_progress_acked_bytes: u64,
+    pub secondary_ack_progress_has_cross_path_alternative: bool,
     pub secondary_lost_packets: u64,
     pub secondary_stream_retransmit_bytes: u64,
     pub secondary_pto_timeouts: u64,
@@ -791,6 +1323,77 @@ enum SustainedServerEvent {
 }
 
 #[derive(Debug)]
+struct SustainedEventTrace {
+    received_at: Vec<Instant>,
+    records: u64,
+    bytes: u64,
+}
+
+async fn collect_sustained_server_events(
+    mut events: mpsc::UnboundedReceiver<SustainedServerEvent>,
+    chunk_size: usize,
+) -> LabResult<SustainedEventTrace> {
+    let mut received_at = Vec::new();
+    let mut expected_sequence = 0_u64;
+
+    while let Some(event) = events.recv().await {
+        match event {
+            SustainedServerEvent::Record {
+                sequence,
+                received_at: at,
+            } => {
+                if sequence != expected_sequence {
+                    return Err(other_error(format!(
+                        "持续 writer 接收事件序号错误：期望 {expected_sequence}，实际 {sequence}",
+                    )));
+                }
+                received_at.push(at);
+                expected_sequence = expected_sequence
+                    .checked_add(1)
+                    .ok_or_else(|| other_error("持续 writer 接收事件序号溢出"))?;
+            }
+            SustainedServerEvent::Finished { records, bytes } => {
+                let expected_bytes = records
+                    .checked_mul(chunk_size as u64)
+                    .ok_or_else(|| other_error("持续 writer 接收事件业务字节数溢出"))?;
+                if records != expected_sequence || bytes != expected_bytes {
+                    return Err(other_error(
+                        "持续 writer 接收事件的最终记录数或业务字节数不一致",
+                    ));
+                }
+                return Ok(SustainedEventTrace {
+                    received_at,
+                    records,
+                    bytes,
+                });
+            }
+            SustainedServerEvent::Failed(reason) => {
+                return Err(other_error(format!("持续 writer 服务端失败：{reason}")));
+            }
+        }
+    }
+
+    Err(other_error("持续 writer 接收事件通道提前关闭"))
+}
+
+fn count_received_records_in_window(
+    received_at: &[Instant],
+    started: Instant,
+    ended: Instant,
+) -> LabResult<u64> {
+    if ended < started {
+        return Err(other_error("持续 writer 测量窗口结束早于开始"));
+    }
+    u64::try_from(
+        received_at
+            .iter()
+            .filter(|received_at| **received_at >= started && **received_at < ended)
+            .count(),
+    )
+    .map_err(|_| other_error("持续 writer 测量窗口记录数超出 u64"))
+}
+
+#[derive(Debug)]
 struct SustainedReceiveTrace {
     received_at: Vec<Instant>,
     records: u64,
@@ -810,6 +1413,14 @@ struct RunningLab {
     connection: Connection,
     server_addr: SocketAddr,
     primary: Path,
+}
+
+#[derive(Default)]
+struct LabInstrumentation {
+    declared_backlogged_epoch_sensor: bool,
+    segmentation_offload: Option<bool>,
+    sustained_events: Option<mpsc::UnboundedSender<SustainedServerEvent>>,
+    realtime_datagram_events: Option<mpsc::UnboundedSender<realtime::RealtimeDatagramEvent>>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1010,6 +1621,7 @@ pub async fn run_network_benchmark(
     run_network_workload(
         config.mode,
         config.scheduler,
+        config.congestion,
         config.pto_recovery,
         BenchmarkWorkload::Fixed {
             transfer_size: config.transfer_size,
@@ -1027,6 +1639,7 @@ pub async fn run_sustained_network_benchmark(
     run_network_workload(
         config.mode,
         config.scheduler,
+        config.congestion,
         config.pto_recovery,
         BenchmarkWorkload::Sustained {
             warmup_duration: config.warmup_duration,
@@ -1037,9 +1650,243 @@ pub async fn run_sustained_network_benchmark(
     .await
 }
 
+pub async fn run_continuous_network_benchmark(
+    config: ContinuousBenchmarkConfig,
+) -> LabResult<ContinuousBenchmarkReport> {
+    config.validate()?;
+
+    let client_ip = match config.mode {
+        PathMode::LineOneOnly => LINE_ONE_IP,
+        PathMode::LineTwoOnly => LINE_TWO_IP,
+        PathMode::MultipathAvailable => Ipv4Addr::UNSPECIFIED,
+    };
+    let (sustained_events_tx, sustained_events_rx) = mpsc::unbounded_channel();
+    let lab = start_connection_internal(
+        client_ip,
+        Some(NETWORK_PATH_IDLE_TIMEOUT),
+        config.pto_recovery,
+        config.scheduler,
+        config.congestion,
+        LabInstrumentation {
+            sustained_events: Some(sustained_events_tx),
+            ..LabInstrumentation::default()
+        },
+    )
+    .await?;
+    let secondary = if config.mode == PathMode::MultipathAvailable {
+        Some(lab.open_second_path(PathStatus::Available).await?)
+    } else {
+        None
+    };
+    sleep(Duration::from_millis(150)).await;
+
+    let operation_result: LabResult<ContinuousBenchmarkReport> = async {
+        let event_collector = tokio::spawn(collect_sustained_server_events(
+            sustained_events_rx,
+            config.chunk_size,
+        ));
+        let (writer, stop_writer, completed_bytes) =
+            start_continuous_writer(&lab.connection, config.chunk_size, 197).await?;
+
+        sleep(config.warmup_duration).await;
+        let writer_alive_at_measurement_start = !writer.is_finished();
+        if !writer_alive_at_measurement_start {
+            let result = writer
+                .await
+                .map_err(|error| other_error(format!("持续 writer task 提前退出：{error}")))?;
+            result?;
+            return Err(other_error("持续 writer task 在测量前意外完成"));
+        }
+
+        let primary_before = lab.primary.stats();
+        let secondary_before = secondary.as_ref().map(Path::stats);
+        let resources = ResourceMonitor::start()?;
+        let measurement_started = Instant::now();
+
+        sleep(config.measurement_duration).await;
+        let measurement_ended = Instant::now();
+        let transfer_duration = measurement_ended.saturating_duration_since(measurement_started);
+        let writer_alive_at_measurement_end = !writer.is_finished();
+        let primary_after = lab.primary.stats();
+        let secondary_after = secondary.as_ref().map(Path::stats);
+        let _ = stop_writer.send(());
+        let resources = resources.finish(transfer_duration).await?;
+
+        let (sent_records, sent_bytes) = timeout(SUSTAINED_FAILOVER_GRACE, writer)
+            .await
+            .map_err(|_| other_error("等待持续 writer task 完整收尾超时"))?
+            .map_err(|error| other_error(format!("持续 writer task 异常退出：{error}")))??;
+        if sent_bytes != completed_bytes.load(Ordering::Relaxed) {
+            return Err(other_error("持续 writer task 的累计业务字节统计不一致"));
+        }
+
+        let received = timeout(SUSTAINED_FAILOVER_GRACE, event_collector)
+            .await
+            .map_err(|_| other_error("等待持续 writer 接收事件收尾超时"))?
+            .map_err(|error| other_error(format!("持续 writer 接收事件任务异常退出：{error}")))??;
+        if (sent_records, sent_bytes) != (received.records, received.bytes) {
+            return Err(other_error(
+                "持续 writer 最终发送与接收记录数或业务字节数不一致",
+            ));
+        }
+
+        let records_received_in_window = count_received_records_in_window(
+            &received.received_at,
+            measurement_started,
+            measurement_ended,
+        )?;
+        let transfer_bytes = records_received_in_window
+            .checked_mul(config.chunk_size as u64)
+            .ok_or_else(|| other_error("持续 writer 测量窗口业务字节数溢出"))?;
+        let transfer_size = usize::try_from(transfer_bytes)
+            .map_err(|_| other_error("持续 writer 测量窗口业务字节数超出平台范围"))?;
+
+        let primary_measurement = path_delta(primary_before, primary_after);
+        let secondary_measurement = match (secondary_before, secondary_after) {
+            (Some(before), Some(after)) => path_delta(before, after),
+            _ => PathMeasurement::default(),
+        };
+        let (line_one, line_two) = match config.mode {
+            PathMode::LineOneOnly => (primary_measurement, PathMeasurement::default()),
+            PathMode::LineTwoOnly => (PathMeasurement::default(), primary_measurement),
+            PathMode::MultipathAvailable => (primary_measurement, secondary_measurement),
+        };
+        let total_udp_bytes_sent = line_one
+            .udp_bytes_sent
+            .saturating_add(line_two.udp_bytes_sent);
+        let all_configured_paths_open = lab.primary.status().is_ok()
+            && secondary.as_ref().is_none_or(|path| path.status().is_ok());
+        let any_configured_path_open = lab.primary.status().is_ok()
+            || secondary.as_ref().is_some_and(|path| path.status().is_ok());
+
+        Ok(ContinuousBenchmarkReport {
+            mode: config.mode,
+            scheduler: config.scheduler,
+            congestion: config.congestion,
+            pto_recovery: config.pto_recovery,
+            multipath_negotiated: lab.connection.is_multipath_enabled(),
+            data_intact: true,
+            writer_alive_at_measurement_start,
+            writer_alive_at_measurement_end,
+            transfer_size,
+            transfer_duration,
+            throughput_mbps: throughput_mbps(transfer_size, transfer_duration),
+            records_received_in_window,
+            total_records_received: received.records,
+            total_application_bytes_received: received.bytes,
+            line_one,
+            line_two,
+            total_udp_bytes_sent,
+            extra_udp_bytes_sent: total_udp_bytes_sent.saturating_sub(transfer_bytes),
+            cpu_time: resources.cpu_time,
+            cpu_utilization_percent: resources.cpu_utilization_percent,
+            peak_rss_kib: resources.peak_rss_kib,
+            all_configured_paths_open,
+            any_configured_path_open,
+        })
+    }
+    .await;
+
+    let shutdown_result = lab.shutdown().await;
+    let report = operation_result?;
+    shutdown_result?;
+    Ok(report)
+}
+
+pub async fn run_declared_backlogged_epoch_probe(
+    config: DeclaredBackloggedEpochConfig,
+) -> LabResult<DeclaredBackloggedEpochReport> {
+    config.validate()?;
+    let client_ip = match config.mode {
+        PathMode::LineOneOnly => LINE_ONE_IP,
+        PathMode::LineTwoOnly => LINE_TWO_IP,
+        PathMode::MultipathAvailable => unreachable!("validated as single-path only"),
+    };
+    let lab = start_connection_internal(
+        client_ip,
+        Some(NETWORK_PATH_IDLE_TIMEOUT),
+        PtoRecovery::Disabled,
+        MultipathScheduler::NoqDefault,
+        QuicCongestion::Cubic,
+        LabInstrumentation {
+            declared_backlogged_epoch_sensor: true,
+            ..LabInstrumentation::default()
+        },
+    )
+    .await?;
+
+    let operation_result: LabResult<DeclaredBackloggedEpochReport> = async {
+        let (writer, stop_writer, completed_bytes) =
+            start_continuous_writer(&lab.connection, config.chunk_size, 197).await?;
+
+        sleep(config.warmup_duration).await;
+        let writer_alive_at_epoch_start = !writer.is_finished();
+        if !writer_alive_at_epoch_start {
+            let result = writer
+                .await
+                .map_err(|error| other_error(format!("持续 writer task 提前退出：{error}")))?;
+            result?;
+            return Err(other_error("持续 writer task 在 epoch 前意外完成"));
+        }
+
+        let before = lab.primary.stats();
+        let resources = ResourceMonitor::start()?;
+        let epoch_started = Instant::now();
+        lab.connection
+            .begin_declared_backlogged_epoch(config.measurement_duration)?;
+        let bytes_before = completed_bytes.load(Ordering::Relaxed);
+
+        sleep(config.measurement_duration).await;
+        let transfer_duration = epoch_started.elapsed();
+        let bytes_after = completed_bytes.load(Ordering::Relaxed);
+        let writer_alive_at_epoch_end = !writer.is_finished();
+        let _ = stop_writer.send(());
+        let resources = resources.finish(transfer_duration).await?;
+
+        let (_records, total_bytes) = timeout(SUSTAINED_FAILOVER_GRACE, writer)
+            .await
+            .map_err(|_| other_error("等待持续 writer task 完整收尾超时"))?
+            .map_err(|error| other_error(format!("持续 writer task 异常退出：{error}")))??;
+        if total_bytes != completed_bytes.load(Ordering::Relaxed) {
+            return Err(other_error("持续 writer task 的累计业务字节统计不一致"));
+        }
+
+        sleep(DECLARED_EPOCH_SETTLE_WAIT).await;
+        let after = lab.primary.stats();
+        let path = path_delta(before, after);
+        let transfer_bytes = bytes_after.saturating_sub(bytes_before);
+        let transfer_size = usize::try_from(transfer_bytes)
+            .map_err(|_| other_error("declared epoch 业务字节数超出平台范围"))?;
+
+        Ok(DeclaredBackloggedEpochReport {
+            mode: config.mode,
+            multipath_negotiated: lab.connection.is_multipath_enabled(),
+            data_intact: true,
+            writer_alive_at_epoch_start,
+            writer_alive_at_epoch_end,
+            transfer_size,
+            transfer_duration,
+            throughput_mbps: throughput_mbps(transfer_size, transfer_duration),
+            total_udp_bytes_sent: path.udp_bytes_sent,
+            path,
+            cpu_time: resources.cpu_time,
+            cpu_utilization_percent: resources.cpu_utilization_percent,
+            peak_rss_kib: resources.peak_rss_kib,
+            path_open: lab.primary.status().is_ok(),
+        })
+    }
+    .await;
+
+    let shutdown_result = lab.shutdown().await;
+    let report = operation_result?;
+    shutdown_result?;
+    Ok(report)
+}
+
 async fn run_network_workload(
     mode: PathMode,
     scheduler: MultipathScheduler,
+    congestion: QuicCongestion,
     pto_recovery: PtoRecovery,
     workload: BenchmarkWorkload,
 ) -> LabResult<NetworkBenchmarkReport> {
@@ -1053,7 +1900,14 @@ async fn run_network_workload(
         PathMode::LineTwoOnly => LINE_TWO_IP,
         PathMode::MultipathAvailable => Ipv4Addr::UNSPECIFIED,
     };
-    let lab = start_connection(client_ip, Some(NETWORK_PATH_IDLE_TIMEOUT), pto_recovery).await?;
+    let lab = start_connection_with_scheduler_and_congestion(
+        client_ip,
+        Some(NETWORK_PATH_IDLE_TIMEOUT),
+        pto_recovery,
+        scheduler,
+        congestion,
+    )
+    .await?;
 
     let secondary = if mode == PathMode::MultipathAvailable {
         Some(lab.open_second_path(PathStatus::Available).await?)
@@ -1123,6 +1977,7 @@ async fn run_network_workload(
         Ok(NetworkBenchmarkReport {
             mode,
             scheduler,
+            congestion,
             pto_recovery,
             multipath_negotiated: lab.connection.is_multipath_enabled(),
             transfer_size,
@@ -1158,10 +2013,11 @@ where
     Activate: FnOnce() -> LabResult<()>,
     Restore: FnOnce() -> LabResult<()>,
 {
-    let lab = start_connection(
+    let lab = start_connection_with_scheduler(
         Ipv4Addr::UNSPECIFIED,
         Some(NETWORK_PATH_IDLE_TIMEOUT),
         pto_recovery,
+        scheduler,
     )
     .await?;
     let secondary = lab.open_second_path(PathStatus::Backup).await?;
@@ -1249,6 +2105,7 @@ where
         Ipv4Addr::UNSPECIFIED,
         Some(NETWORK_PATH_IDLE_TIMEOUT),
         config.pto_recovery,
+        config.scheduler,
     )
     .await?;
     let secondary = lab.open_second_path(PathStatus::Backup).await?;
@@ -1360,9 +2217,11 @@ where
                 stream_id,
                 &sender_connection,
                 &receiver_connection,
+                &sender_primary,
                 &sender_secondary,
                 &receiver_primary,
                 &receiver_secondary,
+                primary_at_blackhole,
                 secondary_at_blackhole,
                 receiver_primary_at_blackhole,
                 receiver_secondary_at_blackhole,
@@ -1397,9 +2256,11 @@ where
                                 stream_id,
                                 &sender_connection,
                                 &receiver_connection,
+                                &sender_primary,
                                 &sender_secondary,
                                 &receiver_primary,
                                 &receiver_secondary,
+                                primary_at_blackhole,
                                 secondary_at_blackhole,
                                 receiver_primary_at_blackhole,
                                 receiver_secondary_at_blackhole,
@@ -1443,9 +2304,11 @@ where
                 stream_id,
                 &sender_connection,
                 &receiver_connection,
+                &sender_primary,
                 &sender_secondary,
                 &receiver_primary,
                 &receiver_secondary,
+                primary_at_blackhole,
                 secondary_at_blackhole,
                 receiver_primary_at_blackhole,
                 receiver_secondary_at_blackhole,
@@ -1858,9 +2721,11 @@ fn observe_sustained_stream_state(
     stream_id: StreamId,
     sender_connection: &Connection,
     receiver_connection: &Connection,
+    sender_primary: &Path,
     sender_secondary: &Path,
     receiver_primary: &Path,
     receiver_secondary: &Path,
+    primary_at_blackhole: PathStats,
     secondary_at_blackhole: PathStats,
     receiver_primary_at_blackhole: PathStats,
     receiver_secondary_at_blackhole: PathStats,
@@ -1872,6 +2737,8 @@ fn observe_sustained_stream_state(
         .streams
         .iter()
         .find(|stream| stream.id == stream_id);
+    let sampled_at = Instant::now();
+    let primary = sender_primary.stats();
     let secondary = sender_secondary.stats();
     let receiver_primary = receiver_primary.stats();
     let receiver_secondary = receiver_secondary.stats();
@@ -1930,6 +2797,51 @@ fn observe_sustained_stream_state(
             .and_then(|stream| stream.receive_contiguous_offset),
         response_receiver_highest_offset: sender_stream
             .and_then(|stream| stream.receive_highest_offset),
+        primary_ack_progress_obligation_stream_id: primary
+            .ack_progress_stream_obligation
+            .map(|(id, _)| id),
+        primary_ack_progress_obligation_offset: primary
+            .ack_progress_stream_obligation
+            .map(|(_, offset)| offset),
+        primary_ack_progress_obligation_age: primary
+            .ack_progress_start
+            .map(|start| sampled_at.saturating_duration_since(start)),
+        primary_ack_progress_deadline_remaining: primary
+            .ack_progress_recovery_deadline
+            .map(|deadline| deadline.saturating_duration_since(sampled_at)),
+        primary_ack_progress_full_recovery_deadline_remaining: primary
+            .ack_progress_full_recovery_deadline
+            .map(|deadline| deadline.saturating_duration_since(sampled_at)),
+        primary_ack_progress_service_deadline: primary.ack_progress_service_deadline,
+        primary_ack_progress_alternative_recovery_budget: primary
+            .ack_progress_alternative_recovery_budget,
+        primary_ack_progress_feedback_probe_staged: primary.ack_progress_feedback_probe_staged,
+        primary_ack_progress_timer_armed: primary.ack_progress_recovery_timer_armed,
+        primary_ack_progress_stream_frames_in_flight: primary.ack_progress_stream_frames_in_flight,
+        primary_ack_progress_has_cross_path_alternative: primary
+            .ack_progress_has_cross_path_alternative,
+        primary_ack_progress_pto_recovery_probe_active: primary
+            .ack_progress_pto_recovery_probe_active,
+        primary_authenticated_feedback_age: primary
+            .last_authenticated_at
+            .map(|last| sampled_at.saturating_duration_since(last)),
+        secondary_authenticated_feedback_age: secondary
+            .last_authenticated_at
+            .map(|last| sampled_at.saturating_duration_since(last)),
+        primary_stream_progress_updates: primary
+            .stream_progress_updates
+            .saturating_sub(primary_at_blackhole.stream_progress_updates),
+        primary_stream_progress_acked_bytes: primary
+            .stream_progress_acked_bytes
+            .saturating_sub(primary_at_blackhole.stream_progress_acked_bytes),
+        secondary_stream_progress_updates: secondary
+            .stream_progress_updates
+            .saturating_sub(secondary_at_blackhole.stream_progress_updates),
+        secondary_stream_progress_acked_bytes: secondary
+            .stream_progress_acked_bytes
+            .saturating_sub(secondary_at_blackhole.stream_progress_acked_bytes),
+        secondary_ack_progress_has_cross_path_alternative: secondary
+            .ack_progress_has_cross_path_alternative,
         secondary_lost_packets: secondary
             .lost_packets
             .saturating_sub(secondary_at_blackhole.lost_packets),
@@ -2009,18 +2921,136 @@ async fn start_connection(
     path_idle_timeout: Option<Duration>,
     pto_recovery: PtoRecovery,
 ) -> LabResult<RunningLab> {
-    start_connection_internal(client_ip, path_idle_timeout, pto_recovery, None).await
+    start_connection_with_scheduler(
+        client_ip,
+        path_idle_timeout,
+        pto_recovery,
+        MultipathScheduler::NoqDefault,
+    )
+    .await
+}
+
+async fn start_connection_with_scheduler(
+    client_ip: Ipv4Addr,
+    path_idle_timeout: Option<Duration>,
+    pto_recovery: PtoRecovery,
+    scheduler: MultipathScheduler,
+) -> LabResult<RunningLab> {
+    start_connection_with_scheduler_and_congestion(
+        client_ip,
+        path_idle_timeout,
+        pto_recovery,
+        scheduler,
+        QuicCongestion::Cubic,
+    )
+    .await
+}
+
+async fn start_connection_with_scheduler_and_congestion(
+    client_ip: Ipv4Addr,
+    path_idle_timeout: Option<Duration>,
+    pto_recovery: PtoRecovery,
+    scheduler: MultipathScheduler,
+    congestion: QuicCongestion,
+) -> LabResult<RunningLab> {
+    start_connection_internal(
+        client_ip,
+        path_idle_timeout,
+        pto_recovery,
+        scheduler,
+        congestion,
+        LabInstrumentation::default(),
+    )
+    .await
 }
 
 async fn start_connection_with_sustained_observer(
     client_ip: Ipv4Addr,
     path_idle_timeout: Option<Duration>,
     pto_recovery: PtoRecovery,
+    scheduler: MultipathScheduler,
 ) -> LabResult<(RunningLab, mpsc::UnboundedReceiver<SustainedServerEvent>)> {
     let (events_tx, events_rx) = mpsc::unbounded_channel();
-    let lab =
-        start_connection_internal(client_ip, path_idle_timeout, pto_recovery, Some(events_tx))
-            .await?;
+    let lab = start_connection_internal(
+        client_ip,
+        path_idle_timeout,
+        pto_recovery,
+        scheduler,
+        QuicCongestion::Cubic,
+        LabInstrumentation {
+            sustained_events: Some(events_tx),
+            ..LabInstrumentation::default()
+        },
+    )
+    .await?;
+    Ok((lab, events_rx))
+}
+
+async fn start_connection_with_realtime_datagram_observer(
+    client_ip: Ipv4Addr,
+    path_idle_timeout: Option<Duration>,
+    pto_recovery: PtoRecovery,
+    scheduler: MultipathScheduler,
+) -> LabResult<(
+    RunningLab,
+    mpsc::UnboundedReceiver<realtime::RealtimeDatagramEvent>,
+)> {
+    start_connection_with_realtime_datagram_observer_and_congestion(
+        client_ip,
+        path_idle_timeout,
+        pto_recovery,
+        scheduler,
+        QuicCongestion::Cubic,
+    )
+    .await
+}
+
+async fn start_connection_with_realtime_datagram_observer_and_congestion(
+    client_ip: Ipv4Addr,
+    path_idle_timeout: Option<Duration>,
+    pto_recovery: PtoRecovery,
+    scheduler: MultipathScheduler,
+    congestion: QuicCongestion,
+) -> LabResult<(
+    RunningLab,
+    mpsc::UnboundedReceiver<realtime::RealtimeDatagramEvent>,
+)> {
+    start_connection_with_realtime_datagram_observer_and_transport(
+        client_ip,
+        path_idle_timeout,
+        pto_recovery,
+        scheduler,
+        congestion,
+        None,
+    )
+    .await
+}
+
+async fn start_connection_with_realtime_datagram_observer_and_transport(
+    client_ip: Ipv4Addr,
+    path_idle_timeout: Option<Duration>,
+    pto_recovery: PtoRecovery,
+    scheduler: MultipathScheduler,
+    congestion: QuicCongestion,
+    segmentation_offload: Option<bool>,
+) -> LabResult<(
+    RunningLab,
+    mpsc::UnboundedReceiver<realtime::RealtimeDatagramEvent>,
+)> {
+    let (events_tx, events_rx) = mpsc::unbounded_channel();
+    let lab = start_connection_internal(
+        client_ip,
+        path_idle_timeout,
+        pto_recovery,
+        scheduler,
+        congestion,
+        LabInstrumentation {
+            segmentation_offload,
+            realtime_datagram_events: Some(events_tx),
+            ..LabInstrumentation::default()
+        },
+    )
+    .await?;
     Ok((lab, events_rx))
 }
 
@@ -2028,9 +3058,24 @@ async fn start_connection_internal(
     client_ip: Ipv4Addr,
     path_idle_timeout: Option<Duration>,
     pto_recovery: PtoRecovery,
-    sustained_events: Option<mpsc::UnboundedSender<SustainedServerEvent>>,
+    scheduler: MultipathScheduler,
+    congestion: QuicCongestion,
+    instrumentation: LabInstrumentation,
 ) -> LabResult<RunningLab> {
-    let (server_config, client_config) = make_configs(path_idle_timeout, pto_recovery)?;
+    let LabInstrumentation {
+        declared_backlogged_epoch_sensor,
+        segmentation_offload,
+        sustained_events,
+        realtime_datagram_events,
+    } = instrumentation;
+    let (server_config, client_config) = make_configs(
+        path_idle_timeout,
+        pto_recovery,
+        scheduler,
+        congestion,
+        declared_backlogged_epoch_sensor,
+        segmentation_offload,
+    )?;
     let server_endpoint =
         Endpoint::server(server_config, SocketAddr::new(IpAddr::V4(LINE_ONE_IP), 0))?;
     let server_addr = server_endpoint.local_addr()?;
@@ -2047,7 +3092,7 @@ async fn start_connection_internal(
         server_connection_tx
             .send(connection.clone())
             .map_err(|_| other_error("实验控制器没有接收服务端连接"))?;
-        serve_connection(connection, sustained_events).await
+        serve_connection(connection, sustained_events, realtime_datagram_events).await
     });
 
     let client_endpoint = Endpoint::client(SocketAddr::new(IpAddr::V4(client_ip), 0))?;
@@ -2088,6 +3133,10 @@ async fn start_connection_internal(
 fn make_configs(
     path_idle_timeout: Option<Duration>,
     pto_recovery: PtoRecovery,
+    scheduler: MultipathScheduler,
+    congestion: QuicCongestion,
+    declared_backlogged_epoch_sensor: bool,
+    segmentation_offload: Option<bool>,
 ) -> LabResult<(ServerConfig, ClientConfig)> {
     let generated = rcgen::generate_simple_self_signed(vec!["localhost".into()])?;
     let certificate = CertificateDer::from(generated.cert);
@@ -2097,13 +3146,33 @@ fn make_configs(
         ServerConfig::with_single_cert(vec![certificate.clone()], private_key.into())?;
     let server_transport = Arc::get_mut(&mut server_config.transport)
         .ok_or_else(|| other_error("无法配置服务端传输参数"))?;
-    configure_transport(server_transport, path_idle_timeout, pto_recovery);
+    configure_transport(
+        server_transport,
+        path_idle_timeout,
+        pto_recovery,
+        scheduler,
+        congestion,
+        declared_backlogged_epoch_sensor,
+    );
+    if let Some(enabled) = segmentation_offload {
+        server_transport.enable_segmentation_offload(enabled);
+    }
 
     let mut roots = noq::rustls::RootCertStore::empty();
     roots.add(certificate)?;
     let mut client_config = ClientConfig::with_root_certificates(Arc::new(roots))?;
     let mut client_transport = TransportConfig::default();
-    configure_transport(&mut client_transport, path_idle_timeout, pto_recovery);
+    configure_transport(
+        &mut client_transport,
+        path_idle_timeout,
+        pto_recovery,
+        scheduler,
+        congestion,
+        declared_backlogged_epoch_sensor,
+    );
+    if let Some(enabled) = segmentation_offload {
+        client_transport.enable_segmentation_offload(enabled);
+    }
     client_config.transport_config(Arc::new(client_transport));
 
     Ok((server_config, client_config))
@@ -2113,21 +3182,55 @@ fn configure_transport(
     transport: &mut TransportConfig,
     path_idle_timeout: Option<Duration>,
     pto_recovery: PtoRecovery,
+    _scheduler: MultipathScheduler,
+    congestion: QuicCongestion,
+    declared_backlogged_epoch_sensor: bool,
 ) {
+    match congestion {
+        QuicCongestion::Cubic => {
+            transport.congestion_controller_factory(Arc::new(CubicConfig::default()));
+        }
+        QuicCongestion::Bbr3 => {
+            transport.congestion_controller_factory(Arc::new(Bbr3Config::default()));
+        }
+    }
     transport
         .max_concurrent_multipath_paths(2)
         .cross_path_pto_reinjection(pto_recovery.pto_reinjection_enabled())
         .cross_path_abandon_reinjection(pto_recovery.abandon_reinjection_enabled())
         .cross_path_ack_progress_reinjection(pto_recovery.ack_progress_reinjection_enabled())
+        .cross_path_ack_progress_stream_obligation(
+            pto_recovery.ack_progress_stream_obligation_enabled(),
+        )
+        .cross_path_ack_progress_service_deadline(pto_recovery.ack_progress_service_deadline())
+        .cross_path_ack_progress_service_recovery_flights(
+            pto_recovery.ack_progress_service_recovery_flights(),
+        )
+        .cross_path_ack_progress_fresh_alternative(
+            pto_recovery.ack_progress_fresh_alternative_enabled(),
+        )
+        .cross_path_ack_progress_feedback_stability(
+            pto_recovery.ack_progress_feedback_stability_enabled(),
+        )
+        .cross_path_ack_progress_alternative_stability(
+            pto_recovery.ack_progress_alternative_stability_enabled(),
+        )
         .cross_path_ack_progress_feedback_probe(pto_recovery.feedback_probe_enabled())
         .cross_path_ack_progress_feedback_evidence_reinjection(
             pto_recovery.feedback_evidence_reinjection_enabled(),
         )
         .stream_gap_rescue(pto_recovery.stream_gap_rescue_enabled())
         .stream_gap_watch_rescue(pto_recovery.stream_gap_watch_rescue_enabled())
+        .stream_gap_delivery_watch_rescue(pto_recovery.stream_gap_delivery_watch_rescue_enabled())
         .cross_path_ack_escape(pto_recovery.ack_escape_enabled())
         .cross_path_feedback_handoff(pto_recovery.feedback_handoff_enabled())
         .cross_path_feedback_credit_snapshot(pto_recovery.feedback_credit_snapshot_enabled())
+        .cross_path_feedback_stream_progress_snapshot(
+            pto_recovery.feedback_stream_progress_snapshot_enabled(),
+        )
+        .cross_path_blocked_credit_handoff(pto_recovery.blocked_credit_handoff_enabled())
+        .cross_path_stream_progress(pto_recovery.stream_progress_enabled())
+        .declared_backlogged_epoch_sensor(declared_backlogged_epoch_sensor)
         .default_path_max_idle_timeout(path_idle_timeout)
         .default_path_keep_alive_interval(Some(Duration::from_millis(200)))
         .datagram_receive_buffer_size(Some(1024 * 1024))
@@ -2137,6 +3240,7 @@ fn configure_transport(
 async fn serve_connection(
     connection: Connection,
     sustained_events: Option<mpsc::UnboundedSender<SustainedServerEvent>>,
+    realtime_datagram_events: Option<mpsc::UnboundedSender<realtime::RealtimeDatagramEvent>>,
 ) -> LabResult<()> {
     let datagram_connection = connection.clone();
     let datagram_task = tokio::spawn(async move {
@@ -2148,6 +3252,19 @@ async fn serve_connection(
                 }
                 Err(error) => return Err(error.into()),
             };
+
+            if let Some(events) = realtime_datagram_events.as_ref() {
+                if events
+                    .send(realtime::RealtimeDatagramEvent {
+                        data: data.to_vec(),
+                        received_at: Instant::now(),
+                    })
+                    .is_err()
+                {
+                    return Ok::<(), LabError>(());
+                }
+                continue;
+            }
 
             datagram_connection
                 .send_datagram_wait(data)
@@ -2384,6 +3501,117 @@ fn parse_sustained_success_response(response: &[u8]) -> LabResult<(u64, u64)> {
             .expect("持续换网字节数固定为 8 字节"),
     );
     Ok((records, bytes))
+}
+
+async fn start_continuous_writer(
+    connection: &Connection,
+    chunk_size: usize,
+    seed: u8,
+) -> LabResult<(
+    JoinHandle<LabResult<(u64, u64)>>,
+    oneshot::Sender<()>,
+    Arc<AtomicU64>,
+)> {
+    let request_config = SustainedFailoverConfig::new(
+        MultipathScheduler::NoqDefault,
+        PtoRecovery::Disabled,
+        FailoverDirection::ClientToServer,
+        Duration::from_secs(1),
+        Duration::from_millis(500),
+        chunk_size,
+        seed,
+    );
+    let (mut send, mut receive) = timeout(OPERATION_TIMEOUT, connection.open_bi())
+        .await
+        .map_err(|_| other_error("打开持续 writer 上传流超时"))??;
+    let request = make_sustained_stream_request(request_config)?;
+    timeout(OPERATION_TIMEOUT, send.write_all(&request))
+        .await
+        .map_err(|_| other_error("发送持续 writer 上传请求超时"))??;
+
+    let mut ready = [0_u8; SUSTAINED_FAILOVER_READY.len()];
+    timeout(OPERATION_TIMEOUT, receive.read_exact(&mut ready))
+        .await
+        .map_err(|_| other_error("等待持续 writer 服务端就绪超时"))??;
+    if &ready != SUSTAINED_FAILOVER_READY {
+        return Err(other_error("持续 writer 服务端没有返回就绪标记"));
+    }
+    timeout(OPERATION_TIMEOUT, send.write_all(&[SUSTAINED_FAILOVER_GO]))
+        .await
+        .map_err(|_| other_error("发送持续 writer 开始标记超时"))??;
+
+    let (stop_tx, stop_rx) = oneshot::channel();
+    let completed_bytes = Arc::new(AtomicU64::new(0));
+    let writer_completed_bytes = Arc::clone(&completed_bytes);
+    let task = tokio::spawn(async move {
+        run_declared_backlogged_writer(
+            &mut send,
+            &mut receive,
+            stop_rx,
+            writer_completed_bytes,
+            chunk_size,
+            seed,
+        )
+        .await
+    });
+    Ok((task, stop_tx, completed_bytes))
+}
+
+async fn run_declared_backlogged_writer(
+    send: &mut noq::SendStream,
+    receive: &mut noq::RecvStream,
+    mut stop: oneshot::Receiver<()>,
+    completed_bytes: Arc<AtomicU64>,
+    chunk_size: usize,
+    seed: u8,
+) -> LabResult<(u64, u64)> {
+    let mut sequence = 0_u64;
+    let mut bytes = 0_u64;
+    let mut payload = vec![0_u8; chunk_size];
+
+    loop {
+        match stop.try_recv() {
+            Ok(()) | Err(oneshot::error::TryRecvError::Closed) => break,
+            Err(oneshot::error::TryRecvError::Empty) => {}
+        }
+
+        fill_sustained_payload(&mut payload, seed, sequence);
+        let mut header = [0_u8; SUSTAINED_RECORD_HEADER_SIZE];
+        header[..8].copy_from_slice(&sequence.to_be_bytes());
+        header[8..].copy_from_slice(&digest(&payload).to_be_bytes());
+        timeout(OPERATION_TIMEOUT, async {
+            send.write_all(&header).await?;
+            send.write_all(&payload).await?;
+            Ok::<(), LabError>(())
+        })
+        .await
+        .map_err(|_| other_error("持续 writer 记录发送超时"))??;
+
+        sequence = sequence
+            .checked_add(1)
+            .ok_or_else(|| other_error("持续 writer 记录编号溢出"))?;
+        bytes = bytes
+            .checked_add(chunk_size as u64)
+            .ok_or_else(|| other_error("持续 writer 累计字节数溢出"))?;
+        completed_bytes.store(bytes, Ordering::Relaxed);
+    }
+
+    let mut end = [0_u8; SUSTAINED_RECORD_HEADER_SIZE];
+    end[..8].copy_from_slice(&SUSTAINED_RECORD_END.to_be_bytes());
+    end[8..].copy_from_slice(&sequence.to_be_bytes());
+    timeout(OPERATION_TIMEOUT, send.write_all(&end))
+        .await
+        .map_err(|_| other_error("持续 writer 结束标记发送超时"))??;
+    send.finish()?;
+
+    let response = timeout(OPERATION_TIMEOUT, receive.read_to_end(64))
+        .await
+        .map_err(|_| other_error("等待持续 writer 完整性响应超时"))??;
+    let (received_records, received_bytes) = parse_sustained_success_response(&response)?;
+    if (sequence, bytes) != (received_records, received_bytes) {
+        return Err(other_error("持续 writer 上传的记录数或业务字节数不一致"));
+    }
+    Ok((sequence, bytes))
 }
 
 async fn write_sustained_records(
@@ -2876,6 +4104,30 @@ fn path_delta(before: PathStats, after: PathStats) -> PathMeasurement {
             .frame_tx
             .stream_retransmit_bytes
             .saturating_sub(before.frame_tx.stream_retransmit_bytes),
+        declared_epoch_cohorts: after
+            .declared_epoch_cohorts
+            .saturating_sub(before.declared_epoch_cohorts),
+        declared_epoch_settled_cohorts: after
+            .declared_epoch_settled_cohorts
+            .saturating_sub(before.declared_epoch_settled_cohorts),
+        declared_epoch_empty_cohorts: after
+            .declared_epoch_empty_cohorts
+            .saturating_sub(before.declared_epoch_empty_cohorts),
+        declared_epoch_fresh_bytes: after
+            .declared_epoch_fresh_bytes
+            .saturating_sub(before.declared_epoch_fresh_bytes),
+        declared_epoch_acked_bytes: after
+            .declared_epoch_acked_bytes
+            .saturating_sub(before.declared_epoch_acked_bytes),
+        declared_epoch_late_acked_bytes: after
+            .declared_epoch_late_acked_bytes
+            .saturating_sub(before.declared_epoch_late_acked_bytes),
+        declared_epoch_bytes_missing_at_drain: after
+            .declared_epoch_bytes_missing_at_drain
+            .saturating_sub(before.declared_epoch_bytes_missing_at_drain),
+        declared_epoch_pending_cohorts: after.declared_epoch_pending_cohorts,
+        declared_epoch_pending_origin_bytes: after.declared_epoch_pending_origin_bytes,
+        declared_epoch_tracked_origin_bytes: after.declared_epoch_tracked_origin_bytes,
         path_acks_same_path: after
             .frame_tx
             .path_acks_same_path
@@ -2956,6 +4208,21 @@ fn path_delta(before: PathStats, after: PathStats) -> PathMeasurement {
         ack_progress_feedback_probe_bytes: after
             .ack_progress_feedback_probe_bytes
             .saturating_sub(before.ack_progress_feedback_probe_bytes),
+        stream_progress_updates: after
+            .stream_progress_updates
+            .saturating_sub(before.stream_progress_updates),
+        stream_progress_acked_bytes: after
+            .stream_progress_acked_bytes
+            .saturating_sub(before.stream_progress_acked_bytes),
+        blocked_credit_handoffs: after
+            .blocked_credit_handoffs
+            .saturating_sub(before.blocked_credit_handoffs),
+        blocked_credit_max_data_requeues: after
+            .blocked_credit_max_data_requeues
+            .saturating_sub(before.blocked_credit_max_data_requeues),
+        blocked_credit_max_stream_data_requeues: after
+            .blocked_credit_max_stream_data_requeues
+            .saturating_sub(before.blocked_credit_max_stream_data_requeues),
         stream_gap_rescue_probes: after
             .stream_gap_rescue_probes
             .saturating_sub(before.stream_gap_rescue_probes),
@@ -3080,7 +4347,7 @@ pub fn print_basic_report(report: &BasicLabReport) {
         "- 错误格式数据被拒绝：{}",
         pass(report.malformed_frame_rejected)
     );
-    println!("注意：本阶段尚未实现真正的带宽聚合算法和 FEC。");
+    println!("注意：本命令只展示基础 MPQUIC 功能；A/B/C 正式门控和代理入口见项目文档。");
 }
 
 fn pass(value: bool) -> &'static str {
@@ -3097,12 +4364,14 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn true_mpquic_two_path_lab_passes() {
+        let _network_test_guard = LOCAL_NETWORK_TEST_LOCK.lock().await;
         let report = run_basic_lab().await.expect("MPQUIC 双路径实验应成功运行");
         verify_basic_report(&report).expect("实验报告中的全部基础条件都应通过");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn sustained_mpquic_workload_runs_past_requested_duration() {
+        let _network_test_guard = LOCAL_NETWORK_TEST_LOCK.lock().await;
         let report = run_sustained_network_benchmark(SustainedBenchmarkConfig::new(
             PathMode::MultipathAvailable,
             MultipathScheduler::NoqDefault,
@@ -3120,7 +4389,85 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn continuous_writer_spans_warmup_measurement_and_integrity_close() {
+        let _network_test_guard = LOCAL_NETWORK_TEST_LOCK.lock().await;
+        let report = run_continuous_network_benchmark(ContinuousBenchmarkConfig::new(
+            PathMode::MultipathAvailable,
+            MultipathScheduler::NoqDefault,
+            Duration::from_millis(50),
+            Duration::from_millis(150),
+            16 * 1024,
+        ))
+        .await
+        .expect("持续单流 MPQUIC 实验应成功运行");
+
+        assert!(report.multipath_negotiated);
+        assert!(report.data_intact);
+        assert!(report.writer_alive_at_measurement_start);
+        assert!(report.writer_alive_at_measurement_end);
+        assert!(report.transfer_duration >= Duration::from_millis(150));
+        assert!(report.records_received_in_window > 0);
+        assert_eq!(
+            report.transfer_size as u64,
+            report.records_received_in_window * 16 * 1024
+        );
+        assert!(report.total_records_received >= report.records_received_in_window);
+        assert!(report.total_application_bytes_received >= report.transfer_size as u64);
+        // This short loopback integrity test may spend longer than PathIdle draining the
+        // unbounded writer after measurement, while NoQ default legitimately leaves the
+        // unused secondary path idle. Formal B tests separately require both shaped paths open.
+        assert!(report.any_configured_path_open);
+        assert!(report.peak_rss_kib > 0);
+    }
+
+    #[test]
+    fn continuous_writer_window_counts_only_completed_records_in_half_open_interval() {
+        let started = Instant::now();
+        let ended = started + Duration::from_millis(100);
+        let received_at = [
+            started - Duration::from_nanos(1),
+            started,
+            started + Duration::from_millis(50),
+            ended - Duration::from_nanos(1),
+            ended,
+        ];
+
+        assert_eq!(
+            count_received_records_in_window(&received_at, started, ended)
+                .expect("合法半开窗口应能计数"),
+            3
+        );
+        assert!(count_received_records_in_window(&received_at, ended, started).is_err());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn declared_backlogged_epoch_keeps_all_cohorts_and_stream_integrity() {
+        let _network_test_guard = LOCAL_NETWORK_TEST_LOCK.lock().await;
+        let report = run_declared_backlogged_epoch_probe(DeclaredBackloggedEpochConfig::new(
+            PathMode::LineOneOnly,
+            Duration::from_millis(50),
+            Duration::from_millis(500),
+            16 * 1024,
+        ))
+        .await
+        .expect("declared backlogged epoch 本地探针应完整运行");
+
+        assert!(report.multipath_negotiated);
+        assert!(report.data_intact);
+        assert!(report.writer_alive_at_epoch_start);
+        assert!(report.writer_alive_at_epoch_end);
+        assert!(report.transfer_size > 0);
+        assert!(report.path_open);
+        assert_eq!(report.path.declared_epoch_cohorts, 2);
+        assert_eq!(report.path.declared_epoch_settled_cohorts, 2);
+        assert_eq!(report.path.declared_epoch_pending_cohorts, 0);
+        assert_eq!(report.path.declared_epoch_pending_origin_bytes, 0);
+        assert_eq!(report.path.declared_epoch_tracked_origin_bytes, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn failover_progress_is_reported_before_full_integrity_check() {
+        let _network_test_guard = LOCAL_NETWORK_TEST_LOCK.lock().await;
         let lab = start_connection(Ipv4Addr::UNSPECIFIED, None, PtoRecovery::Disabled)
             .await
             .expect("进度测量实验应建立连接");
@@ -3135,11 +4482,13 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn sustained_failover_protocol_preserves_both_directions() {
+        let _network_test_guard = LOCAL_NETWORK_TEST_LOCK.lock().await;
         for direction in FailoverDirection::ALL {
             let (lab, events) = start_connection_with_sustained_observer(
                 Ipv4Addr::UNSPECIFIED,
                 None,
                 PtoRecovery::Disabled,
+                MultipathScheduler::NoqDefault,
             )
             .await
             .expect("正式换网协议实验应建立连接");
@@ -3314,6 +4663,257 @@ mod tests {
     }
 
     #[test]
+    fn application_progress_variant_composes_without_changing_gap_watch_history() {
+        let recovery = PtoRecovery::CrossPathRecoveryWithApplicationProgressWatch;
+        assert!(recovery.pto_reinjection_enabled());
+        assert!(recovery.abandon_reinjection_enabled());
+        assert!(recovery.ack_progress_reinjection_enabled());
+        assert!(recovery.ack_escape_enabled());
+        assert!(recovery.feedback_handoff_enabled());
+        assert!(recovery.feedback_credit_snapshot_enabled());
+        assert!(recovery.feedback_probe_enabled());
+        assert!(recovery.feedback_evidence_reinjection_enabled());
+        assert!(!recovery.stream_gap_rescue_enabled());
+        assert!(recovery.stream_gap_watch_rescue_enabled());
+        assert!(recovery.ack_progress_stream_obligation_enabled());
+        assert!(recovery.blocked_credit_handoff_enabled());
+        assert_eq!(recovery.ack_progress_service_deadline(), None);
+
+        let historical = PtoRecovery::CrossPathRecoveryWithFeedbackEvidenceAndGapWatch;
+        assert!(!historical.ack_progress_stream_obligation_enabled());
+        assert!(!historical.blocked_credit_handoff_enabled());
+        assert!(!PtoRecovery::CANDIDATES.contains(&recovery));
+    }
+
+    #[test]
+    fn service_deadline_variant_is_separate_from_application_progress_history() {
+        let recovery = PtoRecovery::CrossPathRecoveryWithApplicationProgressDeadline;
+        assert!(recovery.pto_reinjection_enabled());
+        assert!(recovery.abandon_reinjection_enabled());
+        assert!(recovery.ack_progress_reinjection_enabled());
+        assert!(recovery.ack_escape_enabled());
+        assert!(recovery.feedback_handoff_enabled());
+        assert!(recovery.feedback_credit_snapshot_enabled());
+        assert!(recovery.feedback_probe_enabled());
+        assert!(recovery.feedback_evidence_reinjection_enabled());
+        assert!(!recovery.stream_gap_rescue_enabled());
+        assert!(recovery.stream_gap_watch_rescue_enabled());
+        assert!(recovery.ack_progress_stream_obligation_enabled());
+        assert!(recovery.blocked_credit_handoff_enabled());
+        assert_eq!(
+            recovery.ack_progress_service_deadline(),
+            Some(Duration::from_millis(1_000))
+        );
+        assert!(!recovery.ack_progress_fresh_alternative_enabled());
+
+        let historical = PtoRecovery::CrossPathRecoveryWithApplicationProgressWatch;
+        assert_eq!(historical.ack_progress_service_deadline(), None);
+        assert!(!PtoRecovery::CANDIDATES.contains(&recovery));
+    }
+
+    #[test]
+    fn version_aware_deadline_variant_is_separate_from_v6_2_history() {
+        let recovery = PtoRecovery::CrossPathRecoveryWithVersionAwareDeadline;
+        assert!(recovery.pto_reinjection_enabled());
+        assert!(recovery.abandon_reinjection_enabled());
+        assert!(recovery.ack_progress_reinjection_enabled());
+        assert!(recovery.ack_escape_enabled());
+        assert!(recovery.feedback_handoff_enabled());
+        assert!(recovery.feedback_credit_snapshot_enabled());
+        assert!(recovery.feedback_probe_enabled());
+        assert!(recovery.feedback_evidence_reinjection_enabled());
+        assert!(recovery.stream_gap_watch_rescue_enabled());
+        assert!(recovery.ack_progress_stream_obligation_enabled());
+        assert!(recovery.blocked_credit_handoff_enabled());
+        assert_eq!(
+            recovery.ack_progress_service_deadline(),
+            Some(Duration::from_millis(1_000))
+        );
+        assert!(recovery.ack_progress_fresh_alternative_enabled());
+
+        let historical = PtoRecovery::CrossPathRecoveryWithApplicationProgressDeadline;
+        assert!(!historical.ack_progress_fresh_alternative_enabled());
+        assert!(!PtoRecovery::CANDIDATES.contains(&recovery));
+    }
+
+    #[test]
+    fn stream_progress_variant_inherits_v6_3_and_stays_isolated() {
+        let recovery = PtoRecovery::CrossPathRecoveryWithStreamProgress;
+        assert!(recovery.pto_reinjection_enabled());
+        assert!(recovery.abandon_reinjection_enabled());
+        assert!(recovery.ack_progress_reinjection_enabled());
+        assert!(recovery.ack_escape_enabled());
+        assert!(recovery.feedback_handoff_enabled());
+        assert!(recovery.feedback_credit_snapshot_enabled());
+        assert!(recovery.feedback_probe_enabled());
+        assert!(recovery.feedback_evidence_reinjection_enabled());
+        assert!(recovery.stream_gap_watch_rescue_enabled());
+        assert!(recovery.ack_progress_stream_obligation_enabled());
+        assert!(recovery.blocked_credit_handoff_enabled());
+        assert_eq!(
+            recovery.ack_progress_service_deadline(),
+            Some(Duration::from_millis(1_000))
+        );
+        assert!(recovery.ack_progress_fresh_alternative_enabled());
+        assert!(recovery.stream_progress_enabled());
+        assert_eq!(recovery.ack_progress_service_recovery_flights(), 1);
+
+        let historical = PtoRecovery::CrossPathRecoveryWithVersionAwareDeadline;
+        assert!(!historical.stream_progress_enabled());
+        assert!(!PtoRecovery::Disabled.stream_progress_enabled());
+        assert!(!PtoRecovery::CANDIDATES.contains(&recovery));
+    }
+
+    #[test]
+    fn multi_flight_budget_variant_inherits_v6_4_and_stays_isolated() {
+        let recovery = PtoRecovery::CrossPathRecoveryWithMultiFlightBudget;
+        assert!(recovery.pto_reinjection_enabled());
+        assert!(recovery.abandon_reinjection_enabled());
+        assert!(recovery.ack_progress_reinjection_enabled());
+        assert!(recovery.ack_escape_enabled());
+        assert!(recovery.feedback_handoff_enabled());
+        assert!(recovery.feedback_credit_snapshot_enabled());
+        assert!(recovery.feedback_probe_enabled());
+        assert!(recovery.feedback_evidence_reinjection_enabled());
+        assert!(recovery.stream_gap_watch_rescue_enabled());
+        assert!(recovery.ack_progress_stream_obligation_enabled());
+        assert!(recovery.blocked_credit_handoff_enabled());
+        assert!(recovery.ack_progress_fresh_alternative_enabled());
+        assert!(recovery.stream_progress_enabled());
+        assert_eq!(
+            recovery.ack_progress_service_deadline(),
+            Some(Duration::from_millis(1_000))
+        );
+        assert_eq!(recovery.ack_progress_service_recovery_flights(), 3);
+        assert!(!recovery.ack_progress_feedback_stability_enabled());
+
+        let historical = PtoRecovery::CrossPathRecoveryWithStreamProgress;
+        assert_eq!(historical.ack_progress_service_recovery_flights(), 1);
+        assert!(!PtoRecovery::CANDIDATES.contains(&recovery));
+    }
+
+    #[test]
+    fn stable_multi_flight_variant_inherits_v6_5_without_changing_history() {
+        let recovery = PtoRecovery::CrossPathRecoveryWithStableMultiFlightBudget;
+        assert!(recovery.pto_reinjection_enabled());
+        assert!(recovery.abandon_reinjection_enabled());
+        assert!(recovery.ack_progress_reinjection_enabled());
+        assert!(recovery.ack_escape_enabled());
+        assert!(recovery.feedback_handoff_enabled());
+        assert!(recovery.feedback_credit_snapshot_enabled());
+        assert!(recovery.feedback_probe_enabled());
+        assert!(recovery.feedback_evidence_reinjection_enabled());
+        assert!(recovery.stream_gap_watch_rescue_enabled());
+        assert!(recovery.ack_progress_stream_obligation_enabled());
+        assert!(recovery.blocked_credit_handoff_enabled());
+        assert!(recovery.ack_progress_fresh_alternative_enabled());
+        assert!(recovery.stream_progress_enabled());
+        assert_eq!(
+            recovery.ack_progress_service_deadline(),
+            Some(Duration::from_millis(1_000))
+        );
+        assert_eq!(recovery.ack_progress_service_recovery_flights(), 3);
+        assert!(recovery.ack_progress_feedback_stability_enabled());
+        assert!(!recovery.stream_gap_delivery_watch_rescue_enabled());
+
+        let historical = PtoRecovery::CrossPathRecoveryWithMultiFlightBudget;
+        assert!(!historical.ack_progress_feedback_stability_enabled());
+        assert!(!PtoRecovery::CANDIDATES.contains(&recovery));
+    }
+
+    #[test]
+    fn delivery_gap_watch_variant_inherits_v6_6_without_changing_history() {
+        let recovery = PtoRecovery::CrossPathRecoveryWithDeliveryGapWatch;
+        assert!(recovery.pto_reinjection_enabled());
+        assert!(recovery.abandon_reinjection_enabled());
+        assert!(recovery.ack_progress_reinjection_enabled());
+        assert!(recovery.ack_escape_enabled());
+        assert!(recovery.feedback_handoff_enabled());
+        assert!(recovery.feedback_credit_snapshot_enabled());
+        assert!(recovery.feedback_probe_enabled());
+        assert!(recovery.feedback_evidence_reinjection_enabled());
+        assert!(recovery.stream_gap_watch_rescue_enabled());
+        assert!(!recovery.stream_gap_rescue_enabled());
+        assert!(recovery.ack_progress_stream_obligation_enabled());
+        assert!(recovery.blocked_credit_handoff_enabled());
+        assert!(recovery.ack_progress_fresh_alternative_enabled());
+        assert!(recovery.stream_progress_enabled());
+        assert_eq!(
+            recovery.ack_progress_service_deadline(),
+            Some(Duration::from_millis(1_000))
+        );
+        assert_eq!(recovery.ack_progress_service_recovery_flights(), 3);
+        assert!(recovery.ack_progress_feedback_stability_enabled());
+        assert!(recovery.stream_gap_delivery_watch_rescue_enabled());
+
+        let historical = PtoRecovery::CrossPathRecoveryWithStableMultiFlightBudget;
+        assert!(!historical.stream_gap_delivery_watch_rescue_enabled());
+        assert!(!PtoRecovery::CANDIDATES.contains(&recovery));
+    }
+
+    #[test]
+    fn alternative_stability_variant_inherits_v6_7_without_changing_history() {
+        let recovery = PtoRecovery::CrossPathRecoveryWithAlternativeStability;
+        assert!(recovery.pto_reinjection_enabled());
+        assert!(recovery.abandon_reinjection_enabled());
+        assert!(recovery.ack_progress_reinjection_enabled());
+        assert!(recovery.ack_escape_enabled());
+        assert!(recovery.feedback_handoff_enabled());
+        assert!(recovery.feedback_credit_snapshot_enabled());
+        assert!(recovery.feedback_probe_enabled());
+        assert!(recovery.feedback_evidence_reinjection_enabled());
+        assert!(recovery.stream_gap_watch_rescue_enabled());
+        assert!(!recovery.stream_gap_rescue_enabled());
+        assert!(recovery.ack_progress_stream_obligation_enabled());
+        assert!(recovery.blocked_credit_handoff_enabled());
+        assert!(recovery.ack_progress_fresh_alternative_enabled());
+        assert!(recovery.stream_progress_enabled());
+        assert_eq!(
+            recovery.ack_progress_service_deadline(),
+            Some(Duration::from_millis(1_000))
+        );
+        assert_eq!(recovery.ack_progress_service_recovery_flights(), 3);
+        assert!(recovery.ack_progress_feedback_stability_enabled());
+        assert!(recovery.stream_gap_delivery_watch_rescue_enabled());
+        assert!(recovery.ack_progress_alternative_stability_enabled());
+
+        let historical = PtoRecovery::CrossPathRecoveryWithDeliveryGapWatch;
+        assert!(!historical.ack_progress_alternative_stability_enabled());
+        assert!(!PtoRecovery::CANDIDATES.contains(&recovery));
+    }
+
+    #[test]
+    fn stream_progress_snapshot_variant_inherits_v6_8_without_changing_history() {
+        let recovery = PtoRecovery::CrossPathRecoveryWithStreamProgressSnapshot;
+        assert!(recovery.pto_reinjection_enabled());
+        assert!(recovery.abandon_reinjection_enabled());
+        assert!(recovery.ack_progress_reinjection_enabled());
+        assert!(recovery.ack_escape_enabled());
+        assert!(recovery.feedback_handoff_enabled());
+        assert!(recovery.feedback_credit_snapshot_enabled());
+        assert!(recovery.feedback_probe_enabled());
+        assert!(recovery.feedback_evidence_reinjection_enabled());
+        assert!(recovery.stream_gap_watch_rescue_enabled());
+        assert!(recovery.ack_progress_stream_obligation_enabled());
+        assert!(recovery.blocked_credit_handoff_enabled());
+        assert!(recovery.ack_progress_fresh_alternative_enabled());
+        assert!(recovery.stream_progress_enabled());
+        assert_eq!(
+            recovery.ack_progress_service_deadline(),
+            Some(Duration::from_millis(1_000))
+        );
+        assert_eq!(recovery.ack_progress_service_recovery_flights(), 3);
+        assert!(recovery.ack_progress_feedback_stability_enabled());
+        assert!(recovery.stream_gap_delivery_watch_rescue_enabled());
+        assert!(recovery.ack_progress_alternative_stability_enabled());
+        assert!(recovery.feedback_stream_progress_snapshot_enabled());
+
+        let historical = PtoRecovery::CrossPathRecoveryWithAlternativeStability;
+        assert!(!historical.feedback_stream_progress_snapshot_enabled());
+        assert!(!PtoRecovery::CANDIDATES.contains(&recovery));
+    }
+
+    #[test]
     fn stream_state_sampling_is_diagnostic_only() {
         let config = SustainedFailoverConfig::new(
             MultipathScheduler::NoqDefault,
@@ -3408,6 +5008,24 @@ mod tests {
             MAX_PAYLOAD_SIZE + 1,
         );
         assert!(oversized_chunk.validate().is_err());
+
+        let no_continuous_measurement = ContinuousBenchmarkConfig::new(
+            PathMode::MultipathAvailable,
+            MultipathScheduler::NoqDefault,
+            Duration::from_secs(2),
+            Duration::ZERO,
+            16 * 1024,
+        );
+        assert!(no_continuous_measurement.validate().is_err());
+
+        let oversized_continuous_chunk = ContinuousBenchmarkConfig::new(
+            PathMode::MultipathAvailable,
+            MultipathScheduler::NoqDefault,
+            Duration::from_secs(2),
+            Duration::from_secs(20),
+            MAX_PAYLOAD_SIZE + 1,
+        );
+        assert!(oversized_continuous_chunk.validate().is_err());
 
         let fault_after_end = SustainedFailoverConfig::new(
             MultipathScheduler::NoqDefault,

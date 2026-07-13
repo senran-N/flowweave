@@ -143,6 +143,16 @@ impl Send {
         self.pending.has_unsent_data() || self.fin_pending
     }
 
+    /// Whether the stream's final-size obligation has not yet been acknowledged.
+    pub(super) fn fin_outstanding(&self) -> bool {
+        matches!(
+            self.state,
+            SendState::DataSent {
+                finish_acked: false
+            }
+        )
+    }
+
     pub(super) fn is_writable(&self) -> bool {
         matches!(self.state, SendState::Ready)
     }

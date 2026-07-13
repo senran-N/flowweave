@@ -130,6 +130,8 @@ pub struct StreamsState {
     pub(super) send_window: u64,
     /// Configured upper bound for how much unacked data the peer can send us per stream
     pub(super) stream_receive_window: u64,
+    /// Whether both endpoints negotiated data-level STREAM progress.
+    pub(super) stream_progress_enabled: bool,
 
     // Pertinent state from the TransportParameters supplied by the peer
     initial_max_stream_data_uni: VarInt,
@@ -180,6 +182,7 @@ impl StreamsState {
             unacked_data: 0,
             send_window,
             stream_receive_window: stream_receive_window.into(),
+            stream_progress_enabled: false,
             initial_max_stream_data_uni: 0u32.into(),
             initial_max_stream_data_bidi_local: 0u32.into(),
             initial_max_stream_data_bidi_remote: 0u32.into(),
@@ -190,6 +193,10 @@ impl StreamsState {
 
     pub(crate) fn unacked_data(&self) -> u64 {
         self.unacked_data
+    }
+
+    pub(crate) fn set_stream_progress_enabled(&mut self, enabled: bool) {
+        self.stream_progress_enabled = enabled;
     }
 
     pub(crate) fn flow_control_stats(&self) -> FlowControlStats {
@@ -258,6 +265,35 @@ impl StreamsState {
                 Some((id, offset, stream.pending.retransmit_bytes()))
             })
             .min_by_key(|(id, offset, _)| (u64::from(*id), *offset))
+    }
+
+    /// First still-unacknowledged application obligation represented by a retained STREAM frame.
+    pub(crate) fn first_outstanding_stream_obligation(
+        &self,
+        frame: &frame::StreamMeta,
+    ) -> Option<(StreamId, u64)> {
+        let stream = self.send.get(&frame.id).and_then(Option::as_deref)?;
+        stream
+            .pending
+            .first_unacked_offset(frame.offsets.clone())
+            .or_else(|| (frame.fin && stream.fin_outstanding()).then_some(frame.offsets.end))
+            .map(|offset| (frame.id, offset))
+    }
+
+    /// Whether a specific application obligation is still queued for retransmission.
+    ///
+    /// The identity check is intentional: the retransmission queue is connection-wide, so a
+    /// different stream or offset cannot be used to keep a path-local recovery epoch alive.
+    pub(crate) fn has_retransmit_obligation(&self, id: StreamId, offset: u64) -> bool {
+        self.send
+            .get(&id)
+            .and_then(Option::as_deref)
+            .is_some_and(|stream| {
+                stream.pending.retransmit_contains(offset)
+                    || (stream.fin_pending
+                        && stream.fin_outstanding()
+                        && stream.pending.offset() == offset)
+            })
     }
 
     pub(crate) fn set_params(&mut self, params: &TransportParameters) {
@@ -483,6 +519,25 @@ impl StreamsState {
             .is_some_and(|s| s.can_send_flow_control())
     }
 
+    /// Whether the peer's reported connection-level blocked offset is older than credit already
+    /// available at this receiver.
+    pub(crate) fn has_newer_connection_credit(&self, blocked_at: u64) -> bool {
+        self.local_max_data > blocked_at
+    }
+
+    /// Whether the peer's reported stream-level blocked offset is older than credit already
+    /// available at this receiver.
+    pub(crate) fn has_newer_stream_credit(&self, id: StreamId, blocked_at: u64) -> bool {
+        self.recv
+            .get(&id)
+            .and_then(|s| s.as_ref())
+            .and_then(|s| s.as_open_recv())
+            .is_some_and(|stream| {
+                stream.can_send_flow_control()
+                    && stream.current_max_stream_data(self.stream_receive_window) > blocked_at
+            })
+    }
+
     pub(in crate::connection) fn write_control_frames<'a, 'b>(
         &mut self,
         builder: &mut PacketBuilder<'a, 'b>,
@@ -518,6 +573,15 @@ impl StreamsState {
             // peer, but we discard that information as soon as the application consumes it, so it
             // can't be relied upon regardless.
             builder.write_frame(frame, stats);
+        }
+
+        // STREAM_PROGRESS
+        while builder.frame_space_remaining() >= frame::StreamProgress::SIZE_BOUND {
+            let Some((&id, &offset)) = pending.stream_progress.iter().next() else {
+                break;
+            };
+            pending.stream_progress.remove(&id);
+            builder.write_frame(frame::StreamProgress { id, offset }, stats);
         }
 
         // MAX_DATA
@@ -561,6 +625,36 @@ impl StreamsState {
             let (max, _) = rs.max_stream_data(self.stream_receive_window);
             rs.record_sent_max_stream_data(max);
             builder.write_frame(frame::MaxStreamData { id, offset: max }, stats);
+        }
+
+        // DATA_BLOCKED is informational and intentionally not retransmitted. A later blocked write
+        // can queue another frame if the peer still has not supplied credit.
+        if pending.data_blocked && builder.frame_space_remaining() > 9 {
+            pending.data_blocked = false;
+            builder.write_frame(frame::DataBlocked(self.max_data), stats);
+        }
+
+        // STREAM_DATA_BLOCKED follows the same one-signal-per-blocked-write rule. Drop stale
+        // entries for streams which have since closed or received more credit.
+        while builder.frame_space_remaining() > 17 {
+            let id = match pending.stream_data_blocked.iter().next() {
+                Some(id) => *id,
+                None => break,
+            };
+            pending.stream_data_blocked.remove(&id);
+            let Some(stream) = self.send.get(&id).and_then(|stream| stream.as_ref()) else {
+                continue;
+            };
+            if !stream.is_writable() || stream.offset() != stream.max_data {
+                continue;
+            }
+            builder.write_frame(
+                frame::StreamDataBlocked {
+                    id,
+                    offset: stream.max_data,
+                },
+                stats,
+            );
         }
 
         // MAX_STREAMS
@@ -619,6 +713,12 @@ impl StreamsState {
             if stream.is_reset() {
                 continue;
             }
+            // A packet ACK or STREAM_PROGRESS can cancel every queued retransmit after the stream
+            // ID was inserted into the scheduling heap. Consume that stale heap entry without
+            // emitting a zero-length STREAM frame.
+            if !stream.is_pending() {
+                continue;
+            }
 
             // Now that we know the `StreamId`, we can better account for how many bytes
             // are required to encode it.
@@ -652,6 +752,9 @@ impl StreamsState {
 
             let range = offsets.clone();
             let meta = frame::StreamMeta { id, offsets, fin };
+            if !is_retransmit {
+                builder.record_declared_epoch_fresh_stream_frame(meta.clone());
+            }
             builder.write_frame(meta.encoder(encode_length), stats);
             stream.pending.get_into(range, builder.buf);
         }
@@ -668,9 +771,9 @@ impl StreamsState {
         builder.sent_frames().stream_frames.clone()
     }
 
-    pub(crate) fn received_ack_of(&mut self, frame: frame::StreamMeta) {
+    pub(crate) fn received_ack_of(&mut self, frame: frame::StreamMeta) -> u64 {
         let mut entry = match self.send.entry(frame.id) {
-            hash_map::Entry::Vacant(_) => return,
+            hash_map::Entry::Vacant(_) => return 0,
             hash_map::Entry::Occupied(e) => e,
         };
 
@@ -679,24 +782,25 @@ impl StreamsState {
             // this closure should be unreachable. If we did somehow screw that up,
             // then we might hit an underflow below with unpredictable effects down
             // the line. Best to short-circuit.
-            return;
+            return 0;
         };
 
         if stream.is_reset() {
             // We account for outstanding data on reset streams at time of reset
-            return;
+            return 0;
         }
         let id = frame.id;
         let (finished, newly_acked) = stream.ack(frame);
         self.unacked_data -= newly_acked;
         if !finished {
             // The stream is unfinished or may still need retransmits
-            return;
+            return newly_acked;
         }
 
         entry.remove_entry();
         self.stream_freed(id, StreamHalf::Send);
         self.events.push_back(StreamEvent::Finished { id });
+        newly_acked
     }
 
     pub(crate) fn retransmit(&mut self, frame: frame::StreamMeta) -> u64 {
@@ -752,16 +856,76 @@ impl StreamsState {
         Ok(())
     }
 
-    /// Handle increase to connection-level flow control limit
-    pub(crate) fn received_max_data(&mut self, n: VarInt) {
-        self.max_data = self.max_data.max(n.into());
+    /// Apply a negotiated data-level acknowledgment without changing packet-level recovery state.
+    pub(crate) fn received_stream_progress(
+        &mut self,
+        id: StreamId,
+        offset: u64,
+    ) -> Result<u64, TransportError> {
+        if id.initiator() != self.side && id.dir() == Dir::Uni {
+            return Err(TransportError::STREAM_STATE_ERROR(
+                "STREAM_PROGRESS on recv-only stream",
+            ));
+        }
+
+        let stream_was_opened = if id.initiator() == self.side {
+            id.index() < self.next[id.dir() as usize]
+        } else {
+            debug_assert_eq!(id.dir(), Dir::Bi);
+            id.index() < self.next_remote[Dir::Bi as usize]
+        };
+        let Some(slot) = self.send.get_mut(&id) else {
+            if !stream_was_opened {
+                return Err(TransportError::STREAM_STATE_ERROR(
+                    "STREAM_PROGRESS on unopened stream",
+                ));
+            }
+            // A delayed duplicate may outlive send-stream state which ordinary packet ACKs already
+            // released. With no local bytes left to retire, the monotonic update is a no-op.
+            return Ok(0);
+        };
+        let Some(stream) = slot.as_mut() else {
+            if offset == 0 {
+                return Ok(0);
+            }
+            return Err(TransportError::PROTOCOL_VIOLATION(
+                "STREAM_PROGRESS exceeds transmitted stream offset",
+            ));
+        };
+        if stream.is_reset() {
+            return Ok(0);
+        }
+        if offset > stream.pending.sent_offset() {
+            return Err(TransportError::PROTOCOL_VIOLATION(
+                "STREAM_PROGRESS exceeds transmitted stream offset",
+            ));
+        }
+
+        let (_, newly_acked) = stream.ack(frame::StreamMeta {
+            id,
+            offsets: 0..offset,
+            fin: false,
+        });
+        self.unacked_data = self.unacked_data.saturating_sub(newly_acked);
+        Ok(newly_acked)
+    }
+
+    /// Handle increase to connection-level flow control limit.
+    ///
+    /// Returns whether the peer supplied a strictly newer credit value. Duplicate or reordered
+    /// MAX_DATA frames must not be mistaken for fresh progress by blocked-frame bookkeeping.
+    pub(crate) fn received_max_data(&mut self, n: VarInt) -> bool {
+        let n = u64::from(n);
+        let increased = n > self.max_data;
+        self.max_data = self.max_data.max(n);
+        increased
     }
 
     pub(crate) fn received_max_stream_data(
         &mut self,
         id: StreamId,
         offset: u64,
-    ) -> Result<(), TransportError> {
+    ) -> Result<bool, TransportError> {
         if id.initiator() != self.side && id.dir() == Dir::Uni {
             debug!("got MAX_STREAM_DATA on recv-only {}", id);
             return Err(TransportError::STREAM_STATE_ERROR(
@@ -774,11 +938,13 @@ impl StreamsState {
 
         let write_limit = self.write_limit();
         let max_send_data = self.max_send_data(id);
+        let mut increased = false;
         if let Some(ss) = self
             .send
             .get_mut(&id)
             .map(get_or_insert_send(max_send_data))
         {
+            increased = ss.state == SendState::Ready && offset > ss.max_data;
             if ss.increase_max_data(offset) {
                 if write_limit > 0 {
                     self.events.push_back(StreamEvent::Writable { id });
@@ -797,7 +963,7 @@ impl StreamsState {
             ));
         }
 
-        Ok(())
+        Ok(increased)
     }
 
     /// Returns the maximum amount of data this is allowed to be written on the connection
@@ -1063,6 +1229,358 @@ mod tests {
             (1024 * 1024u32).into(),
             (1024 * 1024u32).into(),
         )
+    }
+
+    #[test]
+    fn flow_control_progress_requires_a_strictly_newer_value() -> Result<(), TransportError> {
+        let mut sender = make(Side::Client);
+        assert!(sender.received_max_data(100u32.into()));
+        assert!(!sender.received_max_data(100u32.into()));
+        assert!(!sender.received_max_data(99u32.into()));
+
+        sender.set_params(&TransportParameters {
+            initial_max_data: VarInt::MAX,
+            initial_max_stream_data_uni: 10u32.into(),
+            initial_max_streams_uni: 1u32.into(),
+            ..TransportParameters::default()
+        });
+        let conn_state = ConnState::established();
+        let id = Streams {
+            state: &mut sender,
+            conn_state: &conn_state,
+        }
+        .open(Dir::Uni)
+        .unwrap();
+        assert!(sender.received_max_stream_data(id, 20)?);
+        assert!(!sender.received_max_stream_data(id, 20)?);
+        assert!(!sender.received_max_stream_data(id, 19)?);
+        Ok(())
+    }
+
+    #[test]
+    fn ordered_reads_coalesce_stream_progress_monotonically() {
+        let mut receiver = make(Side::Server);
+        receiver.set_stream_progress_enabled(true);
+        let id = StreamId::new(Side::Client, Dir::Uni, 0);
+        let _ = receiver
+            .received(
+                frame::Stream {
+                    id,
+                    offset: 0,
+                    fin: false,
+                    data: Bytes::from_static(&[0; 1_024]),
+                },
+                1_024,
+            )
+            .unwrap();
+
+        let mut pending = Retransmits::default();
+        {
+            let mut recv = RecvStream {
+                id,
+                state: &mut receiver,
+                pending: &mut pending,
+            };
+            let mut chunks = recv.read(true).unwrap();
+            assert_eq!(chunks.next(256).unwrap().unwrap().bytes.len(), 256);
+            assert!(chunks.finalize().should_transmit());
+        }
+        assert_eq!(pending.stream_progress.get(&id), Some(&256));
+
+        {
+            let mut recv = RecvStream {
+                id,
+                state: &mut receiver,
+                pending: &mut pending,
+            };
+            let mut chunks = recv.read(true).unwrap();
+            assert_eq!(chunks.next(512).unwrap().unwrap().bytes.len(), 512);
+            assert!(chunks.finalize().should_transmit());
+        }
+        assert_eq!(pending.stream_progress.get(&id), Some(&768));
+
+        let mut disabled = make(Side::Server);
+        let _ = disabled
+            .received(
+                frame::Stream {
+                    id,
+                    offset: 0,
+                    fin: false,
+                    data: Bytes::from_static(b"progress stays negotiated-off"),
+                },
+                29,
+            )
+            .unwrap();
+        let mut disabled_pending = Retransmits::default();
+        let mut recv = RecvStream {
+            id,
+            state: &mut disabled,
+            pending: &mut disabled_pending,
+        };
+        let mut chunks = recv.read(true).unwrap();
+        assert!(chunks.next(usize::MAX).unwrap().is_some());
+        let _ = chunks.finalize();
+        assert!(disabled_pending.stream_progress.is_empty());
+    }
+
+    #[test]
+    fn stream_progress_retires_only_transmitted_bytes_and_preserves_fin() {
+        const MESSAGE: &[u8] = b"data-level progress";
+        let conn_state = ConnState::established();
+        let mut sender = make(Side::Client);
+        sender.set_params(&TransportParameters {
+            initial_max_data: VarInt::MAX,
+            initial_max_stream_data_uni: VarInt::MAX,
+            initial_max_streams_uni: 1u32.into(),
+            ..TransportParameters::default()
+        });
+        let id = Streams {
+            state: &mut sender,
+            conn_state: &conn_state,
+        }
+        .open(Dir::Uni)
+        .unwrap();
+        let mut pending = Retransmits::default();
+        {
+            let mut stream = SendStream {
+                id,
+                state: &mut sender,
+                pending: &mut pending,
+                conn_state: &conn_state,
+            };
+            assert_eq!(stream.write(MESSAGE), Ok(MESSAGE.len()));
+            stream.finish().unwrap();
+        }
+
+        let sent = sender.write_frames_for_test(1_200, false);
+        assert_eq!(sent.len(), 1);
+        let sent = sent[0].clone();
+        assert_eq!(sent.offsets, 0..MESSAGE.len() as u64);
+        assert!(sent.fin);
+        assert_eq!(sender.retransmit(sent.clone()), MESSAGE.len() as u64);
+
+        assert_eq!(sender.received_stream_progress(id, 5).unwrap(), 5);
+        let stream = sender.send.get(&id).unwrap().as_ref().unwrap();
+        assert_eq!(stream.pending.fully_acked_offset(), 5);
+        assert_eq!(stream.pending.lowest_retransmit_offset(), Some(5));
+        assert!(stream.fin_outstanding());
+        assert_eq!(sender.unacked_data(), MESSAGE.len() as u64 - 5);
+
+        assert_eq!(
+            sender
+                .received_stream_progress(id, MESSAGE.len() as u64)
+                .unwrap(),
+            MESSAGE.len() as u64 - 5,
+        );
+        let stream = sender.send.get(&id).unwrap().as_ref().unwrap();
+        assert_eq!(stream.pending.fully_acked_offset(), MESSAGE.len() as u64);
+        assert!(!stream.pending.has_retransmits());
+        assert!(stream.fin_outstanding());
+        assert_eq!(sender.unacked_data(), 0);
+        let fin_only = sender.write_frames_for_test(1_200, false);
+        assert_eq!(fin_only.len(), 1);
+        assert_eq!(
+            fin_only[0].offsets,
+            MESSAGE.len() as u64..MESSAGE.len() as u64
+        );
+        assert!(fin_only[0].fin, "STREAM_PROGRESS must not acknowledge FIN");
+
+        sender.received_ack_of(sent);
+        assert!(!sender.send.contains_key(&id));
+        assert_eq!(
+            sender
+                .received_stream_progress(id, MESSAGE.len() as u64)
+                .unwrap(),
+            0,
+            "a delayed duplicate after send-state release must be harmless",
+        );
+    }
+
+    #[test]
+    fn stream_progress_rejects_unsent_and_unopened_offsets() {
+        let conn_state = ConnState::established();
+        let mut sender = make(Side::Client);
+        sender.set_params(&TransportParameters {
+            initial_max_data: VarInt::MAX,
+            initial_max_stream_data_uni: VarInt::MAX,
+            initial_max_streams_uni: 2u32.into(),
+            ..TransportParameters::default()
+        });
+        let id = Streams {
+            state: &mut sender,
+            conn_state: &conn_state,
+        }
+        .open(Dir::Uni)
+        .unwrap();
+        let mut pending = Retransmits::default();
+        assert_eq!(
+            SendStream {
+                id,
+                state: &mut sender,
+                pending: &mut pending,
+                conn_state: &conn_state,
+            }
+            .write(b"not transmitted yet"),
+            Ok(19),
+        );
+
+        let error = sender.received_stream_progress(id, 1).unwrap_err();
+        assert_eq!(error.code, TransportErrorCode::PROTOCOL_VIOLATION);
+
+        let unopened = StreamId::new(Side::Client, Dir::Uni, 1);
+        let error = sender.received_stream_progress(unopened, 0).unwrap_err();
+        assert_eq!(error.code, TransportErrorCode::STREAM_STATE_ERROR);
+
+        let recv_only = StreamId::new(Side::Server, Dir::Uni, 0);
+        let error = sender.received_stream_progress(recv_only, 0).unwrap_err();
+        assert_eq!(error.code, TransportErrorCode::STREAM_STATE_ERROR);
+    }
+
+    #[test]
+    fn lost_stream_progress_coalesces_to_the_newest_offset() {
+        let id = StreamId::new(Side::Client, Dir::Uni, 0);
+        let mut pending = Retransmits::default();
+        pending.stream_progress.insert(id, 200);
+
+        let mut older_loss = Retransmits::default();
+        older_loss.stream_progress.insert(id, 100);
+        pending |= older_loss;
+        assert_eq!(pending.stream_progress.get(&id), Some(&200));
+
+        let mut newer_loss = Retransmits::default();
+        newer_loss.stream_progress.insert(id, 300);
+        pending |= newer_loss;
+        assert_eq!(pending.stream_progress.get(&id), Some(&300));
+    }
+
+    #[test]
+    fn stale_blocked_credit_requires_a_strictly_newer_local_value() {
+        let mut receiver = make(Side::Server);
+        let id = StreamId::new(Side::Client, Dir::Uni, 0);
+        let _ = receiver
+            .received(
+                frame::Stream {
+                    id,
+                    offset: 0,
+                    fin: false,
+                    data: Bytes::from_static(b"x"),
+                },
+                1,
+            )
+            .unwrap();
+
+        assert!(!receiver.has_newer_connection_credit(receiver.local_max_data));
+        assert!(receiver.has_newer_connection_credit(receiver.local_max_data - 1));
+
+        let current = receiver
+            .recv
+            .get(&id)
+            .and_then(Option::as_ref)
+            .and_then(StreamRecv::as_open_recv)
+            .unwrap()
+            .current_max_stream_data(receiver.stream_receive_window);
+        assert!(!receiver.has_newer_stream_credit(id, current));
+        assert!(receiver.has_newer_stream_credit(id, current - 1));
+    }
+
+    #[test]
+    fn repeated_blocked_writes_coalesce_while_pending() {
+        let conn_state = ConnState::established();
+
+        let mut stream_limited = make(Side::Client);
+        stream_limited.set_params(&TransportParameters {
+            initial_max_data: VarInt::MAX,
+            initial_max_stream_data_uni: 8u32.into(),
+            initial_max_streams_uni: 1u32.into(),
+            ..TransportParameters::default()
+        });
+        let stream_id = Streams {
+            state: &mut stream_limited,
+            conn_state: &conn_state,
+        }
+        .open(Dir::Uni)
+        .unwrap();
+        let mut pending = Retransmits::default();
+        {
+            let mut stream = SendStream {
+                id: stream_id,
+                state: &mut stream_limited,
+                pending: &mut pending,
+                conn_state: &conn_state,
+            };
+            assert_eq!(stream.write(b"12345678"), Ok(8));
+            for _ in 0..8 {
+                assert_eq!(stream.write(b"x"), Err(WriteError::Blocked));
+            }
+        }
+        assert_eq!(pending.stream_data_blocked.len(), 1);
+
+        let mut connection_limited = make(Side::Client);
+        connection_limited.set_params(&TransportParameters {
+            initial_max_data: 8u32.into(),
+            initial_max_stream_data_uni: VarInt::MAX,
+            initial_max_streams_uni: 1u32.into(),
+            ..TransportParameters::default()
+        });
+        let stream_id = Streams {
+            state: &mut connection_limited,
+            conn_state: &conn_state,
+        }
+        .open(Dir::Uni)
+        .unwrap();
+        let mut pending = Retransmits::default();
+        {
+            let mut stream = SendStream {
+                id: stream_id,
+                state: &mut connection_limited,
+                pending: &mut pending,
+                conn_state: &conn_state,
+            };
+            assert_eq!(stream.write(b"12345678"), Ok(8));
+            for _ in 0..8 {
+                assert_eq!(stream.write(b"x"), Err(WriteError::Blocked));
+            }
+        }
+        assert!(pending.data_blocked);
+    }
+
+    #[test]
+    fn outstanding_stream_obligation_includes_fin_only_frames() {
+        let conn_state = ConnState::established();
+        let mut sender = make(Side::Client);
+        sender.set_params(&TransportParameters {
+            initial_max_data: VarInt::MAX,
+            initial_max_stream_data_uni: VarInt::MAX,
+            initial_max_streams_uni: 1u32.into(),
+            ..TransportParameters::default()
+        });
+        let id = Streams {
+            state: &mut sender,
+            conn_state: &conn_state,
+        }
+        .open(Dir::Uni)
+        .unwrap();
+        let mut pending = Retransmits::default();
+        SendStream {
+            id,
+            state: &mut sender,
+            pending: &mut pending,
+            conn_state: &conn_state,
+        }
+        .finish()
+        .unwrap();
+
+        let fin = frame::StreamMeta {
+            id,
+            offsets: 0..0,
+            fin: true,
+        };
+        assert_eq!(
+            sender.first_outstanding_stream_obligation(&fin),
+            Some((id, 0))
+        );
+        sender.received_ack_of(fin.clone());
+        assert_eq!(sender.first_outstanding_stream_obligation(&fin), None);
     }
 
     #[test]

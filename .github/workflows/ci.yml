@@ -1,0 +1,36 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  root:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.88.0 --profile minimal --component clippy,rustfmt
+      - name: Check formatting
+        run: cargo +1.88.0 fmt --all -- --check
+      - name: Run root tests
+        run: cargo +1.88.0 test --locked --all-targets
+      - name: Run Clippy
+        run: cargo +1.88.0 clippy --locked --all-targets -- -D warnings
+      - name: Verify frozen evidence
+        run: ./scripts/verify_evidence.sh
+
+  vendor:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.88.0 --profile minimal --component clippy,rustfmt
+      - name: Test NoQ Proto patch set
+        run: cargo +1.88.0 test --locked --manifest-path third_party/noq-proto/Cargo.toml
+      - name: Test NoQ patch set
+        run: cargo +1.88.0 test --locked --manifest-path third_party/noq/Cargo.toml

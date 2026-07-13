@@ -1,1 +1,7 @@
-/target/
+# Cargo build output can be created by the root crate and both vendored crates.
+target/
+
+# Local editor and operating-system noise.
+.DS_Store
+*.swp
+*.swo
