@@ -8,6 +8,7 @@
 
 ```bash
 cargo test vpn_product_config -- --nocapture
+cargo test vpn_product_runtime -- --nocapture
 ./scripts/run_vpn_tun_lab.sh
 ```
 

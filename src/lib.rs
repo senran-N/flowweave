@@ -43,6 +43,8 @@ mod vpn_identity_config;
 #[cfg(target_os = "linux")]
 mod vpn_packet_bridge;
 mod vpn_product_config;
+#[cfg(target_os = "linux")]
+mod vpn_product_runtime;
 mod vpn_quota;
 mod vpn_session;
 mod vpn_tls;
@@ -149,6 +151,12 @@ pub use vpn_product_config::{
     VPN_TUN_NAME_MAX_BYTES, VpnClientProductConfig, VpnProductConfigError, VpnServerProductConfig,
     load_vpn_client_product_config, load_vpn_server_product_config,
     parse_vpn_client_product_config_json, parse_vpn_server_product_config_json,
+};
+#[cfg(target_os = "linux")]
+pub use vpn_product_runtime::{
+    VPN_PRODUCT_CREDENTIAL_MAX_BYTES, VpnClientProductBootstrap, VpnProductBootstrapError,
+    VpnProductCredentialError, VpnProductCredentialFile, VpnServerProductBootstrap,
+    load_vpn_client_product_bootstrap, load_vpn_server_product_bootstrap,
 };
 pub use vpn_quota::{
     VPN_DEFAULT_GLOBAL_INFLIGHT_PACKETS, VPN_DEFAULT_GLOBAL_REASSEMBLY_BYTES,
