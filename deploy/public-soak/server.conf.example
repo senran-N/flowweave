@@ -1,0 +1,6 @@
+# Dedicated public-soak server. The fixed upstream is the loopback echo service.
+listen=0.0.0.0:4433
+certificate_der=/etc/flowweave-public-soak/server.cert.der
+private_key_der=/etc/flowweave-public-soak/server.key.der
+token_file=/etc/flowweave-public-soak/token
+allowed_target=127.0.0.1:48080

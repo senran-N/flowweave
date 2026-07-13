@@ -1,0 +1,43 @@
+[Unit]
+Description=FlowWeave public-soak loopback echo target
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=flowweave
+Group=flowweave
+UMask=0077
+ExecStart=/usr/local/libexec/flowweave-public-soak/flowweave-proxy-soak echo-server --listen 127.0.0.1:48080
+Restart=on-failure
+RestartSec=2s
+TimeoutStopSec=25s
+LimitNOFILE=8192
+TasksMax=128
+MemoryMax=256M
+
+CapabilityBoundingSet=
+NoNewPrivileges=true
+PrivateDevices=true
+PrivateTmp=true
+ProtectClock=true
+ProtectControlGroups=true
+ProtectHome=true
+ProtectHostname=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectProc=invisible
+ProtectSystem=strict
+ProcSubset=pid
+RemoveIPC=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

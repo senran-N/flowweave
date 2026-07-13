@@ -49,7 +49,12 @@ pub use proxy_observe::{
     MAX_PROXY_EVENT_LINE_BYTES, PROXY_OBSERVATION_SCHEMA, ProxyHealthPolicy, ProxyHealthReport,
     ProxyObservation, ProxyRoleObservation, analyze_proxy_jsonl,
 };
-pub use proxy_soak::{PROXY_SOAK_REPORT_SCHEMA, ProxySoakConfig, ProxySoakReport, run_proxy_soak};
+pub use proxy_soak::{
+    PROXY_PUBLIC_SOAK_REPORT_SCHEMA, PROXY_SOAK_REPORT_SCHEMA, ProxyPublicSoakConfig,
+    ProxyPublicSoakReport, ProxyPublicSoakStopReason, ProxySoakConfig, ProxySoakReport,
+    run_proxy_public_soak, run_proxy_public_soak_with_checkpoints,
+    run_proxy_public_soak_with_shutdown, run_proxy_soak, run_proxy_soak_echo_server,
+};
 pub use realtime::{
     RealtimeDatagramConfig, RealtimeDatagramReport, run_batched_duplication_realtime,
 };

@@ -181,6 +181,8 @@ uname -srmo
 
 退出码为零且报告中的 `stage_pass=true` 才算通过。该命令只证明单机回环合同，不代表真实 Wi-Fi/蜂窝、公网 NAT 或生产 SLA；完整边界见 [PROXY_SOAK.md](../PROXY_SOAK.md)。
 
+真实公网阶段使用独立的 `public-workload` 和 loopback `echo-server` 模式，带应用限速、双向应用字节预算、周期检查点、中途失败报告和专用清理边界。它只需要一个受控客户端环境和一台受控公网测试服务器，但客户端必须有两条独立公网出口。部署步骤见 [public-soak/README.md](public-soak/README.md)。
+
 ## 7. 回退
 
 停止并移除单元不会修改系统网络配置：

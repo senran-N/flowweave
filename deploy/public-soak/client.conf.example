@@ -1,0 +1,11 @@
+# Dedicated public-soak client. Replace the server address, certificate name and path IPs.
+listen=127.0.0.1:10080
+server=203.0.113.10:4433
+server_name=flowweave-soak.example
+ca_certificate_der=/etc/flowweave-public-soak/ca.cert.der
+token_file=/etc/flowweave-public-soak/token
+target=127.0.0.1:48080
+
+# Both addresses must exist locally and have source-based routes to the same server.
+primary_local_ip=192.0.2.10
+additional_local_ips=198.51.100.20
