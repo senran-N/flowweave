@@ -2,7 +2,7 @@
 
 当前入口只转发一个固定 TCP 目标：本地应用连接客户端 loopback TCP 端口，客户端通过标准 TLS 1.3 MPQUIC 连接服务端，服务端只允许配置中的唯一 `allowed_target`。它不是 TUN、SOCKS5、开放代理或 UDP 转发器。
 
-`vpn-server.json.example`、`vpn-client.json.example` 和 `vpn-identities.json.example` 已经是代码可严格校验的未来 VPN 配置合同，但目前没有 systemd 单元或产品命令会读取它们。仓库已有 library 级单客户端 Endpoint 生命周期：服务端从样例合同绑定显式 UDP 地址并顺序处理连接，客户端从合同重新解析 DNS、严格校验证书名称、有限尝试地址并验证 primary/additional 源 IP 路径，随后完成 `FWC1`、地址精确比对、协商 DATAGRAM、双向包桥接和活动代际回收。隔离门控也已把这套生命周期与两端真实 TUN 同场组合：client/server 位于不同临时 network namespace，外层经 veth，IPv4/IPv6 UDP、256 KiB TCP 半关闭回显、双栈无特权 ICMP、精确 MTU/超 MTU 和连续两个代际通过。它仍不是产品命令，脚本中的地址/路由准备也不是可安装的 root oneshot；尚未修改真实默认路由、NAT 或 DNS。不要把这些样例当成可部署 VPN 入口；身份格式与剩余边界见 [VPN_IDENTITY.md](../VPN_IDENTITY.md) 和 [VPN_RESEARCH.md](../VPN_RESEARCH.md)。
+`vpn-server.json.example`、`vpn-client.json.example` 和 `vpn-identities.json.example` 已经是代码可严格校验的未来 VPN 配置合同，但目前没有 systemd 单元或产品命令会读取它们。仓库已有 library 级单客户端 Endpoint 生命周期：服务端从样例合同绑定显式 UDP 地址并顺序处理连接，客户端从合同重新解析 DNS、严格校验证书名称、有限尝试地址并验证 primary/additional 源 IP 路径，随后完成 `FWC1`、地址精确比对、协商 DATAGRAM、双向包桥接和活动代际回收。隔离门控也已把这套生命周期与两端真实 TUN 同场组合：client/server 位于不同临时 network namespace，外层经 veth，IPv4/IPv6 UDP、256 KiB TCP 半关闭回显、双栈无特权 ICMP、精确 MTU/超 MTU、连续三个代际和外层失联收敛通过；进程被 `SIGKILL` 后，两侧 TUN 也能由同一无特权身份重新附着。它仍不是产品命令，脚本中的地址/路由准备也不是可安装的 root oneshot；尚未修改真实默认路由、NAT 或 DNS。不要把这些样例当成可部署 VPN 入口；身份格式与剩余边界见 [VPN_IDENTITY.md](../VPN_IDENTITY.md) 和 [VPN_RESEARCH.md](../VPN_RESEARCH.md)。
 
 客户端样例中的 `expected_client_ipv4/ipv6` 与 `expected_server_ipv4/ipv6` 必须和服务端身份文件对该客户端的静态分配完全一致。它们不是让客户端自行申请地址：服务端证书身份仍是最终授权来源；这些预期值用于未来 root oneshot 在主进程启动前配置 TUN，并让数据进程在 `FWC1 ACCEPT` 后拒绝任何配置漂移。
 
@@ -14,7 +14,7 @@ cargo test vpn_product_runtime -- --nocapture
 ./scripts/run_vpn_tun_lab.sh
 ```
 
-第二条命令需要 Linux 的 `unshare`、mount namespace、`ip`、`ping`、`setpriv`、`jq` 以及当前用户的 `/etc/subuid`、`/etc/subgid` 映射。脚本会先证明已经离开主网络空间，临时创建 `fwvpn0` 并验证 root、未设置 `NoNewPrivileges`、接口 down、MTU 不一致和不存在接口均被拒绝；随后在两个嵌套 network namespace 中创建 veth 和各自的 `fwvpn0`，以无 capability 的设备 owner 运行 server/client，验证 IPv4/IPv6 UDP、TCP、双栈无特权 ICMP、分片、精确/超 MTU、两代际复用和退出后重新附着。退出后 mount 与全部网络空间消失。
+第二条命令需要 Linux 的 `unshare`、mount namespace、`ip`、`ping`、`setpriv`、`jq` 以及当前用户的 `/etc/subuid`、`/etc/subgid` 映射。脚本会先证明已经离开主网络空间，临时创建 `fwvpn0` 并验证 root、未设置 `NoNewPrivileges`、接口 down、MTU 不一致和不存在接口均被拒绝；随后在两个嵌套 network namespace 中创建 veth 和各自的 `fwvpn0`，以无 capability 的设备 owner 运行 server/client，验证 IPv4/IPv6 UDP、TCP、双栈无特权 ICMP、分片、精确/超 MTU、连续代际、外层 veth 断网收敛，以及双方进程被 `SIGKILL` 后的 TUN 重附着。所有标记等待都有上限，退出后 mount 与全部网络空间消失。
 
 ## 1. 构建和安装
 

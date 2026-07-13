@@ -36,6 +36,7 @@ use crate::{
 };
 
 pub const VPN_PRODUCT_CREDENTIAL_MAX_BYTES: usize = 1024 * 1024;
+pub const VPN_PRODUCT_CONNECTION_IDLE_TIMEOUT: Duration = Duration::from_secs(10);
 
 const VPN_PRODUCT_PATH_IDLE_TIMEOUT: Duration = Duration::from_secs(3);
 const PRODUCT_RUNTIME_START_FAILED_REASON: &[u8] = b"product_runtime_start_failed";
@@ -904,6 +905,11 @@ fn configure_product_transport(
         QuicCongestion::Cubic,
         false,
     );
+    transport.max_idle_timeout(Some(
+        VPN_PRODUCT_CONNECTION_IDLE_TIMEOUT
+            .try_into()
+            .expect("fixed VPN connection idle timeout fits QUIC transport parameters"),
+    ));
     transport.max_concurrent_multipath_paths(path_count.max(1));
     transport.max_concurrent_bidi_streams(incoming_bidi_streams.into());
     transport.max_concurrent_uni_streams(0_u8.into());
@@ -1066,6 +1072,13 @@ pub(crate) mod tests {
                 .len(),
             2
         );
+
+        let server_transport = format!("{:?}", server.tls_config().transport);
+        let mut client_transport = TransportConfig::default();
+        configure_product_transport(&mut client_transport, 1, 0);
+        let client_transport = format!("{client_transport:?}");
+        assert!(server_transport.contains("max_idle_timeout: Some(10000)"));
+        assert!(client_transport.contains("max_idle_timeout: Some(10000)"));
 
         let server_debug = format!("{server:?}");
         let client_debug = format!("{client:?}");

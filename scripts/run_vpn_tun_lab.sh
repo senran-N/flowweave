@@ -115,7 +115,7 @@ unshare \
             FLOWWEAVE_TUN_ENDPOINT_DIR="$3" \
             "$1" \
             --ignored \
-            --exact real_tun_and_endpoint_complete_two_generations \
+            --exact real_tun_endpoint_protocol_mtu_and_connection_loss \
             --nocapture
         chown -R 1000:1000 "$3"/*
         chown 0:1000 "$3"
@@ -149,7 +149,17 @@ unshare \
         ip netns exec fwclient sh -c '"'"'echo "1000 1000" > /proc/sys/net/ipv4/ping_group_range'"'"'
 
         server_pid=
+        client_pid=
+        fault_pid=
         cleanup_endpoint_lab() {
+            if [ -n "$fault_pid" ] && kill -0 "$fault_pid" 2>/dev/null; then
+                kill "$fault_pid" 2>/dev/null || true
+                wait "$fault_pid" 2>/dev/null || true
+            fi
+            if [ -n "$client_pid" ] && kill -0 "$client_pid" 2>/dev/null; then
+                kill "$client_pid" 2>/dev/null || true
+                wait "$client_pid" 2>/dev/null || true
+            fi
             if [ -n "$server_pid" ] && kill -0 "$server_pid" 2>/dev/null; then
                 kill "$server_pid" 2>/dev/null || true
                 wait "$server_pid" 2>/dev/null || true
@@ -159,6 +169,42 @@ unshare \
         }
         trap cleanup_endpoint_lab EXIT
         trap "exit 1" HUP INT TERM
+
+        wait_for_endpoint_marker() {
+            marker=$1
+            process_pid=$2
+            process_log=$3
+            description=$4
+            marker_attempts=0
+            while [ "$marker_attempts" -lt 200 ]; do
+                if [ -f "$marker" ]; then
+                    return 0
+                fi
+                if ! kill -0 "$process_pid" 2>/dev/null; then
+                    break
+                fi
+                marker_attempts=$((marker_attempts + 1))
+                sleep 0.05
+            done
+            cat "$process_log" >&2 || true
+            echo "$description 未在固定截止内就绪" >&2
+            return 1
+        }
+
+        (
+            fault_attempts=0
+            while [ "$fault_attempts" -lt 400 ]; do
+                if [ -f "$3/fault.ready" ]; then
+                    ip netns exec fwclient ip link set fwclient0 down
+                    exit 0
+                fi
+                fault_attempts=$((fault_attempts + 1))
+                sleep 0.05
+            done
+            echo "等待外层断网注入标记超时" >&2
+            exit 1
+        ) >"$3/fault.log" 2>&1 &
+        fault_pid=$!
 
         ip netns exec fwserver \
             setpriv \
@@ -176,7 +222,7 @@ unshare \
                     FLOWWEAVE_TUN_ENDPOINT_DIR="$3" \
                     "$1" \
                     --ignored \
-                    --exact real_tun_and_endpoint_complete_two_generations \
+                    --exact real_tun_endpoint_protocol_mtu_and_connection_loss \
                     --nocapture \
             >"$3/server.log" 2>&1 &
         server_pid=$!
@@ -217,16 +263,129 @@ unshare \
                     FLOWWEAVE_TUN_ENDPOINT_DIR="$3" \
                     "$1" \
                     --ignored \
-                    --exact real_tun_and_endpoint_complete_two_generations \
+                    --exact real_tun_endpoint_protocol_mtu_and_connection_loss \
                     --nocapture || client_status=$?
         if [ "$client_status" -ne 0 ]; then
             cat "$3/server.log" >&2 || true
+            cat "$3/fault.log" >&2 || true
             exit "$client_status"
         fi
+        if ! wait "$fault_pid"; then
+            fault_pid=
+            cat "$3/fault.log" >&2 || true
+            cat "$3/server.log" >&2 || true
+            exit 1
+        fi
+        fault_pid=
         if ! wait "$server_pid"; then
             server_pid=
             cat "$3/server.log" >&2 || true
             exit 1
         fi
         server_pid=
+
+        ip netns exec fwclient ip link set fwclient0 up
+        rm -f \
+            "$3/cleanup.server.ready" \
+            "$3/cleanup.client.ready" \
+            "$3/cleanup.server.log" \
+            "$3/cleanup.client.log"
+
+        ip netns exec fwserver \
+            setpriv \
+                --no-new-privs \
+                --bounding-set=-all \
+                --inh-caps=-all \
+                --ambient-caps=-all \
+                --reuid=1000 \
+                --regid=1000 \
+                --clear-groups \
+                env \
+                    FLOWWEAVE_TUN_LAB=1 \
+                    FLOWWEAVE_HOST_NETNS="$2" \
+                    FLOWWEAVE_TUN_CLEANUP_ROLE=server \
+                    FLOWWEAVE_TUN_ENDPOINT_DIR="$3" \
+                    "$1" \
+                    --ignored \
+                    --exact real_tun_endpoint_process_cleanup \
+                    --nocapture \
+            >"$3/cleanup.server.log" 2>&1 &
+        server_pid=$!
+        wait_for_endpoint_marker \
+            "$3/cleanup.server.ready" \
+            "$server_pid" \
+            "$3/cleanup.server.log" \
+            "异常退出清理服务端"
+
+        ip netns exec fwclient \
+            setpriv \
+                --no-new-privs \
+                --bounding-set=-all \
+                --inh-caps=-all \
+                --ambient-caps=-all \
+                --reuid=1000 \
+                --regid=1000 \
+                --clear-groups \
+                env \
+                    FLOWWEAVE_TUN_LAB=1 \
+                    FLOWWEAVE_HOST_NETNS="$2" \
+                    FLOWWEAVE_TUN_CLEANUP_ROLE=client \
+                    FLOWWEAVE_TUN_ENDPOINT_DIR="$3" \
+                    "$1" \
+                    --ignored \
+                    --exact real_tun_endpoint_process_cleanup \
+                    --nocapture \
+            >"$3/cleanup.client.log" 2>&1 &
+        client_pid=$!
+        wait_for_endpoint_marker \
+            "$3/cleanup.client.ready" \
+            "$client_pid" \
+            "$3/cleanup.client.log" \
+            "异常退出清理客户端"
+
+        if ! kill -KILL "$client_pid"; then
+            cat "$3/cleanup.client.log" >&2 || true
+            exit 1
+        fi
+        if wait "$client_pid"; then
+            echo "客户端收到 SIGKILL 后意外成功退出" >&2
+            exit 1
+        fi
+        client_pid=
+        if ! kill -0 "$server_pid" 2>/dev/null; then
+            cat "$3/cleanup.server.log" >&2 || true
+            echo "客户端被强制终止后服务端进程意外退出" >&2
+            exit 1
+        fi
+
+        if ! kill -KILL "$server_pid"; then
+            cat "$3/cleanup.server.log" >&2 || true
+            exit 1
+        fi
+        if wait "$server_pid"; then
+            echo "服务端收到 SIGKILL 后意外成功退出" >&2
+            exit 1
+        fi
+        server_pid=
+
+        for endpoint_namespace in fwclient fwserver; do
+            ip netns exec "$endpoint_namespace" \
+                setpriv \
+                    --no-new-privs \
+                    --bounding-set=-all \
+                    --inh-caps=-all \
+                    --ambient-caps=-all \
+                    --reuid=1000 \
+                    --regid=1000 \
+                    --clear-groups \
+                    env \
+                        FLOWWEAVE_TUN_LAB=1 \
+                        FLOWWEAVE_HOST_NETNS="$2" \
+                        FLOWWEAVE_TUN_CLEANUP_ROLE=reattach \
+                        FLOWWEAVE_TUN_ENDPOINT_DIR="$3" \
+                        "$1" \
+                        --ignored \
+                        --exact real_tun_endpoint_process_cleanup \
+                        --nocapture
+        done
     ' sh "$LAB_BINARY" "$HOST_NETNS" "$LAB_STATE_DIR"

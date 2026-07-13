@@ -168,13 +168,13 @@ pub use vpn_product_endpoint::{
 #[cfg(target_os = "linux")]
 pub use vpn_product_runtime::{
     VPN_CLOSE_PRODUCT_RUNTIME_START_FAILED, VPN_CLOSE_PRODUCT_RUNTIME_STOPPED,
-    VPN_PRODUCT_CREDENTIAL_MAX_BYTES, VpnClientProductBootstrap, VpnClientProductConnectionReport,
-    VpnClientProductConnectionRuntime, VpnProductBootstrapError, VpnProductConnectionStartError,
-    VpnProductCredentialError, VpnProductCredentialFile, VpnServerProductBootstrap,
-    VpnServerProductConnectionOutcome, VpnServerProductConnectionReport,
-    VpnServerProductConnectionRuntime, load_vpn_client_product_bootstrap,
-    load_vpn_server_product_bootstrap, start_vpn_client_product_connection,
-    start_vpn_server_product_connection,
+    VPN_PRODUCT_CONNECTION_IDLE_TIMEOUT, VPN_PRODUCT_CREDENTIAL_MAX_BYTES,
+    VpnClientProductBootstrap, VpnClientProductConnectionReport, VpnClientProductConnectionRuntime,
+    VpnProductBootstrapError, VpnProductConnectionStartError, VpnProductCredentialError,
+    VpnProductCredentialFile, VpnServerProductBootstrap, VpnServerProductConnectionOutcome,
+    VpnServerProductConnectionReport, VpnServerProductConnectionRuntime,
+    load_vpn_client_product_bootstrap, load_vpn_server_product_bootstrap,
+    start_vpn_client_product_connection, start_vpn_server_product_connection,
 };
 pub use vpn_quota::{
     VPN_DEFAULT_GLOBAL_INFLIGHT_PACKETS, VPN_DEFAULT_GLOBAL_REASSEMBLY_BYTES,

@@ -2,6 +2,7 @@
 
 use std::{
     fs,
+    future::pending,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     os::fd::AsRawFd,
     os::unix::fs::PermissionsExt,
@@ -12,10 +13,11 @@ use std::{
 };
 
 use flowweave_lab::{
-    VpnProductEndpointLimits, VpnServerProductEndpointStopReason, VpnTunAttachError,
-    attach_existing_vpn_tun, connect_vpn_client_product_endpoint,
-    load_vpn_client_product_bootstrap, load_vpn_server_product_bootstrap,
-    start_vpn_server_product_endpoint, vpn_certificate_fingerprint,
+    VpnDatagramRuntimeStopReason, VpnPacketBridgeStopReason, VpnProductEndpointLimits,
+    VpnServerProductEndpointStopReason, VpnTunAttachError, attach_existing_vpn_tun,
+    connect_vpn_client_product_endpoint, load_vpn_client_product_bootstrap,
+    load_vpn_server_product_bootstrap, start_vpn_server_product_endpoint,
+    vpn_certificate_fingerprint,
 };
 use rcgen::{
     BasicConstraints, Certificate, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa,
@@ -26,7 +28,7 @@ use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     net::{TcpListener, TcpSocket, TcpStream, UdpSocket, tcp::OwnedReadHalf, tcp::OwnedWriteHalf},
     task::spawn_blocking,
-    time::{sleep, timeout},
+    time::{Instant, sleep, timeout},
 };
 
 const SERVER_OUTER_IPV4: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 1);
@@ -41,6 +43,7 @@ const SERVER_UPLINK_IPV4_PORT: u16 = 6100;
 const SERVER_UPLINK_IPV6_PORT: u16 = 6101;
 const SERVER_TCP_IPV4_PORT: u16 = 6200;
 const IO_TIMEOUT: Duration = Duration::from_secs(10);
+const FAULT_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[test]
 #[ignore = "必须通过 scripts/run_vpn_tun_lab.sh 在一次性 user+network namespace 中运行"]
@@ -99,7 +102,7 @@ async fn existing_tun_is_attached_only_by_unprivileged_owner() {
 
 #[tokio::test(flavor = "current_thread")]
 #[ignore = "必须通过 scripts/run_vpn_tun_lab.sh 在一次性双 network namespace 中运行"]
-async fn real_tun_and_endpoint_complete_two_generations() {
+async fn real_tun_endpoint_protocol_mtu_and_connection_loss() {
     assert_isolated_lab();
     let directory = endpoint_lab_directory();
     match std::env::var("FLOWWEAVE_TUN_ENDPOINT_ROLE").as_deref() {
@@ -108,6 +111,42 @@ async fn real_tun_and_endpoint_complete_two_generations() {
         Ok("client") => run_endpoint_client(&directory).await,
         _ => panic!("missing or invalid FLOWWEAVE_TUN_ENDPOINT_ROLE"),
     }
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "必须通过 scripts/run_vpn_tun_lab.sh 在一次性双 network namespace 中运行"]
+async fn real_tun_endpoint_process_cleanup() {
+    assert_isolated_lab();
+    let directory = endpoint_lab_directory();
+    match std::env::var("FLOWWEAVE_TUN_CLEANUP_ROLE").as_deref() {
+        Ok("server") => run_cleanup_hold_server(&directory).await,
+        Ok("client") => run_cleanup_hold_client(&directory).await,
+        Ok("reattach") => drop(attach_existing_vpn_tun("fwvpn0", 1500).unwrap()),
+        _ => panic!("missing or invalid FLOWWEAVE_TUN_CLEANUP_ROLE"),
+    }
+}
+
+async fn run_cleanup_hold_server(directory: &Path) {
+    let attached = attach_existing_vpn_tun("fwvpn0", 1500).unwrap();
+    let bootstrap =
+        Arc::new(load_vpn_server_product_bootstrap(&directory.join("vpn-server.json")).unwrap());
+    let runtime =
+        start_vpn_server_product_endpoint(bootstrap, attached.device(), endpoint_limits()).unwrap();
+    fs::write(directory.join("cleanup.server.ready"), b"ready").unwrap();
+    let _held_resources = (attached, runtime);
+    pending::<()>().await;
+}
+
+async fn run_cleanup_hold_client(directory: &Path) {
+    let attached = attach_existing_vpn_tun("fwvpn0", 1500).unwrap();
+    let bootstrap = load_vpn_client_product_bootstrap(&directory.join("vpn-client.json")).unwrap();
+    let runtime =
+        connect_vpn_client_product_endpoint(&bootstrap, attached.device(), endpoint_limits())
+            .await
+            .unwrap();
+    fs::write(directory.join("cleanup.client.ready"), b"ready").unwrap();
+    let _held_resources = (attached, runtime);
+    pending::<()>().await;
 }
 
 async fn run_endpoint_server(directory: &Path) {
@@ -282,12 +321,18 @@ async fn run_endpoint_server(directory: &Path) {
     wait_for_server_session_release(&bootstrap).await;
     send_line(&mut write, "GEN2_RELEASED").await;
 
+    assert_eq!(read_line(&mut read).await, "FAULT_CONNECTED");
+    send_line(&mut write, "FAULT_ARMED").await;
+    let fault_started = Instant::now();
+    wait_for_server_session_release_with_timeout(&bootstrap, FAULT_TIMEOUT).await;
+    assert!(fault_started.elapsed() <= FAULT_TIMEOUT);
+
     let report = runtime.shutdown().await.unwrap();
     assert_eq!(
         report.stop_reason,
         VpnServerProductEndpointStopReason::ShutdownRequested
     );
-    assert_eq!(report.completed_sessions, 2);
+    assert_eq!(report.completed_sessions, 3);
     assert_eq!(report.session_rejections, 0);
     assert_eq!(report.runtime_start_failures, 0);
     assert_eq!(report.worker_failures, 0);
@@ -297,6 +342,13 @@ async fn run_endpoint_server(directory: &Path) {
         report
             .last_connection
             .is_some_and(|connection| connection.session_released)
+    );
+    assert_connection_loss_stop(
+        report
+            .last_connection
+            .expect("fault generation must have a report")
+            .packet_bridge
+            .stop_reason,
     );
     drop(attached);
     drop(attach_existing_vpn_tun("fwvpn0", 1500).unwrap());
@@ -513,6 +565,18 @@ async fn run_endpoint_client(directory: &Path) {
     send_line(&mut write, "GEN2_DONE").await;
     assert_eq!(read_line(&mut read).await, "GEN2_RELEASED");
 
+    let third = connect_vpn_client_product_endpoint(&bootstrap, attached.device(), limits)
+        .await
+        .unwrap();
+    send_line(&mut write, "FAULT_CONNECTED").await;
+    assert_eq!(read_line(&mut read).await, "FAULT_ARMED");
+    fs::write(directory.join("fault.ready"), b"ready").unwrap();
+    let fault_started = Instant::now();
+    let third_report = timeout(FAULT_TIMEOUT, third.wait()).await.unwrap();
+    assert!(fault_started.elapsed() <= FAULT_TIMEOUT);
+    assert!(third_report.endpoint_drained);
+    assert_connection_loss_stop(third_report.connection.packet_bridge.stop_reason);
+
     drop(attached);
     drop(attach_existing_vpn_tun("fwvpn0", 1500).unwrap());
 }
@@ -656,7 +720,14 @@ fn parse_port(line: &str, command: &str) -> u16 {
 }
 
 async fn wait_for_server_session_release(bootstrap: &flowweave_lab::VpnServerProductBootstrap) {
-    timeout(IO_TIMEOUT, async {
+    wait_for_server_session_release_with_timeout(bootstrap, IO_TIMEOUT).await;
+}
+
+async fn wait_for_server_session_release_with_timeout(
+    bootstrap: &flowweave_lab::VpnServerProductBootstrap,
+    deadline: Duration,
+) {
+    timeout(deadline, async {
         loop {
             if bootstrap.coordinator().active_session("client-a").is_none() {
                 return;
@@ -666,6 +737,16 @@ async fn wait_for_server_session_release(bootstrap: &flowweave_lab::VpnServerPro
     })
     .await
     .unwrap();
+}
+
+fn assert_connection_loss_stop(reason: VpnPacketBridgeStopReason) {
+    assert!(matches!(
+        reason,
+        VpnPacketBridgeStopReason::DatagramRuntime(
+            VpnDatagramRuntimeStopReason::ConnectionClosed
+                | VpnDatagramRuntimeStopReason::ConnectionFailed
+        )
+    ));
 }
 
 fn payload(length: usize, fill: u8) -> Vec<u8> {
