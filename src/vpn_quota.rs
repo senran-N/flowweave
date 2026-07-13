@@ -130,15 +130,21 @@ impl VpnQuotaMetrics {
         increment(&self.inner.identity_inflight_rejections);
     }
 
-    fn record_admitted(&self, direction: VpnPacketDirection, datagram_len: usize) {
-        let bytes = u64::try_from(datagram_len).unwrap_or(u64::MAX);
+    fn record_admitted(
+        &self,
+        direction: VpnPacketDirection,
+        datagram_count: usize,
+        datagram_bytes: usize,
+    ) {
+        let packets = u64::try_from(datagram_count).unwrap_or(u64::MAX);
+        let bytes = u64::try_from(datagram_bytes).unwrap_or(u64::MAX);
         match direction {
             VpnPacketDirection::Uplink => {
-                increment(&self.inner.admitted_uplink_datagrams);
+                add(&self.inner.admitted_uplink_datagrams, packets);
                 add(&self.inner.admitted_uplink_bytes, bytes);
             }
             VpnPacketDirection::Downlink => {
-                increment(&self.inner.admitted_downlink_datagrams);
+                add(&self.inner.admitted_downlink_datagrams, packets);
                 add(&self.inner.admitted_downlink_bytes, bytes);
             }
         }
@@ -220,18 +226,39 @@ impl VpnIdentityRateLimiter {
         datagram_len: usize,
         now: Instant,
     ) -> Result<(), VpnQuotaRejection> {
-        if datagram_len == 0 || datagram_len > VPN_MAX_IP_DATAGRAM_LEN {
+        self.admit_datagrams(direction, &[datagram_len], now)
+    }
+
+    pub(crate) fn admit_datagrams(
+        &self,
+        direction: VpnPacketDirection,
+        datagram_lengths: &[usize],
+        now: Instant,
+    ) -> Result<(), VpnQuotaRejection> {
+        if datagram_lengths.is_empty()
+            || datagram_lengths
+                .iter()
+                .any(|length| *length == 0 || *length > VPN_MAX_IP_DATAGRAM_LEN)
+        {
             self.metrics.record_invalid_datagram();
             return Err(VpnQuotaRejection::InvalidDatagramSize);
         }
+
+        let datagram_bytes = datagram_lengths
+            .iter()
+            .try_fold(0_usize, |total, length| total.checked_add(*length))
+            .ok_or_else(|| {
+                self.metrics.record_invalid_datagram();
+                VpnQuotaRejection::InvalidDatagramSize
+            })?;
 
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         state.refill(now);
-        let packet_cost = TOKEN_SCALE;
-        let byte_cost = (datagram_len as u128).saturating_mul(TOKEN_SCALE);
+        let packet_cost = (datagram_lengths.len() as u128).saturating_mul(TOKEN_SCALE);
+        let byte_cost = (datagram_bytes as u128).saturating_mul(TOKEN_SCALE);
         if state.packet_tokens < packet_cost {
             self.metrics.record_packet_rate_rejection();
             return Err(VpnQuotaRejection::PacketRateExceeded);
@@ -243,7 +270,8 @@ impl VpnIdentityRateLimiter {
         state.packet_tokens -= packet_cost;
         state.byte_tokens -= byte_cost;
         drop(state);
-        self.metrics.record_admitted(direction, datagram_len);
+        self.metrics
+            .record_admitted(direction, datagram_lengths.len(), datagram_bytes);
         Ok(())
     }
 }
@@ -507,6 +535,26 @@ mod tests {
             .admit_datagram(VpnPacketDirection::Uplink, VPN_MAX_IP_DATAGRAM_LEN, started)
             .unwrap();
         assert_eq!(metrics.snapshot().invalid_datagram_rejections, 1);
+    }
+
+    #[test]
+    fn rejected_batch_does_not_consume_partial_packet_or_byte_tokens() {
+        let started = Instant::now();
+        let metrics = VpnQuotaMetrics::default();
+        let limits = VpnIdentityLimits::new(1, 2, 65_535, VPN_MAX_IP_PACKET_LEN).unwrap();
+        let limiter = VpnIdentityRateLimiter::new(limits, started, metrics.clone());
+
+        assert_eq!(
+            limiter.admit_datagrams(VpnPacketDirection::Uplink, &[100, 100, 100], started),
+            Err(VpnQuotaRejection::PacketRateExceeded)
+        );
+        limiter
+            .admit_datagrams(VpnPacketDirection::Uplink, &[100, 100], started)
+            .unwrap();
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.admitted_uplink_datagrams, 2);
+        assert_eq!(snapshot.admitted_uplink_bytes, 200);
+        assert_eq!(snapshot.packet_rate_rejections, 1);
     }
 
     #[test]

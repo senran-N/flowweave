@@ -1,14 +1,18 @@
 use std::{
     error::Error,
     fmt,
-    sync::{Arc, Mutex, MutexGuard},
+    sync::{
+        Arc, Mutex, MutexGuard,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Instant,
 };
 
 use crate::{
     VpnDataPolicyError, VpnDataPolicyMetricsSnapshot, VpnIdentity, VpnIpPacketMeta,
     VpnPacketDirection, VpnPacketError, VpnQuotaMetricsSnapshot, VpnQuotaRejection, VpnReassembler,
-    VpnReassemblyLimits, VpnReassemblyStats, decode_vpn_ip_fragment, validate_vpn_ip_packet_policy,
+    VpnReassemblyLimits, VpnReassemblyStats, decode_vpn_ip_fragment, encode_vpn_ip_fragments,
+    validate_vpn_ip_packet_policy,
     vpn::{VPN_DEFAULT_FRAGMENT_TIMEOUT, VPN_DEFAULT_MAX_INFLIGHT_PACKETS},
     vpn_data_policy::VpnDataPolicyMetrics,
     vpn_quota::{VpnGlobalReassemblyBudget, VpnIdentityRateLimiter, VpnQuotaMetrics},
@@ -106,6 +110,7 @@ impl VpnDataPathHandle {
                 global_budget,
                 quota_metrics,
                 policy_metrics,
+                runtime_bound: AtomicBool::new(false),
                 state: Mutex::new(VpnDataPathState {
                     active: false,
                     uplink: VpnReassembler::new(limits)?,
@@ -119,6 +124,44 @@ impl VpnDataPathHandle {
 
     pub fn session_generation(&self) -> u64 {
         self.inner.session_generation
+    }
+
+    pub fn encode_ip_packet(
+        &self,
+        direction: VpnPacketDirection,
+        packet_id: u32,
+        packet: &[u8],
+        max_datagram_len: usize,
+        now: Instant,
+    ) -> Result<Vec<Vec<u8>>, VpnDataPathError> {
+        let state = self.lock_state();
+        if !state.active {
+            self.inner.quota_metrics.record_stale_generation();
+            return Err(VpnDataPathError::StaleGeneration);
+        }
+
+        let policy = validate_vpn_ip_packet_policy(&self.inner.identity, direction, packet);
+        let metadata = match policy {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                self.inner
+                    .policy_metrics
+                    .record(direction, packet.len(), &Err(error));
+                return Err(VpnDataPathError::Policy(error));
+            }
+        };
+        let fragments = encode_vpn_ip_fragments(packet_id, packet, max_datagram_len)
+            .map_err(VpnDataPathError::Fragment)?;
+        let lengths = fragments.iter().map(Vec::len).collect::<Vec<_>>();
+        self.inner
+            .rate_limiter
+            .admit_datagrams(direction, &lengths, now)
+            .map_err(VpnDataPathError::Quota)?;
+        self.inner
+            .policy_metrics
+            .record(direction, packet.len(), &Ok(metadata));
+        drop(state);
+        Ok(fragments)
     }
 
     pub fn ingest_datagram(
@@ -292,6 +335,17 @@ impl VpnDataPathHandle {
         self.release_all_accounted(&mut state);
     }
 
+    pub(crate) fn try_bind_runtime(&self) -> bool {
+        self.inner
+            .runtime_bound
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    pub(crate) fn unbind_runtime(&self) {
+        self.inner.runtime_bound.store(false, Ordering::Release);
+    }
+
     fn make_identity_room(
         &self,
         state: &mut VpnDataPathState,
@@ -384,6 +438,7 @@ struct VpnDataPathInner {
     global_budget: VpnGlobalReassemblyBudget,
     quota_metrics: VpnQuotaMetrics,
     policy_metrics: VpnDataPolicyMetrics,
+    runtime_bound: AtomicBool,
     state: Mutex<VpnDataPathState>,
 }
 
@@ -611,6 +666,40 @@ mod tests {
         let snapshot = quota.snapshot();
         assert_eq!(snapshot.admitted_uplink_datagrams, 1);
         assert_eq!(snapshot.packet_rate_rejections, 1);
+    }
+
+    #[test]
+    fn outbound_fragment_batch_is_all_or_nothing_for_rate_tokens() {
+        let started = Instant::now();
+        let limits = VpnIdentityLimits::new(1, 2, 1_000_000, VPN_MAX_IP_PACKET_LEN).unwrap();
+        let (handle, quota, policy) = active_handle(limits, "0.0.0.0/0", 1, 8 * 1024 * 1024, 16);
+        let fragmented = ipv4_packet(2500, "10.77.0.2", "198.51.100.8", 0x41);
+        assert_eq!(
+            handle
+                .encode_ip_packet(VpnPacketDirection::Uplink, 1, &fragmented, 1200, started,)
+                .unwrap_err(),
+            VpnDataPathError::Quota(VpnQuotaRejection::PacketRateExceeded)
+        );
+
+        let packet = ipv4_packet(20, "10.77.0.2", "198.51.100.8", 0x42);
+        assert_eq!(
+            handle
+                .encode_ip_packet(VpnPacketDirection::Uplink, 2, &packet, 1200, started)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            handle
+                .encode_ip_packet(VpnPacketDirection::Uplink, 3, &packet, 1200, started)
+                .unwrap()
+                .len(),
+            1
+        );
+        let quota = quota.snapshot();
+        assert_eq!(quota.admitted_uplink_datagrams, 2);
+        assert_eq!(quota.packet_rate_rejections, 1);
+        assert_eq!(policy.snapshot().forwarded_uplink_packets, 2);
     }
 
     #[test]

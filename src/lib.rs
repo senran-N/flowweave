@@ -36,6 +36,7 @@ mod vpn_active_session;
 mod vpn_control;
 mod vpn_data_path;
 mod vpn_data_policy;
+mod vpn_datagram_runtime;
 mod vpn_identity;
 mod vpn_identity_config;
 mod vpn_quota;
@@ -106,6 +107,14 @@ pub use vpn_data_path::fuzz_vpn_data_path;
 pub use vpn_data_path::{VpnDataPacket, VpnDataPathError, VpnDataPathHandle, VpnDataPathSnapshot};
 pub use vpn_data_policy::{
     VpnDataPolicyError, VpnDataPolicyMetricsSnapshot, validate_vpn_ip_packet_policy,
+};
+pub use vpn_datagram_runtime::{
+    VPN_DEFAULT_PACKET_QUEUE_BYTES, VPN_DEFAULT_PACKET_QUEUE_PACKETS, VPN_DEFAULT_REASSEMBLY_TICK,
+    VPN_MAX_PACKET_QUEUE_BYTES, VPN_MAX_PACKET_QUEUE_PACKETS, VPN_MAX_REASSEMBLY_TICK,
+    VpnDatagramRole, VpnDatagramRuntime, VpnDatagramRuntimeConfig, VpnDatagramRuntimeConfigError,
+    VpnDatagramRuntimeMetrics, VpnDatagramRuntimeMetricsSnapshot, VpnDatagramRuntimeReport,
+    VpnDatagramRuntimeStartError, VpnDatagramRuntimeStopReason, VpnPacketQueueError,
+    VpnPacketSender, VpnQueuedPacket, start_vpn_datagram_runtime,
 };
 pub use vpn_identity::{
     VPN_MAX_BYTES_PER_SECOND, VPN_MAX_CLIENT_ID_LEN, VPN_MAX_CONNECTIONS_PER_IDENTITY,
