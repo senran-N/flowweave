@@ -442,12 +442,14 @@ impl ProxyRuntime {
     }
 
     async fn join(&mut self) -> LabResult<()> {
-        let task = self
+        let result = self
             .task
-            .take()
-            .ok_or_else(|| other_error("代理运行任务已经结束"))?;
-        task.await
-            .map_err(|error| other_error(format!("代理运行任务异常退出：{error}")))?
+            .as_mut()
+            .ok_or_else(|| other_error("代理运行任务已经结束"))?
+            .await
+            .map_err(|error| other_error(format!("代理运行任务异常退出：{error}")))?;
+        self.task.take();
+        result
     }
 
     pub async fn wait(mut self) -> LabResult<()> {
@@ -1868,11 +1870,39 @@ mod tests {
 
     use tokio::io::AsyncReadExt;
     use tokio::sync::Notify;
-    use tokio::time::timeout;
+    use tokio::time::{sleep, timeout};
 
     use super::*;
 
     static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+    #[tokio::test]
+    async fn runtime_join_remains_available_when_select_cancels_wait() {
+        let (shutdown, mut shutdown_rx) = watch::channel(false);
+        let task: JoinHandle<LabResult<()>> = tokio::spawn(async move {
+            shutdown_rx
+                .changed()
+                .await
+                .map_err(|_| other_error("测试关闭通道意外结束"))?;
+            Ok(())
+        });
+        let mut runtime = ProxyRuntime {
+            local_addr: "127.0.0.1:1".parse().unwrap(),
+            shutdown,
+            metrics: Arc::new(ProxyMetrics::default()),
+            task: Some(task),
+        };
+
+        tokio::select! {
+            biased;
+            result = runtime.join() => panic!("运行任务不应提前结束：{result:?}"),
+            _ = sleep(Duration::from_millis(20)) => {}
+        }
+        assert!(runtime.task.is_some());
+        runtime.request_shutdown();
+        runtime.join().await.unwrap();
+        assert!(runtime.task.is_none());
+    }
 
     fn test_runtime_limits() -> ProxyRuntimeLimits {
         ProxyRuntimeLimits {
