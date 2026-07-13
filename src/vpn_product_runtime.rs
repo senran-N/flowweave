@@ -4,33 +4,45 @@ use std::{
     fs::{self, File},
     io::{self, Read},
     path::Path,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 
 use noq::{
-    ClientConfig, ServerConfig, TransportConfig,
+    ClientConfig, Connection, ServerConfig, TransportConfig,
     rustls::{
         RootCertStore,
         pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer},
     },
 };
 
+use crate::vpn_packet_bridge::start_vpn_packet_bridge_with_completion_guard;
 use crate::{
     MultipathScheduler, PtoRecovery, QuicCongestion, VPN_CAP_IPV4, VPN_CAP_IPV6,
     VPN_REQUIRED_CAPABILITIES, VPN_WIRE_VERSION_V1, VpnClientDataPathConfig,
-    VpnClientDataPathConfigError, VpnClientDataPathFactory, VpnClientProductConfig,
-    VpnControlError, VpnDatagramRole, VpnDatagramRuntimeConfig, VpnDatagramRuntimeConfigError,
-    VpnHello, VpnIdentityConfigError, VpnManagedSessionError, VpnPacketBridgeConfig,
-    VpnPacketBridgeConfigError, VpnProductConfigError, VpnServerNegotiationConfig,
-    VpnServerProductConfig, VpnSessionCoordinator, build_vpn_client_tls_config,
-    build_vpn_server_tls_config, configure_transport, load_vpn_client_product_config,
-    load_vpn_identity_registry, load_vpn_server_product_config,
+    VpnClientDataPathConfigError, VpnClientDataPathError, VpnClientDataPathFactory,
+    VpnClientProductConfig, VpnControlError, VpnDatagramRole, VpnDatagramRuntimeConfig,
+    VpnDatagramRuntimeConfigError, VpnDatagramRuntimeStartError, VpnHello, VpnIdentityConfigError,
+    VpnManagedServerOutcome, VpnManagedSessionError, VpnPacketBridge, VpnPacketBridgeConfig,
+    VpnPacketBridgeConfigError, VpnPacketBridgeMetricsSnapshot, VpnPacketBridgeReport,
+    VpnPacketBridgeStartError, VpnPacketDevice, VpnProductConfigError, VpnReject,
+    VpnServerNegotiationConfig, VpnServerProductConfig, VpnSessionCoordinator, VpnSessionError,
+    build_vpn_client_tls_config, build_vpn_server_tls_config, configure_transport,
+    load_vpn_client_product_config, load_vpn_identity_registry, load_vpn_server_product_config,
+    start_vpn_datagram_runtime, vpn_client_control_handshake, vpn_server_managed_control_handshake,
 };
 
 pub const VPN_PRODUCT_CREDENTIAL_MAX_BYTES: usize = 1024 * 1024;
 
 const VPN_PRODUCT_PATH_IDLE_TIMEOUT: Duration = Duration::from_secs(3);
+const PRODUCT_RUNTIME_START_FAILED_REASON: &[u8] = b"product_runtime_start_failed";
+const PRODUCT_RUNTIME_STOPPED_REASON: &[u8] = b"product_runtime_stopped";
+
+pub const VPN_CLOSE_PRODUCT_RUNTIME_START_FAILED: u32 = 0x107;
+pub const VPN_CLOSE_PRODUCT_RUNTIME_STOPPED: u32 = 0x108;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VpnProductCredentialFile {
@@ -182,6 +194,7 @@ pub struct VpnServerProductBootstrap {
     negotiation: VpnServerNegotiationConfig,
     datagram: VpnDatagramRuntimeConfig,
     packet_bridge: VpnPacketBridgeConfig,
+    runtime_active: Arc<AtomicBool>,
 }
 
 impl VpnServerProductBootstrap {
@@ -208,6 +221,10 @@ impl VpnServerProductBootstrap {
     pub const fn packet_bridge_config(&self) -> VpnPacketBridgeConfig {
         self.packet_bridge
     }
+
+    fn acquire_runtime(&self) -> Option<VpnProductRuntimeLease> {
+        VpnProductRuntimeLease::acquire(self.runtime_active.clone())
+    }
 }
 
 impl fmt::Debug for VpnServerProductBootstrap {
@@ -233,6 +250,7 @@ pub struct VpnClientProductBootstrap {
     data_path_factory: VpnClientDataPathFactory,
     datagram: VpnDatagramRuntimeConfig,
     packet_bridge: VpnPacketBridgeConfig,
+    runtime_active: Arc<AtomicBool>,
 }
 
 impl VpnClientProductBootstrap {
@@ -259,6 +277,10 @@ impl VpnClientProductBootstrap {
     pub const fn packet_bridge_config(&self) -> VpnPacketBridgeConfig {
         self.packet_bridge
     }
+
+    fn acquire_runtime(&self) -> Option<VpnProductRuntimeLease> {
+        VpnProductRuntimeLease::acquire(self.runtime_active.clone())
+    }
 }
 
 impl fmt::Debug for VpnClientProductBootstrap {
@@ -272,6 +294,440 @@ impl fmt::Debug for VpnClientProductBootstrap {
             .field("packet_bridge", &self.packet_bridge)
             .finish_non_exhaustive()
     }
+}
+
+#[derive(Debug)]
+pub enum VpnProductConnectionStartError {
+    RuntimeAlreadyActive,
+    ServerSession(VpnManagedSessionError),
+    ClientSession(VpnSessionError),
+    AssignedAddressMismatch,
+    ClientDataPath(VpnClientDataPathError),
+    DatagramConfig(VpnDatagramRuntimeConfigError),
+    DatagramRuntime(VpnDatagramRuntimeStartError),
+    PacketBridgeConfig(VpnPacketBridgeConfigError),
+    PacketBridgeRuntime(VpnPacketBridgeStartError),
+}
+
+impl fmt::Display for VpnProductConnectionStartError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ServerSession(error) => {
+                write!(formatter, "vpn_product_connection_server_session:{error}")
+            }
+            Self::ClientSession(error) => {
+                write!(formatter, "vpn_product_connection_client_session:{error}")
+            }
+            Self::ClientDataPath(error) => {
+                write!(formatter, "vpn_product_connection_client_data_path:{error}")
+            }
+            Self::DatagramConfig(error) => {
+                write!(formatter, "vpn_product_connection_datagram_config:{error}")
+            }
+            Self::DatagramRuntime(error) => {
+                write!(formatter, "vpn_product_connection_datagram_runtime:{error}")
+            }
+            Self::PacketBridgeConfig(error) => {
+                write!(
+                    formatter,
+                    "vpn_product_connection_packet_bridge_config:{error}"
+                )
+            }
+            Self::PacketBridgeRuntime(error) => {
+                write!(
+                    formatter,
+                    "vpn_product_connection_packet_bridge_runtime:{error}"
+                )
+            }
+            Self::RuntimeAlreadyActive => {
+                formatter.write_str("vpn_product_connection_runtime_already_active")
+            }
+            Self::AssignedAddressMismatch => {
+                formatter.write_str("vpn_product_connection_assigned_address_mismatch")
+            }
+        }
+    }
+}
+
+impl Error for VpnProductConnectionStartError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::ServerSession(error) => Some(error),
+            Self::ClientSession(error) => Some(error),
+            Self::ClientDataPath(error) => Some(error),
+            Self::DatagramConfig(error) => Some(error),
+            Self::DatagramRuntime(error) => Some(error),
+            Self::PacketBridgeConfig(error) => Some(error),
+            Self::PacketBridgeRuntime(error) => Some(error),
+            Self::RuntimeAlreadyActive | Self::AssignedAddressMismatch => None,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum VpnServerProductConnectionOutcome {
+    Active(Box<VpnServerProductConnectionRuntime>),
+    Rejected(VpnReject),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VpnServerProductConnectionReport {
+    pub selected_wire_version: u16,
+    pub capabilities: u32,
+    pub session_generation: u64,
+    pub session_released: bool,
+    pub packet_bridge: VpnPacketBridgeReport,
+}
+
+pub struct VpnServerProductConnectionRuntime {
+    connection: Connection,
+    bridge: Option<VpnPacketBridge>,
+    coordinator: VpnSessionCoordinator,
+    client_id: String,
+    selected_wire_version: u16,
+    capabilities: u32,
+    session_generation: u64,
+    finished: bool,
+    _lease: VpnProductRuntimeLease,
+}
+
+impl VpnServerProductConnectionRuntime {
+    pub const fn session_generation(&self) -> u64 {
+        self.session_generation
+    }
+
+    pub fn packet_bridge_metrics(&self) -> VpnPacketBridgeMetricsSnapshot {
+        self.bridge
+            .as_ref()
+            .expect("active product runtime has a packet bridge")
+            .metrics_snapshot()
+    }
+
+    pub async fn shutdown(mut self) -> VpnServerProductConnectionReport {
+        let packet_bridge = self
+            .bridge
+            .take()
+            .expect("active product runtime has a packet bridge")
+            .shutdown()
+            .await;
+        self.report(packet_bridge)
+    }
+
+    pub async fn wait(mut self) -> VpnServerProductConnectionReport {
+        let packet_bridge = self
+            .bridge
+            .take()
+            .expect("active product runtime has a packet bridge")
+            .wait()
+            .await;
+        self.report(packet_bridge)
+    }
+
+    fn report(&mut self, packet_bridge: VpnPacketBridgeReport) -> VpnServerProductConnectionReport {
+        let session_released = self.finish();
+        VpnServerProductConnectionReport {
+            selected_wire_version: self.selected_wire_version,
+            capabilities: self.capabilities,
+            session_generation: self.session_generation,
+            session_released,
+            packet_bridge,
+        }
+    }
+
+    fn finish(&mut self) -> bool {
+        if self.finished {
+            return false;
+        }
+        self.finished = true;
+        let released = self
+            .coordinator
+            .release_if_current(&self.client_id, self.session_generation);
+        self.connection.close(
+            VPN_CLOSE_PRODUCT_RUNTIME_STOPPED.into(),
+            PRODUCT_RUNTIME_STOPPED_REASON,
+        );
+        released
+    }
+}
+
+impl fmt::Debug for VpnServerProductConnectionRuntime {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("VpnServerProductConnectionRuntime")
+            .field("client_id", &"[redacted]")
+            .field("selected_wire_version", &self.selected_wire_version)
+            .field("capabilities", &self.capabilities)
+            .field("session_generation", &self.session_generation)
+            .field("metrics", &self.packet_bridge_metrics())
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for VpnServerProductConnectionRuntime {
+    fn drop(&mut self) {
+        self.finish();
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VpnClientProductConnectionReport {
+    pub selected_wire_version: u16,
+    pub capabilities: u32,
+    pub session_generation: u64,
+    pub packet_bridge: VpnPacketBridgeReport,
+}
+
+pub struct VpnClientProductConnectionRuntime {
+    connection: Connection,
+    bridge: Option<VpnPacketBridge>,
+    accept: crate::VpnAccept,
+    finished: bool,
+    _lease: VpnProductRuntimeLease,
+}
+
+impl VpnClientProductConnectionRuntime {
+    pub const fn accept(&self) -> crate::VpnAccept {
+        self.accept
+    }
+
+    pub fn packet_bridge_metrics(&self) -> VpnPacketBridgeMetricsSnapshot {
+        self.bridge
+            .as_ref()
+            .expect("active product runtime has a packet bridge")
+            .metrics_snapshot()
+    }
+
+    pub async fn shutdown(mut self) -> VpnClientProductConnectionReport {
+        let packet_bridge = self
+            .bridge
+            .take()
+            .expect("active product runtime has a packet bridge")
+            .shutdown()
+            .await;
+        self.report(packet_bridge)
+    }
+
+    pub async fn wait(mut self) -> VpnClientProductConnectionReport {
+        let packet_bridge = self
+            .bridge
+            .take()
+            .expect("active product runtime has a packet bridge")
+            .wait()
+            .await;
+        self.report(packet_bridge)
+    }
+
+    fn report(&mut self, packet_bridge: VpnPacketBridgeReport) -> VpnClientProductConnectionReport {
+        self.finish();
+        VpnClientProductConnectionReport {
+            selected_wire_version: self.accept.selected_wire_version,
+            capabilities: self.accept.capabilities,
+            session_generation: self.accept.session_generation,
+            packet_bridge,
+        }
+    }
+
+    fn finish(&mut self) {
+        if self.finished {
+            return;
+        }
+        self.finished = true;
+        self.connection.close(
+            VPN_CLOSE_PRODUCT_RUNTIME_STOPPED.into(),
+            PRODUCT_RUNTIME_STOPPED_REASON,
+        );
+    }
+}
+
+impl fmt::Debug for VpnClientProductConnectionRuntime {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("VpnClientProductConnectionRuntime")
+            .field("selected_wire_version", &self.accept.selected_wire_version)
+            .field("capabilities", &self.accept.capabilities)
+            .field("session_generation", &self.accept.session_generation)
+            .field("assigned_addresses", &"[redacted]")
+            .field("metrics", &self.packet_bridge_metrics())
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for VpnClientProductConnectionRuntime {
+    fn drop(&mut self) {
+        self.finish();
+    }
+}
+
+struct VpnProductRuntimeLease {
+    state: Arc<VpnProductRuntimeLeaseState>,
+}
+
+struct VpnProductRuntimeLeaseState {
+    active: Arc<AtomicBool>,
+}
+
+impl VpnProductRuntimeLease {
+    fn acquire(active: Arc<AtomicBool>) -> Option<Self> {
+        active
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .ok()
+            .map(|_| Self {
+                state: Arc::new(VpnProductRuntimeLeaseState { active }),
+            })
+    }
+}
+
+impl Clone for VpnProductRuntimeLease {
+    fn clone(&self) -> Self {
+        Self {
+            state: self.state.clone(),
+        }
+    }
+}
+
+impl Drop for VpnProductRuntimeLeaseState {
+    fn drop(&mut self) {
+        self.active.store(false, Ordering::Release);
+    }
+}
+
+pub async fn start_vpn_server_product_connection(
+    bootstrap: &VpnServerProductBootstrap,
+    connection: Connection,
+    device: &VpnPacketDevice,
+    handshake_timeout: Duration,
+) -> Result<VpnServerProductConnectionOutcome, VpnProductConnectionStartError> {
+    let Some(lease) = bootstrap.acquire_runtime() else {
+        close_runtime_start_failed(&connection);
+        return Err(VpnProductConnectionStartError::RuntimeAlreadyActive);
+    };
+    let outcome = vpn_server_managed_control_handshake(
+        &connection,
+        &bootstrap.coordinator,
+        bootstrap.negotiation,
+        handshake_timeout,
+    )
+    .await
+    .map_err(|error| {
+        close_runtime_start_failed(&connection);
+        VpnProductConnectionStartError::ServerSession(error)
+    })?;
+
+    let active = match outcome {
+        VpnManagedServerOutcome::Active(active) => active,
+        VpnManagedServerOutcome::Rejected(reject) => {
+            return Ok(VpnServerProductConnectionOutcome::Rejected(reject));
+        }
+    };
+    let accept = active.session().accept();
+    let client_id = active.session().identity().client_id().to_owned();
+    let data_path = active.data_path().clone();
+    let bridge = match start_product_packet_bridge(
+        connection.clone(),
+        data_path,
+        VpnDatagramRole::Server,
+        accept,
+        device.clone(),
+        lease.clone(),
+    ) {
+        Ok(bridge) => bridge,
+        Err(error) => {
+            bootstrap
+                .coordinator
+                .release_if_current(&client_id, accept.session_generation);
+            close_runtime_start_failed(&connection);
+            return Err(error);
+        }
+    };
+
+    Ok(VpnServerProductConnectionOutcome::Active(Box::new(
+        VpnServerProductConnectionRuntime {
+            connection,
+            bridge: Some(bridge),
+            coordinator: bootstrap.coordinator.clone(),
+            client_id,
+            selected_wire_version: accept.selected_wire_version,
+            capabilities: accept.capabilities,
+            session_generation: accept.session_generation,
+            finished: false,
+            _lease: lease,
+        },
+    )))
+}
+
+pub async fn start_vpn_client_product_connection(
+    bootstrap: &VpnClientProductBootstrap,
+    connection: Connection,
+    device: &VpnPacketDevice,
+    handshake_timeout: Duration,
+) -> Result<VpnClientProductConnectionRuntime, VpnProductConnectionStartError> {
+    let Some(lease) = bootstrap.acquire_runtime() else {
+        close_runtime_start_failed(&connection);
+        return Err(VpnProductConnectionStartError::RuntimeAlreadyActive);
+    };
+    let accept = vpn_client_control_handshake(&connection, bootstrap.hello, handshake_timeout)
+        .await
+        .map_err(VpnProductConnectionStartError::ClientSession)?;
+    if !client_accept_addresses_match(&bootstrap.config, accept) {
+        close_runtime_start_failed(&connection);
+        return Err(VpnProductConnectionStartError::AssignedAddressMismatch);
+    }
+    let data_path = bootstrap.data_path_factory.build(accept).map_err(|error| {
+        close_runtime_start_failed(&connection);
+        VpnProductConnectionStartError::ClientDataPath(error)
+    })?;
+    let bridge = start_product_packet_bridge(
+        connection.clone(),
+        data_path,
+        VpnDatagramRole::Client,
+        accept,
+        device.clone(),
+        lease.clone(),
+    )
+    .inspect_err(|_| close_runtime_start_failed(&connection))?;
+
+    Ok(VpnClientProductConnectionRuntime {
+        connection,
+        bridge: Some(bridge),
+        accept,
+        finished: false,
+        _lease: lease,
+    })
+}
+
+fn start_product_packet_bridge(
+    connection: Connection,
+    data_path: crate::VpnDataPathHandle,
+    role: VpnDatagramRole,
+    accept: crate::VpnAccept,
+    device: VpnPacketDevice,
+    lease: VpnProductRuntimeLease,
+) -> Result<VpnPacketBridge, VpnProductConnectionStartError> {
+    let datagram_config = VpnDatagramRuntimeConfig::from_accept(role, accept)
+        .map_err(VpnProductConnectionStartError::DatagramConfig)?;
+    let runtime = start_vpn_datagram_runtime(connection, data_path, datagram_config)
+        .map_err(VpnProductConnectionStartError::DatagramRuntime)?;
+    let bridge_config = VpnPacketBridgeConfig::new(usize::from(accept.max_ip_packet_len))
+        .map_err(VpnProductConnectionStartError::PacketBridgeConfig)?;
+    start_vpn_packet_bridge_with_completion_guard(device, runtime, bridge_config, lease)
+        .map_err(VpnProductConnectionStartError::PacketBridgeRuntime)
+}
+
+fn client_accept_addresses_match(
+    config: &VpnClientProductConfig,
+    accept: crate::VpnAccept,
+) -> bool {
+    accept.client_ipv4 == config.expected_client_ipv4()
+        && accept.server_ipv4 == config.expected_server_ipv4()
+        && accept.client_ipv6 == config.expected_client_ipv6()
+        && accept.server_ipv6 == config.expected_server_ipv6()
+}
+
+fn close_runtime_start_failed(connection: &Connection) {
+    connection.close(
+        VPN_CLOSE_PRODUCT_RUNTIME_START_FAILED.into(),
+        PRODUCT_RUNTIME_START_FAILED_REASON,
+    );
 }
 
 pub fn load_vpn_server_product_bootstrap(
@@ -351,6 +807,7 @@ fn build_server_bootstrap(
         negotiation,
         datagram,
         packet_bridge,
+        runtime_active: Arc::new(AtomicBool::new(false)),
     })
 }
 
@@ -418,6 +875,7 @@ fn build_client_bootstrap(
         data_path_factory,
         datagram,
         packet_bridge,
+        runtime_active: Arc::new(AtomicBool::new(false)),
     })
 }
 
@@ -552,17 +1010,24 @@ fn enforce_private_permissions(
 #[cfg(test)]
 mod tests {
     use std::{
+        os::fd::OwnedFd,
+        os::unix::net::UnixDatagram as StdUnixDatagram,
         path::{Path, PathBuf},
         sync::atomic::{AtomicU64, Ordering},
     };
 
+    use noq::Endpoint;
     use rcgen::{
         BasicConstraints, Certificate, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa,
         Issuer, KeyPair, KeyUsagePurpose,
     };
     use serde_json::json;
 
-    use crate::{VPN_CAP_IPV4, VPN_CAP_IPV6, vpn_certificate_fingerprint};
+    use tokio::{net::UnixDatagram, time::timeout};
+
+    use crate::{
+        VPN_CAP_IPV4, VPN_CAP_IPV6, VpnPacketBridgeStopReason, vpn_certificate_fingerprint,
+    };
 
     use super::*;
 
@@ -682,6 +1147,177 @@ mod tests {
             load_vpn_server_product_bootstrap(&deployment.server_config),
             Err(VpnProductBootstrapError::IdentityLimitExceedsGlobalBudget)
         ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn product_connection_runtime_bridges_both_directions_and_releases_session() {
+        let _network_test_guard = crate::LOCAL_NETWORK_TEST_LOCK.lock().await;
+        let deployment = TestDeployment::new();
+        let server =
+            Arc::new(load_vpn_server_product_bootstrap(&deployment.server_config).unwrap());
+        let client = load_vpn_client_product_bootstrap(&deployment.client_config).unwrap();
+
+        let server_endpoint =
+            Endpoint::server(server.tls_config().clone(), "127.0.0.1:0".parse().unwrap()).unwrap();
+        let server_addr = server_endpoint.local_addr().unwrap();
+        let client_endpoint = Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        client_endpoint.set_default_client_config(client.tls_config().clone());
+
+        let (server_device, server_tun) = packet_device_pair();
+        let (client_device, client_tun) = packet_device_pair();
+        let accept_endpoint = server_endpoint.clone();
+        let server_context = server.clone();
+        let server_task = tokio::spawn(async move {
+            let incoming = accept_endpoint.accept().await.unwrap();
+            let connection = incoming.accept().unwrap().await.unwrap();
+            connection.handshake_confirmed().await.unwrap();
+            start_vpn_server_product_connection(
+                &server_context,
+                connection,
+                &server_device,
+                Duration::from_secs(2),
+            )
+            .await
+            .unwrap()
+        });
+
+        let connection = client_endpoint
+            .connect(server_addr, client.config().server_name())
+            .unwrap()
+            .await
+            .unwrap();
+        connection.handshake_confirmed().await.unwrap();
+        let client_runtime = start_vpn_client_product_connection(
+            &client,
+            connection,
+            &client_device,
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+        let VpnServerProductConnectionOutcome::Active(server_runtime) = server_task.await.unwrap()
+        else {
+            panic!("registered client must be accepted");
+        };
+
+        assert_eq!(
+            client_runtime.accept().client_ipv4,
+            client.config().expected_client_ipv4()
+        );
+        let uplink = ipv4_packet(1280, "10.77.0.2", "198.51.100.8", 0x41);
+        client_tun.send(&uplink).await.unwrap();
+        let mut buffer = vec![0_u8; 1600];
+        let received = timeout(Duration::from_secs(2), server_tun.recv(&mut buffer))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&buffer[..received], uplink.as_slice());
+
+        let downlink = ipv6_packet(1500, "2001:db8::8", "fd77::2", 0x52);
+        server_tun.send(&downlink).await.unwrap();
+        let received = timeout(Duration::from_secs(2), client_tun.recv(&mut buffer))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&buffer[..received], downlink.as_slice());
+
+        let (client_report, server_report) =
+            tokio::join!(client_runtime.shutdown(), server_runtime.shutdown());
+        assert_eq!(
+            client_report.packet_bridge.stop_reason,
+            VpnPacketBridgeStopReason::ShutdownRequested
+        );
+        assert_eq!(
+            server_report.packet_bridge.stop_reason,
+            VpnPacketBridgeStopReason::ShutdownRequested
+        );
+        assert!(server_report.session_released);
+        assert!(server.coordinator().active_session("client-a").is_none());
+        assert_eq!(client_report.packet_bridge.metrics.device_read_packets, 1);
+        assert_eq!(server_report.packet_bridge.metrics.device_read_packets, 1);
+
+        client_endpoint.close(0_u8.into(), b"test complete");
+        server_endpoint.close(0_u8.into(), b"test complete");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn assigned_address_drift_is_rejected_before_client_data_path_starts() {
+        let _network_test_guard = crate::LOCAL_NETWORK_TEST_LOCK.lock().await;
+        let deployment = TestDeployment::new();
+        let mut client_config: serde_json::Value =
+            serde_json::from_slice(&fs::read(&deployment.client_config).unwrap()).unwrap();
+        client_config["expected_client_ipv4"] = serde_json::Value::from("10.77.0.9");
+        write_json(&deployment.client_config, &client_config);
+
+        let server =
+            Arc::new(load_vpn_server_product_bootstrap(&deployment.server_config).unwrap());
+        let client = load_vpn_client_product_bootstrap(&deployment.client_config).unwrap();
+        let server_endpoint =
+            Endpoint::server(server.tls_config().clone(), "127.0.0.1:0".parse().unwrap()).unwrap();
+        let server_addr = server_endpoint.local_addr().unwrap();
+        let client_endpoint = Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        client_endpoint.set_default_client_config(client.tls_config().clone());
+        let (server_device, _server_tun) = packet_device_pair();
+        let (client_device, _client_tun) = packet_device_pair();
+
+        let accept_endpoint = server_endpoint.clone();
+        let server_context = server.clone();
+        let server_task = tokio::spawn(async move {
+            let incoming = accept_endpoint.accept().await.unwrap();
+            let connection = incoming.accept().unwrap().await.unwrap();
+            connection.handshake_confirmed().await.unwrap();
+            start_vpn_server_product_connection(
+                &server_context,
+                connection,
+                &server_device,
+                Duration::from_secs(2),
+            )
+            .await
+            .unwrap()
+        });
+
+        let connection = client_endpoint
+            .connect(server_addr, client.config().server_name())
+            .unwrap()
+            .await
+            .unwrap();
+        connection.handshake_confirmed().await.unwrap();
+        assert!(matches!(
+            start_vpn_client_product_connection(
+                &client,
+                connection,
+                &client_device,
+                Duration::from_secs(2),
+            )
+            .await,
+            Err(VpnProductConnectionStartError::AssignedAddressMismatch)
+        ));
+
+        let VpnServerProductConnectionOutcome::Active(server_runtime) = server_task.await.unwrap()
+        else {
+            panic!("registered client must complete server authorization");
+        };
+        let report = timeout(Duration::from_secs(2), server_runtime.wait())
+            .await
+            .unwrap();
+        assert!(report.session_released);
+        assert!(server.coordinator().active_session("client-a").is_none());
+
+        client_endpoint.close(0_u8.into(), b"test complete");
+        server_endpoint.close(0_u8.into(), b"test complete");
+    }
+
+    #[test]
+    fn product_runtime_lease_prevents_two_tun_readers() {
+        let deployment = TestDeployment::new();
+        let client = load_vpn_client_product_bootstrap(&deployment.client_config).unwrap();
+        let first = client.acquire_runtime().unwrap();
+        let worker_guard = first.clone();
+        assert!(client.acquire_runtime().is_none());
+        drop(first);
+        assert!(client.acquire_runtime().is_none());
+        drop(worker_guard);
+        assert!(client.acquire_runtime().is_some());
     }
 
     struct TestDeployment {
@@ -833,5 +1469,39 @@ mod tests {
 
         fs::write(path, bytes).unwrap();
         fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    fn packet_device_pair() -> (VpnPacketDevice, UnixDatagram) {
+        let (device, peer) = StdUnixDatagram::pair().unwrap();
+        peer.set_nonblocking(true).unwrap();
+        let device = VpnPacketDevice::from_file(File::from(OwnedFd::from(device))).unwrap();
+        let peer = UnixDatagram::from_std(peer).unwrap();
+        (device, peer)
+    }
+
+    fn ipv4_packet(len: usize, source: &str, destination: &str, fill: u8) -> Vec<u8> {
+        let source = source.parse::<std::net::Ipv4Addr>().unwrap().octets();
+        let destination = destination.parse::<std::net::Ipv4Addr>().unwrap().octets();
+        let mut packet = vec![fill; len];
+        packet[0] = 0x45;
+        packet[2..4].copy_from_slice(&(len as u16).to_be_bytes());
+        packet[8] = 64;
+        packet[9] = 17;
+        packet[12..16].copy_from_slice(&source);
+        packet[16..20].copy_from_slice(&destination);
+        packet
+    }
+
+    fn ipv6_packet(len: usize, source: &str, destination: &str, fill: u8) -> Vec<u8> {
+        let source = source.parse::<std::net::Ipv6Addr>().unwrap().octets();
+        let destination = destination.parse::<std::net::Ipv6Addr>().unwrap().octets();
+        let mut packet = vec![fill; len];
+        packet[0] = 0x60;
+        packet[4..6].copy_from_slice(&((len - 40) as u16).to_be_bytes());
+        packet[6] = 17;
+        packet[7] = 64;
+        packet[8..24].copy_from_slice(&source);
+        packet[24..40].copy_from_slice(&destination);
+        packet
     }
 }

@@ -304,19 +304,32 @@ pub fn start_vpn_packet_bridge(
     runtime: VpnDatagramRuntime,
     config: VpnPacketBridgeConfig,
 ) -> Result<VpnPacketBridge, VpnPacketBridgeStartError> {
+    start_vpn_packet_bridge_with_completion_guard(device, runtime, config, ())
+}
+
+pub(crate) fn start_vpn_packet_bridge_with_completion_guard<G>(
+    device: VpnPacketDevice,
+    runtime: VpnDatagramRuntime,
+    config: VpnPacketBridgeConfig,
+    completion_guard: G,
+) -> Result<VpnPacketBridge, VpnPacketBridgeStartError>
+where
+    G: Send + 'static,
+{
     VpnPacketBridgeConfig::new(config.max_packet_len)
         .map_err(VpnPacketBridgeStartError::InvalidConfig)?;
     tokio::runtime::Handle::try_current()
         .map_err(|_| VpnPacketBridgeStartError::RuntimeUnavailable)?;
     let control = VpnPacketBridgeControl::new();
     let metrics = VpnPacketBridgeMetrics::default();
-    let task = tokio::spawn(run_vpn_packet_bridge(
-        device,
-        runtime,
-        config,
-        control.clone(),
-        metrics.clone(),
-    ));
+    let task_control = control.clone();
+    let task_metrics = metrics.clone();
+    let task = tokio::spawn(async move {
+        let report =
+            run_vpn_packet_bridge(device, runtime, config, task_control, task_metrics).await;
+        drop(completion_guard);
+        report
+    });
     Ok(VpnPacketBridge {
         control,
         task: Some(task),
