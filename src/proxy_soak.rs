@@ -389,6 +389,7 @@ pub async fn run_proxy_soak(config: ProxySoakConfig) -> LabResult<ProxySoakRepor
             certificate_der: certificate_path.clone(),
             private_key_der: key_path,
             token_file: token_path.clone(),
+            previous_token_file: None,
             allowed_target: upstream_addr,
         },
         sink.clone(),

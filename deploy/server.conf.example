@@ -3,4 +3,5 @@ listen=0.0.0.0:4433
 certificate_der=/etc/flowweave/server.cert.der
 private_key_der=/etc/flowweave/server.key.der
 token_file=/etc/flowweave/token
+previous_token_file=/etc/flowweave/token.previous
 allowed_target=127.0.0.1:22

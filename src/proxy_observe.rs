@@ -12,6 +12,8 @@ pub struct ProxyRoleObservation {
     pub runtime_started: u64,
     pub startup_failed: u64,
     pub runtime_failed: u64,
+    pub credential_reloads: u64,
+    pub credential_reload_failures: u64,
     pub connection_failures: u64,
     pub stream_failures: u64,
     pub timeout_events: u64,
@@ -42,6 +44,8 @@ impl ProxyRoleObservation {
             "runtime_started": self.runtime_started,
             "startup_failed": self.startup_failed,
             "runtime_failed": self.runtime_failed,
+            "credential_reloads": self.credential_reloads,
+            "credential_reload_failures": self.credential_reload_failures,
             "connection_failures": self.connection_failures,
             "stream_failures": self.stream_failures,
             "timeout_events": self.timeout_events,
@@ -355,6 +359,25 @@ fn ingest_role_event(
             }
             role.runtime_failed += 1;
         }
+        "credentials_reloaded" => {
+            if record.get("kind").and_then(Value::as_str) != Some("token")
+                || !matches!(
+                    record.get("accepted_token_count").and_then(Value::as_u64),
+                    Some(1 | 2)
+                )
+            {
+                return false;
+            }
+            role.credential_reloads += 1;
+        }
+        "credentials_reload_failed" => {
+            if record.get("kind").and_then(Value::as_str) != Some("token")
+                || record.get("reason").and_then(Value::as_str) != Some("token_reload_failed")
+            {
+                return false;
+            }
+            role.credential_reload_failures += 1;
+        }
         "connection_started" => {
             let Some(connection_id) = record.get("connection_id").and_then(Value::as_u64) else {
                 return false;
@@ -485,6 +508,7 @@ fn evaluate_role(
     let runtime_failures = saturating_sum([
         role.startup_failed,
         role.runtime_failed,
+        role.credential_reload_failures,
         role.task_failures,
         role.path_event_lag_reports,
         role.connection_failures,
@@ -748,6 +772,12 @@ mod tests {
             push(
                 &mut lines,
                 role,
+                "credentials_reloaded",
+                json!({"kind": "token", "accepted_token_count": 1}),
+            );
+            push(
+                &mut lines,
+                role,
                 "shutdown_started",
                 json!({"drain_timeout_ms": 10000}),
             );
@@ -769,7 +799,39 @@ mod tests {
         assert!(report.healthy, "{:?}", report.violations);
         assert_eq!(observation.client.streams_started, 1);
         assert_eq!(observation.server.streams_finished, 1);
+        assert_eq!(observation.client.credential_reloads, 1);
+        assert_eq!(observation.server.credential_reload_failures, 0);
         assert_eq!(report.to_json()["schema"], PROXY_OBSERVATION_SCHEMA);
+    }
+
+    #[test]
+    fn failed_credential_reload_uses_existing_runtime_failure_threshold() {
+        let mut fixture = healthy_fixture();
+        let mut lines = Vec::new();
+        push(
+            &mut lines,
+            "server",
+            "credentials_reload_failed",
+            json!({"kind": "token", "reason": "token_reload_failed"}),
+        );
+        fixture.push('\n');
+        fixture.push_str(&lines[0]);
+
+        let observation = analyze_proxy_jsonl(Cursor::new(fixture)).unwrap();
+        assert_eq!(observation.server.credential_reload_failures, 1);
+        let strict = observation.evaluate(ProxyHealthPolicy::strict_both());
+        assert!(!strict.healthy);
+        assert!(
+            strict
+                .violations
+                .contains(&"server.runtime_failures_exceeded".to_owned())
+        );
+
+        let policy = ProxyHealthPolicy {
+            max_runtime_failures: 1,
+            ..ProxyHealthPolicy::strict_both()
+        };
+        assert!(observation.evaluate(policy).healthy);
     }
 
     #[test]

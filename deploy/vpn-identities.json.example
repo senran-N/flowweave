@@ -1,0 +1,26 @@
+{
+  "config_version": 1,
+  "server_ipv4": "10.77.0.1",
+  "server_ipv6": "fd77::1",
+  "identities": [
+    {
+      "client_id": "replace-with-stable-client-id",
+      "fingerprints": [
+        "1111111111111111111111111111111111111111111111111111111111111111"
+      ],
+      "enabled": true,
+      "client_ipv4": "10.77.0.2",
+      "client_ipv6": "fd77::2",
+      "allowed_destinations": [
+        "0.0.0.0/0",
+        "::/0"
+      ],
+      "limits": {
+        "max_connections": 1,
+        "max_packets_per_second": 100000,
+        "max_bytes_per_second": 134217728,
+        "max_reassembly_bytes": 8388608
+      }
+    }
+  ]
+}

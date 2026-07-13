@@ -1,0 +1,24 @@
+[package]
+name = "flowweave-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+rust-version = "1.88"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+flowweave-lab = { path = ".." }
+libfuzzer-sys = "=0.4.13"
+
+[patch.crates-io]
+noq = { path = "../third_party/noq" }
+noq-proto = { path = "../third_party/noq-proto" }
+
+[[bin]]
+name = "vpn_reassembly"
+path = "fuzz_targets/vpn_reassembly.rs"
+test = false
+doc = false
+bench = false

@@ -31,6 +31,15 @@ mod realtime;
 mod realtime_controller;
 mod realtime_v3;
 mod scheduler;
+mod vpn;
+mod vpn_active_session;
+mod vpn_control;
+mod vpn_data_policy;
+mod vpn_identity;
+mod vpn_identity_config;
+mod vpn_quota;
+mod vpn_session;
+mod vpn_tls;
 pub use b_ingress::{
     BIngressSmokeReport, run_b_ingress_observability_controller,
     run_b_ingress_observability_receiver, run_b_ingress_shaper_calibration,
@@ -67,6 +76,60 @@ pub use realtime_v3::{
     run_v12_bbr3_two_of_three_realtime,
 };
 pub use scheduler::MultipathScheduler;
+pub use vpn::{
+    VPN_DEFAULT_FRAGMENT_TIMEOUT, VPN_DEFAULT_MAX_INFLIGHT_PACKETS,
+    VPN_DEFAULT_MAX_REASSEMBLY_BYTES, VPN_IP_DATAGRAM_HEADER_LEN, VPN_IP_DATAGRAM_MAGIC,
+    VPN_MAX_FRAGMENTS_PER_PACKET, VPN_MAX_IP_PACKET_LEN, VPN_MIN_QUIC_DATAGRAM_LEN, VpnFragment,
+    VpnIpPacketMeta, VpnPacketError, VpnReassembler, VpnReassemblyLimits, VpnReassemblyStats,
+    decode_vpn_ip_fragment, encode_vpn_ip_fragments, inspect_vpn_ip_packet,
+};
+pub use vpn_active_session::{
+    VPN_CLOSE_COMMIT_REJECTED, VPN_CLOSE_IDENTITY_REVOKED, VPN_CLOSE_POLICY_CHANGED,
+    VPN_CLOSE_SERVER_SHUTDOWN, VPN_CLOSE_SESSION_REPLACED, VpnActiveSessionSnapshot,
+    VpnCoordinatorReloadReport, VpnManagedActiveSession, VpnManagedServerOutcome,
+    VpnManagedSessionError, VpnReassemblyReservation, VpnSessionCommitError,
+    VpnSessionCommitReport, VpnSessionCoordinator, VpnSessionCoordinatorMetrics,
+    VpnSessionReconcileReport, vpn_server_managed_control_handshake,
+};
+pub use vpn_control::{
+    VPN_ALPN, VPN_CAP_FRAGMENTATION, VPN_CAP_IPV4, VPN_CAP_IPV6, VPN_CAP_MULTIPATH_REQUIRED,
+    VPN_CONTROL_FORMAT_VERSION, VPN_CONTROL_HEADER_LEN, VPN_CONTROL_MAGIC,
+    VPN_CONTROL_MAX_MESSAGE_LEN, VPN_KNOWN_CAPABILITIES, VPN_REQUIRED_CAPABILITIES,
+    VPN_WIRE_VERSION_V1, VpnAccept, VpnControlError, VpnControlMessage, VpnHello, VpnReject,
+    VpnRejectReason, decode_vpn_control_message, encode_vpn_control_message,
+    select_vpn_wire_version,
+};
+pub use vpn_data_policy::{
+    VpnDataPolicyError, VpnDataPolicyMetricsSnapshot, validate_vpn_ip_packet_policy,
+};
+pub use vpn_identity::{
+    VPN_MAX_BYTES_PER_SECOND, VPN_MAX_CLIENT_ID_LEN, VPN_MAX_CONNECTIONS_PER_IDENTITY,
+    VPN_MAX_DESTINATION_NETWORKS_PER_IDENTITY, VPN_MAX_FINGERPRINTS_PER_IDENTITY,
+    VPN_MAX_IDENTITIES, VPN_MAX_PACKETS_PER_SECOND, VPN_SHA256_FINGERPRINT_LEN,
+    VpnCertificateFingerprint, VpnIdentity, VpnIdentityAuthorizationError, VpnIdentityError,
+    VpnIdentityLimits, VpnIdentityRegistry, VpnIpNetwork,
+};
+pub use vpn_identity_config::{
+    SharedVpnIdentityRegistry, VPN_IDENTITY_CONFIG_MAX_BYTES, VPN_IDENTITY_CONFIG_VERSION,
+    VpnIdentityConfigError, VpnIdentityReloadReport, load_vpn_identity_registry,
+    parse_vpn_identity_registry_json,
+};
+pub use vpn_quota::{
+    VPN_DEFAULT_GLOBAL_REASSEMBLY_BYTES, VPN_DEFAULT_GLOBAL_REASSEMBLY_RESERVATIONS,
+    VPN_MAX_GLOBAL_REASSEMBLY_BYTES, VPN_MAX_GLOBAL_REASSEMBLY_RESERVATIONS, VpnPacketDirection,
+    VpnQuotaMetricsSnapshot, VpnQuotaRejection,
+};
+pub use vpn_session::{
+    VPN_CLOSE_CONTROL_FAILED, VPN_CLOSE_CONTROL_REJECTED, VPN_DEFAULT_CONTROL_HANDSHAKE_TIMEOUT,
+    VPN_MAX_CONTROL_HANDSHAKE_TIMEOUT, VpnNegotiatedSession, VpnServerControlOutcome,
+    VpnServerNegotiationConfig, VpnSessionError, VpnSessionGeneration, negotiate_vpn_hello,
+    vpn_client_control_handshake, vpn_server_control_handshake,
+};
+pub use vpn_tls::{
+    build_vpn_client_tls_config, build_vpn_server_tls_config, verify_vpn_alpn,
+    vpn_certificate_fingerprint, vpn_certificate_sha256, vpn_peer_certificate_fingerprint,
+    vpn_peer_certificate_sha256,
+};
 
 pub type LabError = Box<dyn Error + Send + Sync + 'static>;
 pub type LabResult<T> = Result<T, LabError>;

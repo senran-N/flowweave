@@ -9,6 +9,7 @@ User=flowweave
 Group=flowweave
 UMask=0077
 ExecStart=/usr/local/libexec/flowweave-public-soak/flowweave-proxy client /etc/flowweave-public-soak/client.conf
+ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 RestartSec=2s
 TimeoutStopSec=15s

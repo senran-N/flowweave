@@ -1,0 +1,6 @@
+magic="FWI1"
+control_magic="FWC1"
+ipv4="\x45"
+ipv6="\x60"
+max_total="\xff\xff"
+zero_offset="\x00\x00"

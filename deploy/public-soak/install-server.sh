@@ -47,6 +47,12 @@ install -o root -g flowweave -m 0640 "${bundle_dir}/server.conf" /etc/flowweave-
 install -o root -g root -m 0644 "${bundle_dir}/server.cert.der" /etc/flowweave-public-soak/server.cert.der
 install -o flowweave -g flowweave -m 0400 "${bundle_dir}/server.key.der" /etc/flowweave-public-soak/server.key.der
 install -o flowweave -g flowweave -m 0400 "${bundle_dir}/token" /etc/flowweave-public-soak/token
+if [[ -f "${bundle_dir}/token.previous" ]]; then
+  previous_token_source="${bundle_dir}/token.previous"
+else
+  previous_token_source="${bundle_dir}/token"
+fi
+install -o flowweave -g flowweave -m 0400 "${previous_token_source}" /etc/flowweave-public-soak/token.previous
 
 install -o root -g root -m 0644 "${script_dir}/flowweave-public-soak-echo.service" /etc/systemd/system/flowweave-public-soak-echo.service
 install -o root -g root -m 0644 "${script_dir}/flowweave-public-soak-server.service" /etc/systemd/system/flowweave-public-soak-server.service

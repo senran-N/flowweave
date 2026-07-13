@@ -10,6 +10,7 @@ User=flowweave
 Group=flowweave
 UMask=0077
 ExecStart=/usr/local/bin/flowweave-proxy server /etc/flowweave/server.conf
+ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 RestartSec=2s
 TimeoutStopSec=15s

@@ -1,5 +1,8 @@
 # Cargo build output can be created by the root crate and both vendored crates.
 target/
+fuzz/target/
+fuzz/artifacts/
+fuzz/corpus/
 
 # Local editor and operating-system noise.
 .DS_Store

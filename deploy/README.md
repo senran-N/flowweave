@@ -2,6 +2,8 @@
 
 当前入口只转发一个固定 TCP 目标：本地应用连接客户端 loopback TCP 端口，客户端通过标准 TLS 1.3 MPQUIC 连接服务端，服务端只允许配置中的唯一 `allowed_target`。它不是 TUN、SOCKS5、开放代理或 UDP 转发器。
 
+`vpn-identities.json.example` 只是未来 VPN 数据进程使用的严格身份文件样例，目前没有 systemd 单元或命令会读取它。不要因为该文件存在就修改宿主机 TUN、默认路由或 NAT；身份格式与剩余边界见 [VPN_IDENTITY.md](../VPN_IDENTITY.md) 和 [VPN_RESEARCH.md](../VPN_RESEARCH.md)。
+
 ## 1. 构建和安装
 
 在源码目录使用 Rust 1.88 或更高版本：
@@ -48,9 +50,10 @@ openssl x509 -in server.cert.pem -outform DER -out server.cert.der
 openssl pkcs8 -topk8 -nocrypt -in server.key.pem -outform DER -out server.key.der
 openssl x509 -in ca.cert.pem -outform DER -out ca.cert.der
 openssl rand 48 > token
+cp token token.previous
 ```
 
-不要把 `ca.key.pem` 放到服务端或客户端。服务端只需要 `server.cert.der`、`server.key.der` 和 `token`；客户端只需要 `ca.cert.der` 和同一份 `token`。令牌应通过已有的安全通道传输，不能粘贴进配置、命令行或日志。
+不要把 `ca.key.pem` 放到服务端或客户端。服务端需要 `server.cert.der`、`server.key.der`、`token` 和初始内容相同的 `token.previous`；客户端只需要 `ca.cert.der` 和同一份 `token`。令牌应通过已有的安全通道传输，不能粘贴进配置、命令行或日志。
 
 ## 3. 服务端配置
 
@@ -61,6 +64,7 @@ sudo install -o root -g flowweave -m 0640 server.conf.example /etc/flowweave/ser
 sudo install -o root -g root -m 0644 server.cert.der /etc/flowweave/server.cert.der
 sudo install -o flowweave -g flowweave -m 0400 server.key.der /etc/flowweave/server.key.der
 sudo install -o flowweave -g flowweave -m 0400 token /etc/flowweave/token
+sudo install -o flowweave -g flowweave -m 0400 token.previous /etc/flowweave/token.previous
 sudo install -o root -g root -m 0644 flowweave-server.service /etc/systemd/system/flowweave-server.service
 ```
 
@@ -68,6 +72,7 @@ sudo install -o root -g root -m 0644 flowweave-server.service /etc/systemd/syste
 
 - `listen` 是 QUIC/UDP 监听地址；防火墙和云安全组必须允许该 UDP 端口。
 - `allowed_target` 必须是服务端可连接的显式 IP:port。服务端拒绝域名和客户端请求的其他目标，因此不会退化成开放代理。
+- `previous_token_file` 是可选的第二令牌槽。建议从首次部署就配置，并让两个文件初始内容相同，以便之后无重启轮换。
 - 私钥和令牌在 Unix 上不得有任何 group/other 权限；启动时会检查并拒绝宽松权限。
 
 启用服务：
@@ -109,6 +114,31 @@ sudo systemctl status flowweave-client.service
 
 应用随后连接客户端的本地 TCP 端口。例如示例配置把本地 `127.0.0.1:10022` 转发到服务端唯一允许的 `127.0.0.1:22`。
 
+### 无重启令牌轮换
+
+客户端和服务端都支持 `systemctl reload`，它发送 `SIGHUP` 并原子替换内存令牌。重载失败时旧状态继续有效，进程、QUIC 连接和既有流不会退出；撤销只影响之后创建的新流。完整安全合同见 [PROXY_ROTATION.md](../PROXY_ROTATION.md)。
+
+准备一份通过安全通道分发的 `token.new`，然后按以下顺序执行。每次都先在目标目录安装临时文件，再在同一文件系统内重命名，避免重载读到原地覆盖的中间状态：
+
+```bash
+# 1. 服务端进入旧+新重叠期
+sudo install -o flowweave -g flowweave -m 0400 token.new /etc/flowweave/.token.previous.next
+sudo mv -f /etc/flowweave/.token.previous.next /etc/flowweave/token.previous
+sudo systemctl reload flowweave-server.service
+
+# 2. 客户端的新流改用新令牌
+sudo install -o flowweave -g flowweave -m 0400 token.new /etc/flowweave/.token.next
+sudo mv -f /etc/flowweave/.token.next /etc/flowweave/token
+sudo systemctl reload flowweave-client.service
+
+# 3. 验证客户端新流成功后，在服务端撤销旧令牌
+sudo install -o flowweave -g flowweave -m 0400 token.new /etc/flowweave/.token.next
+sudo mv -f /etc/flowweave/.token.next /etc/flowweave/token
+sudo systemctl reload flowweave-server.service
+```
+
+服务端最后两个槽内容相同并自动去重为一个有效令牌。若日志出现 `credentials_reload_failed`，不要继续下一步；修复文件、所有者、权限或长度后重新 reload。不要通过重启掩盖一次未解释的轮换失败。
+
 ## 5. 验证与排错
 
 ```bash
@@ -137,11 +167,12 @@ ss -ltnp | grep 10022
 - `connection_rejected` / `stream_rejected`：固定并发上限触发；
 - `path_changed`：路径建立、放弃、丢弃或远端状态变化；
 - `metrics_snapshot`：每 10 秒以及退出前输出一次原子计数快照；
+- `credentials_reloaded` / `credentials_reload_failed`：脱敏的令牌重载结果；
 - `shutdown_started` / `shutdown_forced` / `shutdown_complete`：drain 截止、超时原因、实际耗时及是否强制关闭。
 
 `metrics_snapshot` 包含活动/累计连接与流、配额拒绝、DNS/TLS/请求/开流/上游连接超时、上游错误、应用上下行字节和优雅/强制退出次数。嵌入库的调用方也可通过 `ProxyRuntime::metrics_snapshot()` 读取同一组原子计数；`ProxyRuntime::shutdown()` 完成后返回最终快照。
 
-SIGTERM 和 Ctrl-C 会触发有界优雅退出：服务端先禁止新 QUIC 连接，客户端先关闭本地 TCP listener，现有代理流最多继续 drain 10 秒；到期仍未完成时关闭 QUIC Endpoint、终止残余任务并把 `forced_shutdowns` 加一。systemd 样例的 `TimeoutStopSec=15s` 给程序的 10 秒窗口留出清理余量。客户端 QUIC 连接意外失效时进程仍会以失败状态退出，由 `Restart=on-failure` 执行外部重启；程序内部没有隐藏重连器。
+SIGHUP 只重载令牌。SIGTERM 和 Ctrl-C 会触发有界优雅退出：服务端先禁止新 QUIC 连接，客户端先关闭本地 TCP listener，现有代理流最多继续 drain 10 秒；到期仍未完成时关闭 QUIC Endpoint、终止残余任务并把 `forced_shutdowns` 加一。systemd 样例的 `TimeoutStopSec=15s` 给程序的 10 秒窗口留出清理余量。客户端 QUIC 连接意外失效时进程仍会以失败状态退出，由 `Restart=on-failure` 执行外部重启；程序内部没有隐藏重连器。
 
 当前运行保护是固定产品合同，不从配置文件放大：服务端最多同时处理 64 条 QUIC 连接，每条连接最多允许 64 条客户端双向流且拒绝所有单向流；客户端最多同时转发 64 条本地 TCP 连接，超额连接会立即关闭。DNS/TLS、打开 QUIC 流和上游 TCP 连接的截止为 10 秒，代理请求头与授权响应截止为 5 秒。systemd 样例另设置 `TasksMax=512` 与 `MemoryMax=1G`；若真实试点触发这些上限，应先记录负载、RSS、活动连接和失败原因，再通过新版本审计调整，不能临时删除保护后继续运行。
 
@@ -181,7 +212,7 @@ uname -srmo
 
 退出码为零且报告中的 `stage_pass=true` 才算通过。该命令只证明单机回环合同，不代表真实 Wi-Fi/蜂窝、公网 NAT 或生产 SLA；完整边界见 [PROXY_SOAK.md](../PROXY_SOAK.md)。
 
-真实公网阶段使用独立的 `public-workload` 和 loopback `echo-server` 模式，带应用限速、双向应用字节预算、周期检查点、中途失败报告和专用清理边界。它只需要一个受控客户端环境和一台受控公网测试服务器，但客户端必须有两条独立公网出口。部署步骤见 [public-soak/README.md](public-soak/README.md)。
+真实公网阶段使用独立的 `public-workload` 和 loopback `echo-server` 模式，带应用限速、双向应用字节预算、周期检查点、中途失败报告和专用清理边界。一个受控客户端环境和一台受控公网测试服务器即可验证双接口/双路径实现；两个独立运营商出口只在宣称运营商级链路故障隔离时才是额外证据要求，不再阻塞当前开发。部署步骤见 [public-soak/README.md](public-soak/README.md)。
 
 ## 7. 回退
 

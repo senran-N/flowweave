@@ -4,7 +4,7 @@ use std::{
     net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
     sync::{
-        Arc,
+        Arc, RwLock,
         atomic::{AtomicU64, Ordering},
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -68,6 +68,7 @@ const SERVER_REQUIRED_KEYS: [&str; 5] = [
     "token_file",
     "allowed_target",
 ];
+const SERVER_OPTIONAL_KEYS: [&str; 1] = ["previous_token_file"];
 const CLIENT_REQUIRED_KEYS: [&str; 6] = [
     "listen",
     "server",
@@ -354,19 +355,23 @@ pub struct ProxyServerConfig {
     pub certificate_der: PathBuf,
     pub private_key_der: PathBuf,
     pub token_file: PathBuf,
+    pub previous_token_file: Option<PathBuf>,
     pub allowed_target: SocketAddr,
 }
 
 impl ProxyServerConfig {
     pub fn load(path: impl AsRef<Path>) -> LabResult<Self> {
         let path = path.as_ref();
-        let values = load_key_values(path, &SERVER_REQUIRED_KEYS, &[])?;
+        let values = load_key_values(path, &SERVER_REQUIRED_KEYS, &SERVER_OPTIONAL_KEYS)?;
         let base = config_base(path);
         Ok(Self {
             listen: parse_socket_addr(required(&values, "listen")?, "listen")?,
             certificate_der: resolve_path(&base, required(&values, "certificate_der")?),
             private_key_der: resolve_path(&base, required(&values, "private_key_der")?),
             token_file: resolve_path(&base, required(&values, "token_file")?),
+            previous_token_file: values
+                .get("previous_token_file")
+                .map(|value| resolve_path(&base, value)),
             allowed_target: parse_socket_addr(
                 required(&values, "allowed_target")?,
                 "allowed_target",
@@ -420,12 +425,67 @@ impl ProxyClientConfig {
     }
 }
 
-#[derive(Debug)]
+type SharedServerTokens = Arc<RwLock<Vec<Vec<u8>>>>;
+type SharedClientToken = Arc<RwLock<Vec<u8>>>;
+
+enum ProxyTokenReloader {
+    Server {
+        token_file: PathBuf,
+        previous_token_file: Option<PathBuf>,
+        tokens: SharedServerTokens,
+    },
+    Client {
+        token_file: PathBuf,
+        token: SharedClientToken,
+    },
+}
+
+impl ProxyTokenReloader {
+    fn reload(&self) -> LabResult<usize> {
+        match self {
+            Self::Server {
+                token_file,
+                previous_token_file,
+                tokens,
+            } => {
+                let replacement = read_server_tokens(token_file, previous_token_file.as_deref())?;
+                let accepted_token_count = replacement.len();
+                let mut current = tokens
+                    .write()
+                    .map_err(|_| other_error("服务端令牌状态锁已损坏"))?;
+                *current = replacement;
+                Ok(accepted_token_count)
+            }
+            Self::Client { token_file, token } => {
+                let replacement = read_token(token_file)?;
+                let mut current = token
+                    .write()
+                    .map_err(|_| other_error("客户端令牌状态锁已损坏"))?;
+                *current = replacement;
+                Ok(1)
+            }
+        }
+    }
+}
+
 pub struct ProxyRuntime {
     local_addr: SocketAddr,
     shutdown: watch::Sender<bool>,
     metrics: Arc<ProxyMetrics>,
+    token_reloader: ProxyTokenReloader,
+    events: ProxyEventLog,
     task: Option<JoinHandle<LabResult<()>>>,
+}
+
+impl fmt::Debug for ProxyRuntime {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ProxyRuntime")
+            .field("local_addr", &self.local_addr)
+            .field("metrics", &self.metrics.snapshot())
+            .field("task_running", &self.task.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 impl ProxyRuntime {
@@ -439,6 +499,30 @@ impl ProxyRuntime {
 
     pub fn request_shutdown(&self) {
         let _ = self.shutdown.send(true);
+    }
+
+    pub fn reload_tokens(&self) -> LabResult<usize> {
+        match self.token_reloader.reload() {
+            Ok(accepted_token_count) => {
+                self.events.emit(
+                    "info",
+                    "credentials_reloaded",
+                    json!({
+                        "kind": "token",
+                        "accepted_token_count": accepted_token_count,
+                    }),
+                );
+                Ok(accepted_token_count)
+            }
+            Err(error) => {
+                self.events.emit(
+                    "error",
+                    "credentials_reload_failed",
+                    json!({"kind": "token", "reason": "token_reload_failed"}),
+                );
+                Err(error)
+            }
+        }
     }
 
     async fn join(&mut self) -> LabResult<()> {
@@ -482,33 +566,50 @@ pub async fn run_proxy_client(path: impl AsRef<Path>) -> LabResult<()> {
     run_runtime_until_signal(runtime).await
 }
 
+#[cfg(unix)]
+async fn run_runtime_until_signal(mut runtime: ProxyRuntime) -> LabResult<()> {
+    use tokio::signal::unix::{SignalKind, signal};
+
+    let mut terminate = signal(SignalKind::terminate())?;
+    let mut hangup = signal(SignalKind::hangup())?;
+    let interrupt = tokio::signal::ctrl_c();
+    tokio::pin!(interrupt);
+    loop {
+        tokio::select! {
+            biased;
+            result = runtime.join() => return result,
+            result = &mut interrupt => {
+                result?;
+                break;
+            }
+            received = terminate.recv() => {
+                if received.is_none() {
+                    return Err(other_error("SIGTERM 监听流意外结束"));
+                }
+                break;
+            }
+            received = hangup.recv() => {
+                if received.is_none() {
+                    return Err(other_error("SIGHUP 监听流意外结束"));
+                }
+                let _ = runtime.reload_tokens();
+            }
+        }
+    }
+    runtime.request_shutdown();
+    runtime.join().await
+}
+
+#[cfg(not(unix))]
 async fn run_runtime_until_signal(mut runtime: ProxyRuntime) -> LabResult<()> {
     tokio::select! {
         result = runtime.join() => result,
-        signal = wait_for_shutdown_signal() => {
+        signal = tokio::signal::ctrl_c() => {
             signal?;
             runtime.request_shutdown();
             runtime.join().await
         }
     }
-}
-
-#[cfg(unix)]
-async fn wait_for_shutdown_signal() -> LabResult<()> {
-    use tokio::signal::unix::{SignalKind, signal};
-
-    let mut terminate = signal(SignalKind::terminate())?;
-    tokio::select! {
-        result = tokio::signal::ctrl_c() => result?,
-        _ = terminate.recv() => {}
-    }
-    Ok(())
-}
-
-#[cfg(not(unix))]
-async fn wait_for_shutdown_signal() -> LabResult<()> {
-    tokio::signal::ctrl_c().await?;
-    Ok(())
 }
 
 pub async fn start_proxy_server(config: ProxyServerConfig) -> LabResult<ProxyRuntime> {
@@ -538,7 +639,15 @@ async fn start_proxy_server_with_limits_and_sink(
     let events = ProxyEventLog::new("server", sink);
     let certificate = read_certificate(&config.certificate_der)?;
     let private_key = read_private_key(&config.private_key_der)?;
-    let token = Arc::new(read_token(&config.token_file)?);
+    let tokens = Arc::new(RwLock::new(read_server_tokens(
+        &config.token_file,
+        config.previous_token_file.as_deref(),
+    )?));
+    let token_reloader = ProxyTokenReloader::Server {
+        token_file: config.token_file.clone(),
+        previous_token_file: config.previous_token_file.clone(),
+        tokens: tokens.clone(),
+    };
 
     let mut server_config = ServerConfig::with_single_cert(vec![certificate], private_key.into())?;
     let transport = Arc::get_mut(&mut server_config.transport)
@@ -559,10 +668,11 @@ async fn start_proxy_server_with_limits_and_sink(
         json!({"listen": local_addr.to_string(), "transport": "udp"}),
     );
     let task_metrics = metrics.clone();
+    let runtime_events = events.clone();
     let task = tokio::spawn(async move {
         run_server_accept_loop(
             endpoint,
-            token,
+            tokens,
             allowed_target,
             ProxyRuntimeContext {
                 limits,
@@ -577,6 +687,8 @@ async fn start_proxy_server_with_limits_and_sink(
         local_addr,
         shutdown,
         metrics,
+        token_reloader,
+        events: runtime_events,
         task: Some(task),
     })
 }
@@ -607,7 +719,11 @@ async fn start_proxy_client_with_limits_and_sink(
     let metrics = Arc::new(ProxyMetrics::default());
     let events = ProxyEventLog::new("client", sink);
     let certificate = read_certificate(&config.ca_certificate_der)?;
-    let token = Arc::new(read_token(&config.token_file)?);
+    let token = Arc::new(RwLock::new(read_token(&config.token_file)?));
+    let token_reloader = ProxyTokenReloader::Client {
+        token_file: config.token_file.clone(),
+        token: token.clone(),
+    };
     let server_addr = match timeout(limits.handshake_timeout, resolve_server_addr(&config)).await {
         Ok(result) => result?,
         Err(_) => {
@@ -704,6 +820,7 @@ async fn start_proxy_client_with_limits_and_sink(
         json!({"listen": local_addr.to_string(), "transport": "tcp"}),
     );
     let task_metrics = metrics.clone();
+    let runtime_events = events.clone();
     let task = tokio::spawn(async move {
         run_client_accept_loop(
             endpoint,
@@ -724,6 +841,8 @@ async fn start_proxy_client_with_limits_and_sink(
         local_addr,
         shutdown,
         metrics,
+        token_reloader,
+        events: runtime_events,
         task: Some(task),
     })
 }
@@ -757,7 +876,7 @@ async fn open_configured_path(
 
 async fn run_server_accept_loop(
     endpoint: Endpoint,
-    token: Arc<Vec<u8>>,
+    tokens: SharedServerTokens,
     allowed_target: SocketAddr,
     runtime: ProxyRuntimeContext,
 ) -> LabResult<()> {
@@ -802,7 +921,7 @@ async fn run_server_accept_loop(
                         continue;
                     }
                 };
-                let token = token.clone();
+                let tokens = tokens.clone();
                 let task_metrics = metrics.clone();
                 let task_events = events.clone();
                 let mut task_shutdown = shutdown.clone();
@@ -871,7 +990,7 @@ async fn run_server_accept_loop(
                     );
                     let result = serve_proxy_connection(
                         &connection,
-                        token,
+                        tokens,
                         allowed_target,
                         limits,
                         task_shutdown,
@@ -950,7 +1069,7 @@ async fn run_server_accept_loop(
 
 async fn serve_proxy_connection(
     connection: &Connection,
-    token: Arc<Vec<u8>>,
+    tokens: SharedServerTokens,
     allowed_target: SocketAddr,
     limits: ProxyRuntimeLimits,
     mut shutdown: watch::Receiver<bool>,
@@ -997,7 +1116,7 @@ async fn serve_proxy_connection(
                         return Err(ProxyTaskError::new("stream_accept_failed"));
                     }
                 };
-                let stream_token = token.clone();
+                let stream_tokens = tokens.clone();
                 let stream_metrics = metrics.clone();
                 let stream_events = events.clone();
                 stream_tasks.spawn(async move {
@@ -1010,7 +1129,7 @@ async fn serve_proxy_connection(
                     match handle_server_stream(
                         send,
                         receive,
-                        &stream_token,
+                        &stream_tokens,
                         allowed_target,
                         limits,
                         &stream_metrics,
@@ -1143,7 +1262,7 @@ fn path_abandon_reason(reason: &PathAbandonReason) -> &'static str {
 async fn handle_server_stream(
     mut send: noq::SendStream,
     mut receive: noq::RecvStream,
-    expected_token: &[u8],
+    expected_tokens: &RwLock<Vec<Vec<u8>>>,
     allowed_target: SocketAddr,
     limits: ProxyRuntimeLimits,
     metrics: &ProxyMetrics,
@@ -1167,7 +1286,13 @@ async fn handle_server_stream(
         }
     };
 
-    if !token_matches(expected_token, &request.token) {
+    let authorized = {
+        let expected_tokens = expected_tokens
+            .read()
+            .map_err(|_| ProxyTaskError::new("token_state_unavailable"))?;
+        token_set_matches(&expected_tokens, &request.token)
+    };
+    if !authorized {
         send_status(&mut send, STATUS_AUTHORIZATION)
             .await
             .runtime_code("status_write_failed")?;
@@ -1222,7 +1347,7 @@ async fn run_client_accept_loop(
     endpoint: Endpoint,
     connection: Connection,
     listener: TcpListener,
-    token: Arc<Vec<u8>>,
+    token: SharedClientToken,
     target: SocketAddr,
     runtime: ProxyRuntimeContext,
 ) -> LabResult<()> {
@@ -1289,7 +1414,10 @@ async fn run_client_accept_loop(
                     }
                 };
                 let stream_connection = connection.clone();
-                let stream_token = token.clone();
+                let stream_token = token
+                    .read()
+                    .map_err(|_| other_error("客户端令牌状态锁已损坏"))?
+                    .clone();
                 let stream_metrics = metrics.clone();
                 let stream_events = events.clone();
                 stream_tasks.spawn(async move {
@@ -1612,6 +1740,14 @@ fn token_matches(expected: &[u8], provided: &[u8]) -> bool {
     expected.ct_eq(provided).unwrap_u8() == 1
 }
 
+fn token_set_matches(expected: &[Vec<u8>], provided: &[u8]) -> bool {
+    let mut matched = 0_u8;
+    for token in expected {
+        matched |= token.ct_eq(provided).unwrap_u8();
+    }
+    matched == 1
+}
+
 async fn send_status(send: &mut noq::SendStream, status: u8) -> LabResult<()> {
     send.write_all(&[status]).await?;
     send.shutdown().await?;
@@ -1656,6 +1792,21 @@ fn read_token(path: &Path) -> LabResult<Vec<u8>> {
     let token = read_regular_file(path, true, "令牌")?;
     validate_token_length(token.len())?;
     Ok(token)
+}
+
+fn read_server_tokens(
+    token_file: &Path,
+    previous_token_file: Option<&Path>,
+) -> LabResult<Vec<Vec<u8>>> {
+    let current = read_token(token_file)?;
+    let mut tokens = vec![current];
+    if let Some(previous_token_file) = previous_token_file {
+        let previous = read_token(previous_token_file)?;
+        if !token_matches(&tokens[0], &previous) {
+            tokens.push(previous);
+        }
+    }
+    Ok(tokens)
 }
 
 fn validate_token_length(length: usize) -> LabResult<()> {
@@ -1890,6 +2041,11 @@ mod tests {
             local_addr: "127.0.0.1:1".parse().unwrap(),
             shutdown,
             metrics: Arc::new(ProxyMetrics::default()),
+            token_reloader: ProxyTokenReloader::Client {
+                token_file: PathBuf::new(),
+                token: Arc::new(RwLock::new(vec![0_u8; MIN_TOKEN_LENGTH])),
+            },
+            events: ProxyEventLog::new("client", default_event_sink()),
             task: Some(task),
         };
 
@@ -2007,6 +2163,18 @@ mod tests {
     #[test]
     fn relative_paths_and_local_path_validation_are_deterministic() {
         let directory = TestDirectory::new();
+        let server_path = directory.path().join("server.conf");
+        fs::write(
+            &server_path,
+            "listen=127.0.0.1:4433\ncertificate_der=pki/cert.der\nprivate_key_der=secrets/key.der\ntoken_file=secrets/current-token\nprevious_token_file=secrets/previous-token\nallowed_target=127.0.0.1:22\n",
+        )
+        .unwrap();
+        let server = ProxyServerConfig::load(&server_path).unwrap();
+        assert_eq!(
+            server.previous_token_file,
+            Some(directory.path().join("secrets/previous-token"))
+        );
+
         let config_path = directory.path().join("client.conf");
         fs::write(
             &config_path,
@@ -2035,6 +2203,10 @@ mod tests {
         let server = ProxyServerConfig::load(root.join("deploy/server.conf.example")).unwrap();
         assert_eq!(server.listen, "0.0.0.0:4433".parse().unwrap());
         assert_eq!(server.allowed_target, "127.0.0.1:22".parse().unwrap());
+        assert_eq!(
+            server.previous_token_file,
+            Some(PathBuf::from("/etc/flowweave/token.previous"))
+        );
 
         let client = ProxyClientConfig::load(root.join("deploy/client.conf.example")).unwrap();
         assert_eq!(client.listen, "127.0.0.1:10022".parse().unwrap());
@@ -2050,6 +2222,7 @@ mod tests {
             assert!(unit.contains(&format!(
                 "ExecStart=/usr/local/bin/flowweave-proxy {mode} /etc/flowweave/"
             )));
+            assert!(unit.contains("ExecReload=/bin/kill -HUP $MAINPID"));
             for required_line in [
                 "User=flowweave",
                 "UMask=0077",
@@ -2142,6 +2315,222 @@ mod tests {
         assert_eq!(read_token(&token).unwrap().len(), MIN_TOKEN_LENGTH);
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn server_accepts_current_and_previous_tokens_and_deduplicates_equal_files() {
+        let _network_test_guard = crate::LOCAL_NETWORK_TEST_LOCK.lock().await;
+        let directory = TestDirectory::new();
+        let (certificate_path, key_path, current_token_path) = write_test_credentials(&directory);
+        let previous_token_path = directory.path().join("previous-token");
+        let previous_token = vec![0x5A; 48];
+        write_test_token(&previous_token_path, &previous_token);
+
+        let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream.local_addr().unwrap();
+        let upstream_task = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (stream, _) = upstream.accept().await.unwrap();
+                drop(stream);
+            }
+        });
+        let server = start_proxy_server(ProxyServerConfig {
+            listen: "127.0.0.1:0".parse().unwrap(),
+            certificate_der: certificate_path.clone(),
+            private_key_der: key_path,
+            token_file: current_token_path.clone(),
+            previous_token_file: Some(previous_token_path.clone()),
+            allowed_target: upstream_addr,
+        })
+        .await
+        .unwrap();
+        let (raw_endpoint, connection) =
+            connect_raw_proxy(server.local_addr(), &certificate_path).await;
+
+        let current_request = encode_proxy_request(&[0xA5; 48], upstream_addr).unwrap();
+        assert_eq!(
+            send_raw_request(&connection, &current_request).await,
+            STATUS_OK
+        );
+        let previous_request = encode_proxy_request(&previous_token, upstream_addr).unwrap();
+        assert_eq!(
+            send_raw_request(&connection, &previous_request).await,
+            STATUS_OK
+        );
+
+        write_test_token(&previous_token_path, &[0xA5; 48]);
+        assert_eq!(server.reload_tokens().unwrap(), 1);
+
+        connection.close(0_u8.into(), b"test complete");
+        raw_endpoint.close(0_u8.into(), b"test complete");
+        server.shutdown().await;
+        upstream_task.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn token_rotation_revokes_new_old_flows_without_restarting_quic_or_existing_streams() {
+        let _network_test_guard = crate::LOCAL_NETWORK_TEST_LOCK.lock().await;
+        let directory = TestDirectory::new();
+        let (certificate_path, key_path, server_token_path) = write_test_credentials(&directory);
+        let previous_token_path = directory.path().join("previous-token");
+        let client_token_path = directory.path().join("client-token");
+        let old_token = vec![0xA5; 48];
+        let new_token = vec![0x5A; 48];
+        write_test_token(&previous_token_path, &new_token);
+        write_test_token(&client_token_path, &old_token);
+
+        let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let echo_addr = echo_listener.local_addr().unwrap();
+        let echo_task = tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = echo_listener.accept().await.unwrap();
+                tokio::spawn(async move {
+                    let (mut read, mut write) = stream.split();
+                    tokio::io::copy(&mut read, &mut write).await.unwrap();
+                });
+            }
+        });
+
+        let server = start_proxy_server(ProxyServerConfig {
+            listen: "127.0.0.1:0".parse().unwrap(),
+            certificate_der: certificate_path.clone(),
+            private_key_der: key_path,
+            token_file: server_token_path.clone(),
+            previous_token_file: Some(previous_token_path),
+            allowed_target: echo_addr,
+        })
+        .await
+        .unwrap();
+        let client = start_proxy_client(ProxyClientConfig {
+            listen: "127.0.0.1:0".parse().unwrap(),
+            server: server.local_addr().to_string(),
+            server_name: "localhost".to_owned(),
+            ca_certificate_der: certificate_path,
+            token_file: client_token_path.clone(),
+            target: echo_addr,
+            primary_local_ip: None,
+            additional_local_ips: Vec::new(),
+        })
+        .await
+        .unwrap();
+
+        let mut existing_old_stream = TcpStream::connect(client.local_addr()).await.unwrap();
+        existing_old_stream.write_all(b"old-before").await.unwrap();
+        let mut old_before = [0_u8; 10];
+        existing_old_stream
+            .read_exact(&mut old_before)
+            .await
+            .unwrap();
+        assert_eq!(&old_before, b"old-before");
+
+        write_test_token(&client_token_path, b"too-short");
+        assert!(client.reload_tokens().is_err());
+        assert_proxy_echo(client.local_addr(), b"old-after-failed-client-reload").await;
+
+        write_test_token(&client_token_path, &new_token);
+        assert_eq!(client.reload_tokens().unwrap(), 1);
+        assert_proxy_echo(client.local_addr(), b"new-during-overlap").await;
+
+        write_test_token(&server_token_path, &new_token);
+        assert_eq!(server.reload_tokens().unwrap(), 1);
+
+        existing_old_stream.write_all(b"old-after").await.unwrap();
+        let mut old_after = [0_u8; 9];
+        existing_old_stream
+            .read_exact(&mut old_after)
+            .await
+            .unwrap();
+        assert_eq!(&old_after, b"old-after");
+
+        write_test_token(&client_token_path, &old_token);
+        assert_eq!(client.reload_tokens().unwrap(), 1);
+        let mut rejected = TcpStream::connect(client.local_addr()).await.unwrap();
+        rejected.write_all(b"revoked").await.unwrap();
+        rejected.shutdown().await.unwrap();
+        let mut rejected_response = Vec::new();
+        let rejected_result = timeout(
+            Duration::from_secs(2),
+            rejected.read_to_end(&mut rejected_response),
+        )
+        .await
+        .expect("撤销后的旧令牌新流应及时关闭");
+        assert!(rejected_response.is_empty());
+        assert!(matches!(rejected_result, Ok(0) | Err(_)));
+
+        write_test_token(&client_token_path, &new_token);
+        assert_eq!(client.reload_tokens().unwrap(), 1);
+        assert_proxy_echo(client.local_addr(), b"new-after-revoke").await;
+        assert_eq!(client.metrics_snapshot().total_connections, 1);
+
+        existing_old_stream.shutdown().await.unwrap();
+        let mut remaining = Vec::new();
+        existing_old_stream
+            .read_to_end(&mut remaining)
+            .await
+            .unwrap();
+        assert!(remaining.is_empty());
+        client.shutdown().await;
+        server.shutdown().await;
+        echo_task.abort();
+        let _ = echo_task.await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn failed_token_reload_preserves_state_and_redacts_runtime_event() {
+        let _network_test_guard = crate::LOCAL_NETWORK_TEST_LOCK.lock().await;
+        let directory = TestDirectory::new();
+        let (certificate_path, key_path, current_token_path) = write_test_credentials(&directory);
+        let current_token = b"FLOWWEAVE_CURRENT_TOKEN_0123456789_ABCDEFG";
+        let previous_token = b"FLOWWEAVE_PREVIOUS_TOKEN_0123456789_ABCDE";
+        write_test_token(&current_token_path, current_token);
+        let previous_token_path = directory.path().join("private-previous-token");
+        write_test_token(&previous_token_path, previous_token);
+
+        let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream.local_addr().unwrap();
+        let upstream_task = tokio::spawn(async move {
+            let (stream, _) = upstream.accept().await.unwrap();
+            drop(stream);
+        });
+        let sink = Arc::new(TestEventSink::default());
+        let server = start_proxy_server_with_limits_and_sink(
+            ProxyServerConfig {
+                listen: "127.0.0.1:0".parse().unwrap(),
+                certificate_der: certificate_path.clone(),
+                private_key_der: key_path,
+                token_file: current_token_path,
+                previous_token_file: Some(previous_token_path.clone()),
+                allowed_target: upstream_addr,
+            },
+            test_runtime_limits(),
+            sink.clone(),
+        )
+        .await
+        .unwrap();
+        let (raw_endpoint, connection) =
+            connect_raw_proxy(server.local_addr(), &certificate_path).await;
+
+        write_test_token(&previous_token_path, b"too-short");
+        assert!(server.reload_tokens().is_err());
+        let previous_request = encode_proxy_request(previous_token, upstream_addr).unwrap();
+        assert_eq!(
+            send_raw_request(&connection, &previous_request).await,
+            STATUS_OK,
+            "失败重载后必须继续使用完整的旧内存状态"
+        );
+
+        connection.close(0_u8.into(), b"test complete");
+        raw_endpoint.close(0_u8.into(), b"test complete");
+        server.shutdown().await;
+        upstream_task.await.unwrap();
+
+        let logs = sink.lines().join("\n");
+        assert!(logs.contains("credentials_reload_failed"));
+        assert!(!logs.contains(std::str::from_utf8(current_token).unwrap()));
+        assert!(!logs.contains(std::str::from_utf8(previous_token).unwrap()));
+        assert!(!logs.contains(&previous_token_path.display().to_string()));
+        let observation = crate::analyze_proxy_jsonl(std::io::Cursor::new(logs)).unwrap();
+        assert_eq!(observation.server.credential_reload_failures, 1);
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn real_tls_proxy_supports_multipath_and_concurrent_streams() {
         let _network_test_guard = crate::LOCAL_NETWORK_TEST_LOCK.lock().await;
@@ -2164,6 +2553,7 @@ mod tests {
             certificate_der: certificate_path.clone(),
             private_key_der: key_path,
             token_file: token_path.clone(),
+            previous_token_file: None,
             allowed_target: echo_addr,
         })
         .await
@@ -2220,6 +2610,7 @@ mod tests {
             certificate_der: certificate_path.clone(),
             private_key_der: key_path,
             token_file: token_path,
+            previous_token_file: None,
             allowed_target,
         })
         .await
@@ -2274,6 +2665,7 @@ mod tests {
                 certificate_der: certificate_path.clone(),
                 private_key_der: key_path,
                 token_file: token_path,
+                previous_token_file: None,
                 allowed_target: upstream.local_addr().unwrap(),
             },
             limits,
@@ -2318,6 +2710,7 @@ mod tests {
                 certificate_der: certificate_path.clone(),
                 private_key_der: key_path,
                 token_file: token_path,
+                previous_token_file: None,
                 allowed_target: "127.0.0.1:9".parse().unwrap(),
             },
             limits,
@@ -2364,6 +2757,7 @@ mod tests {
                 certificate_der: certificate_path.clone(),
                 private_key_der: key_path,
                 token_file: token_path.clone(),
+                previous_token_file: None,
                 allowed_target: upstream_addr,
             },
             test_runtime_limits(),
@@ -2433,6 +2827,7 @@ mod tests {
             certificate_der: certificate_path.clone(),
             private_key_der: key_path,
             token_file: token_path.clone(),
+            previous_token_file: None,
             allowed_target: upstream_addr,
         })
         .await
@@ -2506,6 +2901,7 @@ mod tests {
                 certificate_der: certificate_path.clone(),
                 private_key_der: key_path.clone(),
                 token_file: token_path.clone(),
+                previous_token_file: None,
                 allowed_target: upstream_addr,
             },
             test_runtime_limits(),
@@ -2529,6 +2925,9 @@ mod tests {
         )
         .await
         .unwrap();
+
+        assert_eq!(server.reload_tokens().unwrap(), 1);
+        assert_eq!(client.reload_tokens().unwrap(), 1);
 
         let mut stream = TcpStream::connect(client.local_addr()).await.unwrap();
         stream.write_all(payload).await.unwrap();
@@ -2569,6 +2968,7 @@ mod tests {
         assert!(saw_metrics);
 
         let logs = lines.join("\n");
+        assert!(logs.contains("credentials_reloaded"));
         assert!(!logs.contains(std::str::from_utf8(secret_token).unwrap()));
         assert!(!logs.contains(std::str::from_utf8(payload).unwrap()));
         assert!(!logs.contains(&key_path.display().to_string()));
@@ -2599,6 +2999,7 @@ mod tests {
                 certificate_der: certificate_path.clone(),
                 private_key_der: key_path,
                 token_file: token_path.clone(),
+                previous_token_file: None,
                 allowed_target: upstream_addr,
             },
             test_runtime_limits(),
@@ -2679,6 +3080,7 @@ mod tests {
                 certificate_der: certificate_path.clone(),
                 private_key_der: key_path,
                 token_file: token_path.clone(),
+                previous_token_file: None,
                 allowed_target: upstream_addr,
             },
             test_runtime_limits(),
@@ -2749,6 +3151,7 @@ mod tests {
             certificate_der: certificate_path.clone(),
             private_key_der: key_path,
             token_file: token_path.clone(),
+            previous_token_file: None,
             allowed_target: "127.0.0.1:9".parse().unwrap(),
         })
         .await
@@ -2811,6 +3214,18 @@ mod tests {
         status[0]
     }
 
+    async fn assert_proxy_echo(client_addr: SocketAddr, payload: &[u8]) {
+        let mut stream = TcpStream::connect(client_addr).await.unwrap();
+        stream.write_all(payload).await.unwrap();
+        stream.shutdown().await.unwrap();
+        let mut echoed = Vec::new();
+        timeout(Duration::from_secs(3), stream.read_to_end(&mut echoed))
+            .await
+            .expect("代理回显应在截止时间内完成")
+            .unwrap();
+        assert_eq!(echoed, payload);
+    }
+
     fn write_test_credentials(directory: &TestDirectory) -> (PathBuf, PathBuf, PathBuf) {
         let generated = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
         let certificate_path = directory.path().join("certificate.der");
@@ -2822,6 +3237,11 @@ mod tests {
         set_private_permissions(&key_path);
         set_private_permissions(&token_path);
         (certificate_path, key_path, token_path)
+    }
+
+    fn write_test_token(path: &Path, token: &[u8]) {
+        fs::write(path, token).unwrap();
+        set_private_permissions(path);
     }
 
     #[cfg(unix)]
