@@ -38,6 +38,9 @@ pub enum VpnProductConfigError {
     InvalidTunMtu,
     InvalidDatagramLength,
     MissingAddressFamily,
+    InvalidTunnelAddress,
+    IncompleteTunnelAddressPair,
+    TunnelAddressConflict,
     InvalidLocalIp,
     TooManyLocalIps,
     DuplicateLocalIp,
@@ -76,6 +79,11 @@ impl fmt::Display for VpnProductConfigError {
                 Self::InvalidTunMtu => "vpn_product_config_invalid_tun_mtu",
                 Self::InvalidDatagramLength => "vpn_product_config_invalid_datagram_length",
                 Self::MissingAddressFamily => "vpn_product_config_missing_address_family",
+                Self::InvalidTunnelAddress => "vpn_product_config_invalid_tunnel_address",
+                Self::IncompleteTunnelAddressPair => {
+                    "vpn_product_config_incomplete_tunnel_address_pair"
+                }
+                Self::TunnelAddressConflict => "vpn_product_config_tunnel_address_conflict",
                 Self::InvalidLocalIp => "vpn_product_config_invalid_local_ip",
                 Self::TooManyLocalIps => "vpn_product_config_too_many_local_ips",
                 Self::DuplicateLocalIp => "vpn_product_config_duplicate_local_ip",
@@ -186,8 +194,10 @@ pub struct VpnClientProductConfig {
     tun_name: String,
     tun_mtu: u16,
     max_datagram_len: u16,
-    request_ipv4: bool,
-    request_ipv6: bool,
+    expected_client_ipv4: Option<Ipv4Addr>,
+    expected_server_ipv4: Option<Ipv4Addr>,
+    expected_client_ipv6: Option<Ipv6Addr>,
+    expected_server_ipv6: Option<Ipv6Addr>,
     allowed_destinations: Vec<VpnIpNetwork>,
     limits: VpnIdentityLimits,
     global_reassembly_bytes: usize,
@@ -230,11 +240,27 @@ impl VpnClientProductConfig {
     }
 
     pub const fn request_ipv4(&self) -> bool {
-        self.request_ipv4
+        self.expected_client_ipv4.is_some()
     }
 
     pub const fn request_ipv6(&self) -> bool {
-        self.request_ipv6
+        self.expected_client_ipv6.is_some()
+    }
+
+    pub const fn expected_client_ipv4(&self) -> Option<Ipv4Addr> {
+        self.expected_client_ipv4
+    }
+
+    pub const fn expected_server_ipv4(&self) -> Option<Ipv4Addr> {
+        self.expected_server_ipv4
+    }
+
+    pub const fn expected_client_ipv6(&self) -> Option<Ipv6Addr> {
+        self.expected_client_ipv6
+    }
+
+    pub const fn expected_server_ipv6(&self) -> Option<Ipv6Addr> {
+        self.expected_server_ipv6
     }
 
     pub fn allowed_destinations(&self) -> &[VpnIpNetwork] {
@@ -271,8 +297,9 @@ impl fmt::Debug for VpnClientProductConfig {
             .field("tun_name", &self.tun_name)
             .field("tun_mtu", &self.tun_mtu)
             .field("max_datagram_len", &self.max_datagram_len)
-            .field("request_ipv4", &self.request_ipv4)
-            .field("request_ipv6", &self.request_ipv6)
+            .field("request_ipv4", &self.request_ipv4())
+            .field("request_ipv6", &self.request_ipv6())
+            .field("expected_tunnel_addresses", &"[redacted]")
             .field(
                 "destination_network_count",
                 &self.allowed_destinations.len(),
@@ -348,14 +375,20 @@ pub fn parse_vpn_client_product_config_json(
     {
         return Err(VpnProductConfigError::InvalidServerName);
     }
-    if !raw.request_ipv4 && !raw.request_ipv6 {
+    let (expected_client_ipv4, expected_server_ipv4) =
+        parse_expected_ipv4_pair(raw.expected_client_ipv4, raw.expected_server_ipv4)?;
+    let (expected_client_ipv6, expected_server_ipv6) =
+        parse_expected_ipv6_pair(raw.expected_client_ipv6, raw.expected_server_ipv6)?;
+    let request_ipv4 = expected_client_ipv4.is_some();
+    let request_ipv6 = expected_client_ipv6.is_some();
+    if !request_ipv4 && !request_ipv6 {
         return Err(VpnProductConfigError::MissingAddressFamily);
     }
     let tun_name = validate_vpn_tun_name(&raw.tun_name)?.to_owned();
     validate_packet_sizes(raw.tun_mtu, raw.max_datagram_len)?;
     validate_global_limits(raw.global_reassembly_bytes, raw.global_inflight_packets)?;
     let allowed_destinations =
-        parse_destination_networks(raw.allowed_destinations, raw.request_ipv4, raw.request_ipv6)?;
+        parse_destination_networks(raw.allowed_destinations, request_ipv4, request_ipv6)?;
     let limits = VpnIdentityLimits::new(
         1,
         raw.limits.max_packets_per_second,
@@ -382,8 +415,10 @@ pub fn parse_vpn_client_product_config_json(
         tun_name,
         tun_mtu: raw.tun_mtu,
         max_datagram_len: raw.max_datagram_len,
-        request_ipv4: raw.request_ipv4,
-        request_ipv6: raw.request_ipv6,
+        expected_client_ipv4,
+        expected_server_ipv4,
+        expected_client_ipv6,
+        expected_server_ipv6,
         allowed_destinations,
         limits,
         global_reassembly_bytes: raw.global_reassembly_bytes,
@@ -644,6 +679,64 @@ fn validate_local_ips(
     Ok(())
 }
 
+fn parse_expected_ipv4_pair(
+    client: Option<String>,
+    server: Option<String>,
+) -> Result<(Option<Ipv4Addr>, Option<Ipv4Addr>), VpnProductConfigError> {
+    match (client, server) {
+        (None, None) => Ok((None, None)),
+        (Some(_), None) | (None, Some(_)) => {
+            Err(VpnProductConfigError::IncompleteTunnelAddressPair)
+        }
+        (Some(client), Some(server)) => {
+            let client = client
+                .parse::<Ipv4Addr>()
+                .map_err(|_| VpnProductConfigError::InvalidTunnelAddress)?;
+            let server = server
+                .parse::<Ipv4Addr>()
+                .map_err(|_| VpnProductConfigError::InvalidTunnelAddress)?;
+            if !crate::vpn_control::valid_ipv4_tunnel_address(client)
+                || !crate::vpn_control::valid_ipv4_tunnel_address(server)
+            {
+                return Err(VpnProductConfigError::InvalidTunnelAddress);
+            }
+            if client == server {
+                return Err(VpnProductConfigError::TunnelAddressConflict);
+            }
+            Ok((Some(client), Some(server)))
+        }
+    }
+}
+
+fn parse_expected_ipv6_pair(
+    client: Option<String>,
+    server: Option<String>,
+) -> Result<(Option<Ipv6Addr>, Option<Ipv6Addr>), VpnProductConfigError> {
+    match (client, server) {
+        (None, None) => Ok((None, None)),
+        (Some(_), None) | (None, Some(_)) => {
+            Err(VpnProductConfigError::IncompleteTunnelAddressPair)
+        }
+        (Some(client), Some(server)) => {
+            let client = client
+                .parse::<Ipv6Addr>()
+                .map_err(|_| VpnProductConfigError::InvalidTunnelAddress)?;
+            let server = server
+                .parse::<Ipv6Addr>()
+                .map_err(|_| VpnProductConfigError::InvalidTunnelAddress)?;
+            if !crate::vpn_control::valid_ipv6_tunnel_address(client)
+                || !crate::vpn_control::valid_ipv6_tunnel_address(server)
+            {
+                return Err(VpnProductConfigError::InvalidTunnelAddress);
+            }
+            if client == server {
+                return Err(VpnProductConfigError::TunnelAddressConflict);
+            }
+            Ok((Some(client), Some(server)))
+        }
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawServerConfig {
@@ -672,8 +765,10 @@ struct RawClientConfig {
     tun_name: String,
     tun_mtu: u16,
     max_datagram_len: u16,
-    request_ipv4: bool,
-    request_ipv6: bool,
+    expected_client_ipv4: Option<String>,
+    expected_server_ipv4: Option<String>,
+    expected_client_ipv6: Option<String>,
+    expected_server_ipv6: Option<String>,
     allowed_destinations: Vec<String>,
     limits: RawClientLimits,
     global_reassembly_bytes: usize,
@@ -725,6 +820,14 @@ mod tests {
         assert_eq!(client.tun_name(), "fwvpn0");
         assert!(client.request_ipv4());
         assert!(client.request_ipv6());
+        assert_eq!(
+            client.expected_client_ipv4(),
+            Some("10.77.0.2".parse().unwrap())
+        );
+        assert_eq!(
+            client.expected_server_ipv6(),
+            Some("fd77::1".parse().unwrap())
+        );
         assert_eq!(client.allowed_destinations().len(), 2);
         assert_eq!(client.additional_local_ips().len(), 0);
         assert_eq!(client.limits().max_connections(), 1);
@@ -848,18 +951,39 @@ mod tests {
     #[test]
     fn client_families_networks_limits_and_local_paths_are_cross_validated() {
         let mut no_family = valid_client();
-        no_family["request_ipv4"] = Value::Bool(false);
-        no_family["request_ipv6"] = Value::Bool(false);
+        no_family["expected_client_ipv4"] = Value::Null;
+        no_family["expected_server_ipv4"] = Value::Null;
+        no_family["expected_client_ipv6"] = Value::Null;
+        no_family["expected_server_ipv6"] = Value::Null;
         assert_eq!(
             parse_client_value(no_family).unwrap_err(),
             VpnProductConfigError::MissingAddressFamily
         );
 
         let mut disabled_family = valid_client();
-        disabled_family["request_ipv6"] = Value::Bool(false);
+        disabled_family["expected_client_ipv6"] = Value::Null;
+        disabled_family["expected_server_ipv6"] = Value::Null;
         assert_eq!(
             parse_client_value(disabled_family).unwrap_err(),
             VpnProductConfigError::DestinationFamilyDisabled
+        );
+        let mut incomplete_pair = valid_client();
+        incomplete_pair["expected_server_ipv4"] = Value::Null;
+        assert_eq!(
+            parse_client_value(incomplete_pair).unwrap_err(),
+            VpnProductConfigError::IncompleteTunnelAddressPair
+        );
+        let mut invalid_tunnel_address = valid_client();
+        invalid_tunnel_address["expected_client_ipv4"] = Value::from("127.0.0.1");
+        assert_eq!(
+            parse_client_value(invalid_tunnel_address).unwrap_err(),
+            VpnProductConfigError::InvalidTunnelAddress
+        );
+        let mut tunnel_conflict = valid_client();
+        tunnel_conflict["expected_client_ipv4"] = Value::from("10.77.0.1");
+        assert_eq!(
+            parse_client_value(tunnel_conflict).unwrap_err(),
+            VpnProductConfigError::TunnelAddressConflict
         );
         let mut duplicate_network = valid_client();
         duplicate_network["allowed_destinations"] = json!(["0.0.0.0/0", "0.0.0.0/0"]);
@@ -1004,8 +1128,10 @@ mod tests {
             "tun_name": "fwvpn0",
             "tun_mtu": 1500,
             "max_datagram_len": 1200,
-            "request_ipv4": true,
-            "request_ipv6": true,
+            "expected_client_ipv4": "10.77.0.2",
+            "expected_server_ipv4": "10.77.0.1",
+            "expected_client_ipv6": "fd77::2",
+            "expected_server_ipv6": "fd77::1",
             "allowed_destinations": ["0.0.0.0/0", "::/0"],
             "limits": {
                 "max_packets_per_second": 100000,

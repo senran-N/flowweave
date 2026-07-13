@@ -584,6 +584,10 @@ mod tests {
         );
 
         assert_eq!(client.config().server_name(), "vpn.test");
+        assert_eq!(
+            client.config().expected_client_ipv4(),
+            Some("10.77.0.2".parse().unwrap())
+        );
         assert_eq!(client.hello().max_ip_packet_len, 1500);
         assert_ne!(client.hello().capabilities & VPN_CAP_IPV4, 0);
         assert_ne!(client.hello().capabilities & VPN_CAP_IPV6, 0);
@@ -758,8 +762,10 @@ mod tests {
                 "tun_name": "fwvpn0",
                 "tun_mtu": 1500,
                 "max_datagram_len": 1200,
-                "request_ipv4": true,
-                "request_ipv6": true,
+                "expected_client_ipv4": "10.77.0.2",
+                "expected_server_ipv4": "10.77.0.1",
+                "expected_client_ipv6": "fd77::2",
+                "expected_server_ipv6": "fd77::1",
                 "allowed_destinations": ["0.0.0.0/0", "::/0"],
                 "limits": {
                     "max_packets_per_second": 100000,

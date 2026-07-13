@@ -78,7 +78,7 @@ cargo run --release --bin flowweave-proxy-observe -- \
 - `src/vpn_identity.rs`：证书指纹身份、双指纹轮换、虚拟地址、目标 CIDR 和每身份资源合同；
 - `src/vpn_identity_config.rs`：严格 JSON 身份文件、私有权限和失败保留旧状态的原子注册表替换；
 - `src/vpn_packet_bridge.rs`：Linux 预附着包文件描述符与 DATAGRAM 运行器之间的双向桥接、超限/队列丢弃计数和协同退出；本层不创建 TUN 或修改路由；
-- `src/vpn_product_config.rs`：版本化 server/client JSON、私有文件权限、路径、接口、地址族、ACL 和资源上限的严格校验；
+- `src/vpn_product_config.rs`：版本化 server/client JSON、私有文件权限、路径、接口、预期客户端/服务端隧道地址对、ACL 和资源上限的严格校验；预期地址让 root oneshot 能在数据进程启动前准备 TUN，握手时仍由服务端身份授权最终确认；
 - `src/vpn_product_runtime.rs`：在解析 DNS、打开 UDP 或附着 TUN 前，读取并验证 DER 证书、PKCS#8 私钥、CA、身份注册表、v6.9 产品传输、路径数、协商、数据工厂和桥接上限；
 - `src/vpn_tun.rs`：Linux 非特权数据进程只附着已存在、已启用且 MTU 精确匹配的 `IFF_TUN | IFF_NO_PI`，拒绝 root、可重新启用的 `CAP_NET_ADMIN` 和未设置 `NoNewPrivileges` 的进程；
 - `src/vpn_quota.rs`：跨代际共享 token bucket、逐身份速率隔离和全局重组字节/未完成包原子上限；
@@ -94,6 +94,6 @@ cargo run --release --bin flowweave-proxy-observe -- \
 
 ## 当前限制
 
-实验室结果不等于生产 SLA。仓库已有默认 60 秒的单机真实 TLS/MPQUIC soak、可配置 JSONL 阈值检查、共享令牌无重启轮换，以及带限速、应用字节预算和周期检查点的公网 workload/echo 部署入口；现已完成同一物理出口下“两张接口 + 两条源路由 + 两个 NAT”的 30 分钟真实公网双路径 soak。VPN 已完成逐客户端身份、活动代际、在线撤销、按身份分片的数据热路径、外层 `FWI1` 准入、真实重组、原子全局账本和双向 ACL；客户端现在能直接从受验证的 `FWC1 ACCEPT` 建立数据句柄，双方协商的最大 IP 包长会在收发两端实际执行。真实 loopback 组合测试已串通 TLS 1.3 mTLS、控制握手、受管服务端会话、客户端工厂和双方 NoQ DATAGRAM 运行器，并验证 IPv4 上行、IPv6 下行、超限拒绝及旧运行器退出。Linux 包桥接已用 Unix packet socket 验证双向边界，又在一次性隔离网络空间中真实创建 TUN，证明封闭提权能力后的非 root owner 只能附着既有、已启用、MTU 精确匹配的 `IFF_TUN | IFF_NO_PI`；root、未设置 `NoNewPrivileges`、接口未启用、MTU 不一致和不存在接口均会失败。静态产品装配还会在网络启动前读取并交叉验证配置、证书、PKCS#8 私钥、CA、身份预算、路径数量和全部运行参数。上述实验没有修改主网络空间。产品 `vpn-server` / `vpn-client` 命令、root oneshot 网络准备、TUN 与 DATAGRAM 组合运行、地址/路由/NAT/DNS 和端到端 TCP/UDP/ICMP 仍未完成。两个独立运营商出口只保留为运营商级故障隔离声明边界；多小时/多天证据、跨版本升级、外部指标存储与告警投递仍待完成。C 组编码器目前也是实验入口，不是通用实时媒体协议。
+实验室结果不等于生产 SLA。仓库已有默认 60 秒的单机真实 TLS/MPQUIC soak、可配置 JSONL 阈值检查、共享令牌无重启轮换，以及带限速、应用字节预算和周期检查点的公网 workload/echo 部署入口；现已完成同一物理出口下“两张接口 + 两条源路由 + 两个 NAT”的 30 分钟真实公网双路径 soak。VPN 已完成逐客户端身份、活动代际、在线撤销、按身份分片的数据热路径、外层 `FWI1` 准入、真实重组、原子全局账本和双向 ACL；客户端现在能直接从受验证的 `FWC1 ACCEPT` 建立数据句柄，双方协商的最大 IP 包长会在收发两端实际执行。真实 loopback 组合测试已串通 TLS 1.3 mTLS、控制握手、受管服务端会话、客户端工厂和双方 NoQ DATAGRAM 运行器，并验证 IPv4 上行、IPv6 下行、超限拒绝及旧运行器退出。Linux 包桥接已用 Unix packet socket 验证双向边界，又在一次性隔离网络空间中真实创建 TUN，证明封闭提权能力后的非 root owner 只能附着既有、已启用、MTU 精确匹配的 `IFF_TUN | IFF_NO_PI`；root、未设置 `NoNewPrivileges`、接口未启用、MTU 不一致和不存在接口均会失败。客户端严格配置现包含预期客户端/服务端 IPv4/IPv6 隧道地址对，使未来 root oneshot 能预先配置 TUN，并为握手后的精确比对提供本地真值。静态产品装配还会在网络启动前读取并交叉验证配置、证书、PKCS#8 私钥、CA、身份预算、路径数量和全部运行参数。上述实验没有修改主网络空间。产品 `vpn-server` / `vpn-client` 命令、root oneshot 网络准备、TUN 与 DATAGRAM 组合运行、地址/路由/NAT/DNS 和端到端 TCP/UDP/ICMP 仍未完成。两个独立运营商出口只保留为运营商级故障隔离声明边界；多小时/多天证据、跨版本升级、外部指标存储与告警投递仍待完成。C 组编码器目前也是实验入口，不是通用实时媒体协议。
 
 本仓库当前尚未声明开源许可证；在许可证确定前，不应把第三方许可证误认为 FlowWeave 自身的授权。

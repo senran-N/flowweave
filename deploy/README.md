@@ -4,6 +4,8 @@
 
 `vpn-server.json.example`、`vpn-client.json.example` 和 `vpn-identities.json.example` 已经是代码可严格校验的未来 VPN 配置合同，但目前没有 systemd 单元或产品命令会读取它们。仓库只在一次性隔离 network namespace 中验证了“封闭提权能力的非 root 进程附着已由管理身份准备好的 TUN”；尚未配置真实地址、默认路由、NAT 或 DNS。不要把这些样例当成可部署 VPN 入口；身份格式与剩余边界见 [VPN_IDENTITY.md](../VPN_IDENTITY.md) 和 [VPN_RESEARCH.md](../VPN_RESEARCH.md)。
 
+客户端样例中的 `expected_client_ipv4/ipv6` 与 `expected_server_ipv4/ipv6` 必须和服务端身份文件对该客户端的静态分配完全一致。它们不是让客户端自行申请地址：服务端证书身份仍是最终授权来源；这些预期值用于未来 root oneshot 在主进程启动前配置 TUN，并让数据进程在 `FWC1 ACCEPT` 后拒绝任何配置漂移。
+
 开发机可运行以下只读/隔离门控：
 
 ```bash
