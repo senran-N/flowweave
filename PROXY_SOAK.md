@@ -56,3 +56,5 @@
 - workload 目标必须是 loopback，防止误把测试负载直接发往任意公网 TCP 服务。
 
 应用字节预算不包含 QUIC/TLS、UDP/IP 头、握手、ACK 和重传，不能冒充运营商计费字节的硬上限。真实移动网络试验必须留出传输开销余量，并继续记录接口、源策略路由、两条公网 NAT 地址、路径建立/放弃、持续时间和外部可达性。专用部署与清理流程见 [`deploy/public-soak/README.md`](deploy/public-soak/README.md)。未执行该阶段前，项目继续明确写作“尚未证明真实公网双接口长期 soak”。
+
+2026-07-13 已完成同一物理出口下的公网双接口 smoke：两张临时接口使用独立源策略路由和两个 Docker NAT，服务端观察到两条产品路径建立，15/15 条流完整回显。证据见 [`benchmark-results/2026-07-13-public-same-egress-dual-interface-smoke.md`](benchmark-results/2026-07-13-public-same-egress-dual-interface-smoke.md)。该结果不改变“真实独立双出口尚未证明”的边界。
