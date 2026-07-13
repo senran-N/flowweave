@@ -336,7 +336,7 @@ fn validate_capabilities(capabilities: u32) -> Result<(), VpnControlError> {
 }
 
 fn validate_sizes(max_ip_packet_len: u16, max_datagram_len: u16) -> Result<(), ()> {
-    if usize::from(max_ip_packet_len) < 1280
+    if usize::from(max_ip_packet_len) < crate::VPN_MIN_IP_PACKET_LEN
         || usize::from(max_ip_packet_len) > VPN_MAX_IP_PACKET_LEN
         || usize::from(max_datagram_len) < VPN_MIN_QUIC_DATAGRAM_LEN
     {

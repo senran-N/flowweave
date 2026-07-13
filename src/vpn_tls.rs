@@ -103,7 +103,10 @@ pub fn verify_vpn_alpn(connection: &Connection) -> LabResult<()> {
 
 #[cfg(test)]
 mod tests {
-    use std::{net::SocketAddr, time::Duration};
+    use std::{
+        net::{Ipv4Addr, Ipv6Addr, SocketAddr},
+        time::Duration,
+    };
 
     use noq::{Endpoint, TransportConfig, rustls::pki_types::PrivatePkcs8KeyDer};
     use rcgen::{
@@ -114,9 +117,12 @@ mod tests {
 
     use crate::{
         VPN_CAP_IPV4, VPN_CAP_IPV6, VPN_REQUIRED_CAPABILITIES, VPN_WIRE_VERSION_V1,
-        VpnCertificateFingerprint, VpnHello, VpnIdentity, VpnIdentityLimits, VpnIdentityRegistry,
-        VpnIpNetwork, VpnManagedServerOutcome, VpnReject, VpnRejectReason, VpnServerControlOutcome,
-        VpnServerNegotiationConfig, VpnSessionCoordinator, VpnSessionError, VpnSessionGeneration,
+        VpnCertificateFingerprint, VpnClientDataPathConfig, VpnClientDataPathFactory,
+        VpnDatagramRole, VpnDatagramRuntime, VpnDatagramRuntimeConfig,
+        VpnDatagramRuntimeStopReason, VpnHello, VpnIdentity, VpnIdentityLimits,
+        VpnIdentityRegistry, VpnIpNetwork, VpnManagedServerOutcome, VpnReject, VpnRejectReason,
+        VpnServerControlOutcome, VpnServerNegotiationConfig, VpnSessionCoordinator,
+        VpnSessionError, VpnSessionGeneration, start_vpn_datagram_runtime,
         vpn_client_control_handshake, vpn_server_control_handshake,
         vpn_server_managed_control_handshake,
     };
@@ -393,6 +399,148 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn real_mtls_managed_data_path_transfers_and_enforces_negotiated_limit() {
+        let _network_test_guard = crate::LOCAL_NETWORK_TEST_LOCK.lock().await;
+        let pki = TestPki::new();
+        let fingerprint = vpn_certificate_fingerprint(&pki.client_certificate);
+        let coordinator = VpnSessionCoordinator::new(test_registry(fingerprint, true));
+
+        let mut server_config = build_vpn_server_tls_config(
+            vec![pki.server_certificate.clone()],
+            private_key(pki.server_key.clone()),
+            roots(&pki.client_ca),
+        )
+        .unwrap();
+        configure_vpn_transport(
+            Arc::get_mut(&mut server_config.transport).expect("server transport is unique"),
+        );
+        let server_endpoint =
+            Endpoint::server(server_config, "127.0.0.1:0".parse().unwrap()).unwrap();
+        let server_addr = server_endpoint.local_addr().unwrap();
+        let server_coordinator = coordinator.clone();
+        let expected_uplink = ipv4_packet(1280, "10.77.0.2", "198.51.100.8", 0x61);
+        let expected_downlink = ipv6_packet(1280, "2001:db8::8", "fd77::2", 0x62);
+        let server_uplink = expected_uplink.clone();
+        let server_downlink = expected_downlink.clone();
+        let (release_server, wait_for_release) = oneshot::channel();
+        let server_task = tokio::spawn(async move {
+            let incoming = server_endpoint.accept().await.unwrap();
+            let connection = incoming.accept().unwrap().await.unwrap();
+            connection.handshake_confirmed().await.unwrap();
+            let negotiation = VpnServerNegotiationConfig::new(
+                VPN_WIRE_VERSION_V1,
+                VPN_WIRE_VERSION_V1,
+                1280,
+                1200,
+            )
+            .unwrap();
+            let VpnManagedServerOutcome::Active(active) = vpn_server_managed_control_handshake(
+                &connection,
+                &server_coordinator,
+                negotiation,
+                Duration::from_secs(2),
+            )
+            .await
+            .unwrap() else {
+                panic!("registered mTLS client must become active");
+            };
+            let accept = active.session().accept();
+            let runtime_config =
+                VpnDatagramRuntimeConfig::from_accept(VpnDatagramRole::Server, accept)
+                    .unwrap()
+                    .with_reassembly_tick(Duration::from_millis(10))
+                    .unwrap();
+            let mut runtime = start_vpn_datagram_runtime(
+                connection.clone(),
+                active.data_path().clone(),
+                runtime_config,
+            )
+            .unwrap();
+
+            let received = timeout(Duration::from_secs(3), runtime.recv_packet())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(received.packet().as_bytes(), server_uplink);
+            drop(received);
+            runtime.outbound().try_send(server_downlink).unwrap();
+
+            let _ = wait_for_release.await;
+            assert_eq!(runtime.metrics_snapshot().completed_inbound_packets, 1);
+            assert_eq!(server_coordinator.close_all(), 1);
+            let report = timeout(Duration::from_secs(3), runtime.wait())
+                .await
+                .unwrap();
+            server_endpoint.close(0_u8.into(), b"test complete");
+            report
+        });
+
+        let (client_endpoint, connection) = connect_test_client(server_addr, &pki).await;
+        let accept =
+            vpn_client_control_handshake(&connection, test_hello(), Duration::from_secs(2))
+                .await
+                .unwrap();
+        assert_eq!(accept.max_ip_packet_len, 1280);
+        let client_factory = VpnClientDataPathFactory::new(VpnClientDataPathConfig::new(
+            vec![
+                VpnIpNetwork::v4(Ipv4Addr::UNSPECIFIED, 0).unwrap(),
+                VpnIpNetwork::v6(Ipv6Addr::UNSPECIFIED, 0).unwrap(),
+            ],
+            VpnIdentityLimits::default(),
+        ))
+        .unwrap();
+        let client_path = client_factory.build(accept).unwrap();
+        let client_config =
+            VpnDatagramRuntimeConfig::from_accept(VpnDatagramRole::Client, accept).unwrap();
+        let mut client =
+            start_vpn_datagram_runtime(connection.clone(), client_path, client_config).unwrap();
+
+        client.outbound().try_send(expected_uplink).unwrap();
+        let received = timeout(Duration::from_secs(3), client.recv_packet())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(received.packet().as_bytes(), expected_downlink);
+        drop(received);
+
+        client
+            .outbound()
+            .try_send(ipv4_packet(1281, "10.77.0.2", "198.51.100.9", 0x63))
+            .unwrap();
+        timeout(Duration::from_secs(2), async {
+            loop {
+                if client.metrics_snapshot().outbound_packets_rejected == 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        let _ = release_server.send(());
+        let client_report = timeout(Duration::from_secs(3), client.wait())
+            .await
+            .unwrap();
+        assert!(matches!(
+            client_report.stop_reason,
+            VpnDatagramRuntimeStopReason::ConnectionClosed
+                | VpnDatagramRuntimeStopReason::DataPathStale
+        ));
+        let server_report = timeout(Duration::from_secs(3), server_task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            server_report.stop_reason,
+            VpnDatagramRuntimeStopReason::ConnectionClosed
+                | VpnDatagramRuntimeStopReason::DataPathStale
+        ));
+        connection.close(0_u8.into(), b"test complete");
+        client_endpoint.close(0_u8.into(), b"test complete");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn managed_real_sessions_keep_old_on_reject_then_replace_only_after_accept() {
         let _network_test_guard = crate::LOCAL_NETWORK_TEST_LOCK.lock().await;
         let pki = TestPki::new();
@@ -414,6 +562,7 @@ mod tests {
         let server_coordinator = coordinator.clone();
         let (release_server, wait_for_release) = oneshot::channel();
         let server_task = tokio::spawn(async move {
+            let mut old_runtime = None::<VpnDatagramRuntime>;
             for index in 0..3 {
                 let incoming = server_endpoint.accept().await.unwrap();
                 let connection = incoming.accept().unwrap().await.unwrap();
@@ -429,6 +578,21 @@ mod tests {
                 match (index, outcome) {
                     (0, VpnManagedServerOutcome::Active(active)) => {
                         assert_eq!(active.commit_report().replaced_generation, None);
+                        let config = VpnDatagramRuntimeConfig::from_accept(
+                            VpnDatagramRole::Server,
+                            active.session().accept(),
+                        )
+                        .unwrap()
+                        .with_reassembly_tick(Duration::from_millis(10))
+                        .unwrap();
+                        old_runtime = Some(
+                            start_vpn_datagram_runtime(
+                                connection.clone(),
+                                active.data_path().clone(),
+                                config,
+                            )
+                            .unwrap(),
+                        );
                     }
                     (1, VpnManagedServerOutcome::Rejected(reject)) => {
                         assert_eq!(reject.reason, VpnRejectReason::UnsupportedVersion);
@@ -438,6 +602,19 @@ mod tests {
                         assert_eq!(active.commit_report().replaced_generation, Some(1));
                     }
                     _ => panic!("managed server outcome did not follow the test sequence"),
+                }
+                if index == 2 {
+                    let report = timeout(
+                        Duration::from_secs(2),
+                        old_runtime.take().expect("first runtime exists").wait(),
+                    )
+                    .await
+                    .unwrap();
+                    assert!(matches!(
+                        report.stop_reason,
+                        VpnDatagramRuntimeStopReason::ConnectionClosed
+                            | VpnDatagramRuntimeStopReason::DataPathStale
+                    ));
                 }
             }
             let _ = wait_for_release.await;
@@ -521,6 +698,32 @@ mod tests {
             max_ip_packet_len: u16::MAX,
             max_datagram_len: 1200,
         }
+    }
+
+    fn ipv4_packet(len: usize, source: &str, destination: &str, fill: u8) -> Vec<u8> {
+        let source = source.parse::<Ipv4Addr>().unwrap().octets();
+        let destination = destination.parse::<Ipv4Addr>().unwrap().octets();
+        let mut packet = vec![fill; len];
+        packet[0] = 0x45;
+        packet[2..4].copy_from_slice(&(len as u16).to_be_bytes());
+        packet[8] = 64;
+        packet[9] = 17;
+        packet[12..16].copy_from_slice(&source);
+        packet[16..20].copy_from_slice(&destination);
+        packet
+    }
+
+    fn ipv6_packet(len: usize, source: &str, destination: &str, fill: u8) -> Vec<u8> {
+        let source = source.parse::<Ipv6Addr>().unwrap().octets();
+        let destination = destination.parse::<Ipv6Addr>().unwrap().octets();
+        let mut packet = vec![fill; len];
+        packet[0] = 0x60;
+        packet[4..6].copy_from_slice(&((len - 40) as u16).to_be_bytes());
+        packet[6] = 17;
+        packet[7] = 64;
+        packet[8..24].copy_from_slice(&source);
+        packet[24..40].copy_from_slice(&destination);
+        packet
     }
 
     fn test_registry(fingerprint: VpnCertificateFingerprint, enabled: bool) -> VpnIdentityRegistry {

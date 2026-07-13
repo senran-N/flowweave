@@ -8,6 +8,7 @@ use std::{
 
 pub const VPN_IP_DATAGRAM_MAGIC: &[u8; 4] = b"FWI1";
 pub const VPN_IP_DATAGRAM_HEADER_LEN: usize = 12;
+pub const VPN_MIN_IP_PACKET_LEN: usize = 1280;
 pub const VPN_MAX_IP_PACKET_LEN: usize = u16::MAX as usize;
 pub const VPN_MAX_IP_DATAGRAM_LEN: usize = VPN_IP_DATAGRAM_HEADER_LEN + VPN_MAX_IP_PACKET_LEN;
 pub const VPN_MAX_FRAGMENTS_PER_PACKET: usize = 64;
@@ -346,6 +347,12 @@ impl VpnReassembler {
     pub(crate) fn clear(&mut self) {
         self.packets.clear();
         self.buffered_bytes = 0;
+    }
+
+    pub(crate) fn reject_decoded_fragment(&mut self, packet_id: u32) {
+        self.stats.fragments_received = self.stats.fragments_received.saturating_add(1);
+        self.stats.fragments_rejected = self.stats.fragments_rejected.saturating_add(1);
+        self.remove_packet(packet_id);
     }
 
     pub fn expire(&mut self, now: Instant) -> usize {

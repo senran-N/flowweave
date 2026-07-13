@@ -9,9 +9,10 @@ use std::{
 };
 
 use crate::{
-    VpnDataPolicyError, VpnDataPolicyMetricsSnapshot, VpnIdentity, VpnIpPacketMeta,
-    VpnPacketDirection, VpnPacketError, VpnQuotaMetricsSnapshot, VpnQuotaRejection, VpnReassembler,
-    VpnReassemblyLimits, VpnReassemblyStats, decode_vpn_ip_fragment, encode_vpn_ip_fragments,
+    VpnDataPolicy, VpnDataPolicyError, VpnDataPolicyMetricsSnapshot, VpnIdentity,
+    VpnIdentityLimits, VpnIpPacketMeta, VpnPacketDirection, VpnPacketError,
+    VpnQuotaMetricsSnapshot, VpnQuotaRejection, VpnReassembler, VpnReassemblyLimits,
+    VpnReassemblyStats, decode_vpn_ip_fragment, encode_vpn_ip_fragments,
     validate_vpn_ip_packet_policy,
     vpn::{VPN_DEFAULT_FRAGMENT_TIMEOUT, VPN_DEFAULT_MAX_INFLIGHT_PACKETS},
     vpn_data_policy::VpnDataPolicyMetrics,
@@ -51,6 +52,7 @@ impl VpnDataPacket {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VpnDataPathError {
     StaleGeneration,
+    NegotiatedPacketTooLarge,
     Quota(VpnQuotaRejection),
     Fragment(VpnPacketError),
     Policy(VpnDataPolicyError),
@@ -61,6 +63,9 @@ impl fmt::Display for VpnDataPathError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::StaleGeneration => formatter.write_str("vpn_data_path_stale_generation"),
+            Self::NegotiatedPacketTooLarge => {
+                formatter.write_str("vpn_data_path_negotiated_packet_too_large")
+            }
             Self::Quota(error) => write!(formatter, "vpn_data_path_quota:{error}"),
             Self::Fragment(error) => write!(formatter, "vpn_data_path_fragment:{error}"),
             Self::Policy(error) => write!(formatter, "vpn_data_path_policy:{error}"),
@@ -91,20 +96,52 @@ pub struct VpnDataPathHandle {
 impl VpnDataPathHandle {
     pub(crate) fn new_inactive(
         identity: VpnIdentity,
+        max_ip_packet_len: usize,
         session_generation: u64,
         rate_limiter: Arc<VpnIdentityRateLimiter>,
         global_budget: VpnGlobalReassemblyBudget,
         quota_metrics: VpnQuotaMetrics,
         policy_metrics: VpnDataPolicyMetrics,
     ) -> Result<Self, VpnPacketError> {
-        let limits = VpnReassemblyLimits {
+        Self::new_policy_inactive(
+            identity.data_policy().clone(),
+            identity.limits(),
+            max_ip_packet_len,
+            session_generation,
+            rate_limiter,
+            global_budget,
+            quota_metrics,
+            policy_metrics,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_policy_inactive(
+        policy: VpnDataPolicy,
+        limits: VpnIdentityLimits,
+        max_ip_packet_len: usize,
+        session_generation: u64,
+        rate_limiter: Arc<VpnIdentityRateLimiter>,
+        global_budget: VpnGlobalReassemblyBudget,
+        quota_metrics: VpnQuotaMetrics,
+        policy_metrics: VpnDataPolicyMetrics,
+    ) -> Result<Self, VpnPacketError> {
+        if !(crate::VPN_MIN_IP_PACKET_LEN..=crate::VPN_MAX_IP_PACKET_LEN)
+            .contains(&max_ip_packet_len)
+        {
+            return Err(VpnPacketError::InvalidReassemblyLimits);
+        }
+        let max_reassembly_bytes = limits.max_reassembly_bytes();
+        let reassembly_limits = VpnReassemblyLimits {
             max_inflight_packets: VPN_DEFAULT_MAX_INFLIGHT_PACKETS,
-            max_buffered_bytes: identity.limits().max_reassembly_bytes(),
+            max_buffered_bytes: max_reassembly_bytes,
             fragment_timeout: VPN_DEFAULT_FRAGMENT_TIMEOUT,
         };
         Ok(Self {
             inner: Arc::new(VpnDataPathInner {
-                identity,
+                policy,
+                max_ip_packet_len,
+                max_reassembly_bytes,
                 session_generation,
                 rate_limiter,
                 global_budget,
@@ -113,8 +150,8 @@ impl VpnDataPathHandle {
                 runtime_bound: AtomicBool::new(false),
                 state: Mutex::new(VpnDataPathState {
                     active: false,
-                    uplink: VpnReassembler::new(limits)?,
-                    downlink: VpnReassembler::new(limits)?,
+                    uplink: VpnReassembler::new(reassembly_limits)?,
+                    downlink: VpnReassembler::new(reassembly_limits)?,
                     accounted_bytes: 0,
                     accounted_packets: 0,
                 }),
@@ -139,8 +176,11 @@ impl VpnDataPathHandle {
             self.inner.quota_metrics.record_stale_generation();
             return Err(VpnDataPathError::StaleGeneration);
         }
+        if packet.len() > self.inner.max_ip_packet_len {
+            return Err(VpnDataPathError::NegotiatedPacketTooLarge);
+        }
 
-        let policy = validate_vpn_ip_packet_policy(&self.inner.identity, direction, packet);
+        let policy = validate_vpn_ip_packet_policy(&self.inner.policy, direction, packet);
         let metadata = match policy {
             Ok(metadata) => metadata,
             Err(error) => {
@@ -195,6 +235,15 @@ impl VpnDataPathHandle {
                 return Err(VpnDataPathError::Fragment(actual.err().unwrap_or(expected)));
             }
         };
+        if fragment.total_len > self.inner.max_ip_packet_len {
+            state
+                .reassembler_mut(direction)
+                .reject_decoded_fragment(fragment.packet_id);
+            if !self.reconcile_shrink(&mut state) {
+                return Err(self.fail_accounting(&mut state));
+            }
+            return Err(VpnDataPathError::NegotiatedPacketTooLarge);
+        }
         let existing_packet = state
             .reassembler(direction)
             .contains_packet(fragment.packet_id);
@@ -266,8 +315,7 @@ impl VpnDataPathHandle {
 
         match result {
             Ok(Some(packet)) => {
-                let policy =
-                    validate_vpn_ip_packet_policy(&self.inner.identity, direction, &packet);
+                let policy = validate_vpn_ip_packet_policy(&self.inner.policy, direction, &packet);
                 self.inner
                     .policy_metrics
                     .record(direction, packet.len(), &policy);
@@ -355,7 +403,7 @@ impl VpnDataPathHandle {
         additional_bytes: usize,
         additional_packets: usize,
     ) -> Result<(), VpnQuotaRejection> {
-        let byte_limit = self.inner.identity.limits().max_reassembly_bytes();
+        let byte_limit = self.inner.max_reassembly_bytes;
         loop {
             let count_exceeded = state
                 .inflight_packets()
@@ -432,7 +480,9 @@ impl fmt::Debug for VpnDataPathHandle {
 }
 
 struct VpnDataPathInner {
-    identity: VpnIdentity,
+    policy: VpnDataPolicy,
+    max_ip_packet_len: usize,
+    max_reassembly_bytes: usize,
     session_generation: u64,
     rate_limiter: Arc<VpnIdentityRateLimiter>,
     global_budget: VpnGlobalReassemblyBudget,
@@ -537,7 +587,7 @@ pub fn fuzz_vpn_data_path(input: &[u8]) {
 
     use crate::{
         VPN_MAX_BYTES_PER_SECOND, VPN_MAX_IP_PACKET_LEN, VPN_MAX_PACKETS_PER_SECOND,
-        VpnCertificateFingerprint, VpnIdentityLimits, VpnIpNetwork,
+        VPN_MIN_IP_PACKET_LEN, VpnCertificateFingerprint, VpnIdentityLimits, VpnIpNetwork,
     };
 
     let started = Instant::now();
@@ -571,8 +621,15 @@ pub fn fuzz_vpn_data_path(input: &[u8]) {
         started,
         quota_metrics.clone(),
     ));
+    let negotiated_range = VPN_MAX_IP_PACKET_LEN - VPN_MIN_IP_PACKET_LEN + 1;
+    let negotiated_selector = input
+        .get(..2)
+        .map(|bytes| usize::from(u16::from_be_bytes([bytes[0], bytes[1]])))
+        .unwrap_or(0);
+    let max_ip_packet_len = VPN_MIN_IP_PACKET_LEN + negotiated_selector % negotiated_range;
     let handle = VpnDataPathHandle::new_inactive(
         identity,
+        max_ip_packet_len,
         1,
         rate_limiter,
         budget,
@@ -700,6 +757,81 @@ mod tests {
         assert_eq!(quota.admitted_uplink_datagrams, 2);
         assert_eq!(quota.packet_rate_rejections, 1);
         assert_eq!(policy.snapshot().forwarded_uplink_packets, 2);
+    }
+
+    #[test]
+    fn outbound_packet_above_negotiated_limit_is_rejected_before_accounting() {
+        let started = Instant::now();
+        let limits = VpnIdentityLimits::default();
+        let quota = VpnQuotaMetrics::default();
+        let policy = VpnDataPolicyMetrics::default();
+        let budget = VpnGlobalReassemblyBudget::new(8 * 1024 * 1024, 16, quota.clone()).unwrap();
+        let handle = make_handle_with_max(
+            identity("client-a", "10.77.0.2", limits, "0.0.0.0/0"),
+            1280,
+            1,
+            budget,
+            quota.clone(),
+            policy.clone(),
+            started,
+        );
+        let packet = ipv4_packet(1500, "10.77.0.2", "198.51.100.8", 0x43);
+
+        assert_eq!(
+            handle
+                .encode_ip_packet(VpnPacketDirection::Uplink, 1, &packet, 1200, started)
+                .unwrap_err(),
+            VpnDataPathError::NegotiatedPacketTooLarge
+        );
+        assert_eq!(quota.snapshot().admitted_uplink_datagrams, 0);
+        assert_eq!(policy.snapshot().forwarded_uplink_packets, 0);
+    }
+
+    #[test]
+    fn inbound_packet_above_negotiated_limit_clears_partial_state_after_outer_accounting() {
+        let started = Instant::now();
+        let limits = VpnIdentityLimits::default();
+        let quota = VpnQuotaMetrics::default();
+        let policy = VpnDataPolicyMetrics::default();
+        let budget = VpnGlobalReassemblyBudget::new(8 * 1024 * 1024, 16, quota.clone()).unwrap();
+        let handle = make_handle_with_max(
+            identity("client-a", "10.77.0.2", limits, "0.0.0.0/0"),
+            1280,
+            1,
+            budget,
+            quota.clone(),
+            policy,
+            started,
+        );
+        let first = raw_fragment(9, 1200, 0, &[0x51; 100]);
+        handle
+            .ingest_datagram(VpnPacketDirection::Uplink, &first, started)
+            .unwrap();
+        assert_eq!(handle.snapshot().buffered_reassembly_bytes, 100);
+        assert_eq!(quota.snapshot().current_reassembly_bytes, 100);
+        assert_eq!(quota.snapshot().active_reassembly_packets, 1);
+
+        let oversized = raw_fragment(9, 1500, 100, &[0x52; 100]);
+        assert_eq!(
+            handle
+                .ingest_datagram(VpnPacketDirection::Uplink, &oversized, started)
+                .unwrap_err(),
+            VpnDataPathError::NegotiatedPacketTooLarge
+        );
+
+        let path = handle.snapshot();
+        let global = quota.snapshot();
+        assert_eq!(path.buffered_reassembly_bytes, 0);
+        assert_eq!(path.inflight_reassembly_packets, 0);
+        assert_eq!(path.uplink_reassembly.fragments_received, 2);
+        assert_eq!(path.uplink_reassembly.fragments_rejected, 1);
+        assert_eq!(global.current_reassembly_bytes, 0);
+        assert_eq!(global.active_reassembly_packets, 0);
+        assert_eq!(global.admitted_uplink_datagrams, 2);
+        assert_eq!(
+            global.admitted_uplink_bytes,
+            u64::try_from(first.len() + oversized.len()).unwrap()
+        );
     }
 
     #[test]
@@ -1089,6 +1221,27 @@ mod tests {
         policy_metrics: VpnDataPolicyMetrics,
         now: Instant,
     ) -> VpnDataPathHandle {
+        make_handle_with_max(
+            identity,
+            VPN_MAX_IP_PACKET_LEN,
+            generation,
+            budget,
+            quota_metrics,
+            policy_metrics,
+            now,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn make_handle_with_max(
+        identity: VpnIdentity,
+        max_ip_packet_len: usize,
+        generation: u64,
+        budget: VpnGlobalReassemblyBudget,
+        quota_metrics: VpnQuotaMetrics,
+        policy_metrics: VpnDataPolicyMetrics,
+        now: Instant,
+    ) -> VpnDataPathHandle {
         let rate_limiter = Arc::new(VpnIdentityRateLimiter::new(
             identity.limits(),
             now,
@@ -1096,6 +1249,7 @@ mod tests {
         ));
         let handle = VpnDataPathHandle::new_inactive(
             identity,
+            max_ip_packet_len,
             generation,
             rate_limiter,
             budget,

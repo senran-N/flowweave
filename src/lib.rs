@@ -33,6 +33,7 @@ mod realtime_v3;
 mod scheduler;
 mod vpn;
 mod vpn_active_session;
+mod vpn_client_data_path;
 mod vpn_control;
 mod vpn_data_path;
 mod vpn_data_policy;
@@ -82,9 +83,9 @@ pub use vpn::{
     VPN_DEFAULT_FRAGMENT_TIMEOUT, VPN_DEFAULT_MAX_INFLIGHT_PACKETS,
     VPN_DEFAULT_MAX_REASSEMBLY_BYTES, VPN_IP_DATAGRAM_HEADER_LEN, VPN_IP_DATAGRAM_MAGIC,
     VPN_MAX_FRAGMENTS_PER_PACKET, VPN_MAX_IP_DATAGRAM_LEN, VPN_MAX_IP_PACKET_LEN,
-    VPN_MIN_QUIC_DATAGRAM_LEN, VpnFragment, VpnIpPacketMeta, VpnPacketError, VpnReassembler,
-    VpnReassemblyLimits, VpnReassemblyStats, decode_vpn_ip_fragment, encode_vpn_ip_fragments,
-    inspect_vpn_ip_packet,
+    VPN_MIN_IP_PACKET_LEN, VPN_MIN_QUIC_DATAGRAM_LEN, VpnFragment, VpnIpPacketMeta, VpnPacketError,
+    VpnReassembler, VpnReassemblyLimits, VpnReassemblyStats, decode_vpn_ip_fragment,
+    encode_vpn_ip_fragments, inspect_vpn_ip_packet,
 };
 pub use vpn_active_session::{
     VPN_CLOSE_COMMIT_REJECTED, VPN_CLOSE_IDENTITY_REVOKED, VPN_CLOSE_POLICY_CHANGED,
@@ -93,6 +94,10 @@ pub use vpn_active_session::{
     VpnManagedServerOutcome, VpnManagedSessionError, VpnSessionCommitError, VpnSessionCommitReport,
     VpnSessionCoordinator, VpnSessionCoordinatorMetrics, VpnSessionReconcileReport,
     vpn_server_managed_control_handshake,
+};
+pub use vpn_client_data_path::{
+    VpnClientDataPathConfig, VpnClientDataPathConfigError, VpnClientDataPathError,
+    VpnClientDataPathFactory,
 };
 pub use vpn_control::{
     VPN_ALPN, VPN_CAP_FRAGMENTATION, VPN_CAP_IPV4, VPN_CAP_IPV6, VPN_CAP_MULTIPATH_REQUIRED,
@@ -120,8 +125,8 @@ pub use vpn_identity::{
     VPN_MAX_BYTES_PER_SECOND, VPN_MAX_CLIENT_ID_LEN, VPN_MAX_CONNECTIONS_PER_IDENTITY,
     VPN_MAX_DESTINATION_NETWORKS_PER_IDENTITY, VPN_MAX_FINGERPRINTS_PER_IDENTITY,
     VPN_MAX_IDENTITIES, VPN_MAX_PACKETS_PER_SECOND, VPN_SHA256_FINGERPRINT_LEN,
-    VpnCertificateFingerprint, VpnIdentity, VpnIdentityAuthorizationError, VpnIdentityError,
-    VpnIdentityLimits, VpnIdentityRegistry, VpnIpNetwork,
+    VpnCertificateFingerprint, VpnDataPolicy, VpnIdentity, VpnIdentityAuthorizationError,
+    VpnIdentityError, VpnIdentityLimits, VpnIdentityRegistry, VpnIpNetwork,
 };
 pub use vpn_identity_config::{
     SharedVpnIdentityRegistry, VPN_IDENTITY_CONFIG_MAX_BYTES, VPN_IDENTITY_CONFIG_VERSION,

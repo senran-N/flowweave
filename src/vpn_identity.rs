@@ -200,6 +200,91 @@ fn prefix_mask_v6(prefix_len: u8) -> u128 {
     }
 }
 
+#[derive(Clone, PartialEq, Eq)]
+pub struct VpnDataPolicy {
+    client_ipv4: Option<Ipv4Addr>,
+    client_ipv6: Option<Ipv6Addr>,
+    allowed_destinations: Vec<VpnIpNetwork>,
+}
+
+impl VpnDataPolicy {
+    pub fn new(
+        client_ipv4: Option<Ipv4Addr>,
+        client_ipv6: Option<Ipv6Addr>,
+        allowed_destinations: Vec<VpnIpNetwork>,
+    ) -> Result<Self, VpnIdentityError> {
+        if client_ipv4.is_none() && client_ipv6.is_none() {
+            return Err(VpnIdentityError::MissingClientAddress);
+        }
+        if client_ipv4.is_some_and(|address| !valid_ipv4_tunnel_address(address))
+            || client_ipv6.is_some_and(|address| !valid_ipv6_tunnel_address(address))
+        {
+            return Err(VpnIdentityError::InvalidClientAddress);
+        }
+        if allowed_destinations.len() > VPN_MAX_DESTINATION_NETWORKS_PER_IDENTITY {
+            return Err(VpnIdentityError::TooManyDestinationNetworks);
+        }
+        let mut destination_networks = HashSet::with_capacity(allowed_destinations.len());
+        if !allowed_destinations
+            .iter()
+            .copied()
+            .all(|network| destination_networks.insert(network))
+        {
+            return Err(VpnIdentityError::DuplicateDestinationNetwork);
+        }
+        if allowed_destinations.iter().any(|network| match network {
+            VpnIpNetwork::V4 { .. } => client_ipv4.is_none(),
+            VpnIpNetwork::V6 { .. } => client_ipv6.is_none(),
+        }) {
+            return Err(VpnIdentityError::AddressFamilyUnavailable);
+        }
+        Ok(Self {
+            client_ipv4,
+            client_ipv6,
+            allowed_destinations,
+        })
+    }
+
+    pub const fn client_ipv4(&self) -> Option<Ipv4Addr> {
+        self.client_ipv4
+    }
+
+    pub const fn client_ipv6(&self) -> Option<Ipv6Addr> {
+        self.client_ipv6
+    }
+
+    pub fn allowed_destinations(&self) -> &[VpnIpNetwork] {
+        &self.allowed_destinations
+    }
+
+    pub fn permits_source(&self, source: IpAddr) -> bool {
+        match source {
+            IpAddr::V4(source) => self.client_ipv4 == Some(source),
+            IpAddr::V6(source) => self.client_ipv6 == Some(source),
+        }
+    }
+
+    pub fn allows_destination(&self, destination: IpAddr) -> bool {
+        self.allowed_destinations
+            .iter()
+            .any(|network| network.contains(destination))
+    }
+}
+
+impl fmt::Debug for VpnDataPolicy {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("VpnDataPolicy")
+            .field("has_ipv4", &self.client_ipv4.is_some())
+            .field("has_ipv6", &self.client_ipv6.is_some())
+            .field(
+                "destination_network_count",
+                &self.allowed_destinations.len(),
+            )
+            .finish()
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VpnIdentityLimits {
     max_connections: u16,
@@ -273,9 +358,7 @@ pub struct VpnIdentity {
     client_id: String,
     fingerprints: Vec<VpnCertificateFingerprint>,
     enabled: bool,
-    client_ipv4: Option<Ipv4Addr>,
-    client_ipv6: Option<Ipv6Addr>,
-    allowed_destinations: Vec<VpnIpNetwork>,
+    data_policy: VpnDataPolicy,
     limits: VpnIdentityLimits,
 }
 
@@ -290,17 +373,17 @@ impl VpnIdentity {
         allowed_destinations: Vec<VpnIpNetwork>,
         limits: VpnIdentityLimits,
     ) -> Result<Self, VpnIdentityError> {
-        let identity = Self {
-            client_id: client_id.into(),
+        let client_id = client_id.into();
+        validate_identity_key(&client_id, &fingerprints)?;
+        let data_policy = VpnDataPolicy::new(client_ipv4, client_ipv6, allowed_destinations)?;
+        limits.validate()?;
+        Ok(Self {
+            client_id,
             fingerprints,
             enabled,
-            client_ipv4,
-            client_ipv6,
-            allowed_destinations,
+            data_policy,
             limits,
-        };
-        identity.validate()?;
-        Ok(identity)
+        })
     }
 
     pub fn client_id(&self) -> &str {
@@ -316,15 +399,19 @@ impl VpnIdentity {
     }
 
     pub const fn client_ipv4(&self) -> Option<Ipv4Addr> {
-        self.client_ipv4
+        self.data_policy.client_ipv4()
     }
 
     pub const fn client_ipv6(&self) -> Option<Ipv6Addr> {
-        self.client_ipv6
+        self.data_policy.client_ipv6()
     }
 
     pub fn allowed_destinations(&self) -> &[VpnIpNetwork] {
-        &self.allowed_destinations
+        self.data_policy.allowed_destinations()
+    }
+
+    pub const fn data_policy(&self) -> &VpnDataPolicy {
+        &self.data_policy
     }
 
     pub const fn limits(&self) -> VpnIdentityLimits {
@@ -332,88 +419,53 @@ impl VpnIdentity {
     }
 
     pub fn permits_source(&self, source: IpAddr) -> bool {
-        match source {
-            IpAddr::V4(source) => self.client_ipv4 == Some(source),
-            IpAddr::V6(source) => self.client_ipv6 == Some(source),
-        }
+        self.data_policy.permits_source(source)
     }
 
     pub fn allows_destination(&self, destination: IpAddr) -> bool {
-        self.allowed_destinations
-            .iter()
-            .any(|network| network.contains(destination))
+        self.data_policy.allows_destination(destination)
     }
 
     pub fn has_same_session_policy(&self, other: &Self) -> bool {
         self.client_id == other.client_id
             && self.enabled == other.enabled
-            && self.client_ipv4 == other.client_ipv4
-            && self.client_ipv6 == other.client_ipv6
-            && self.allowed_destinations == other.allowed_destinations
+            && self.data_policy == other.data_policy
             && self.limits == other.limits
     }
 
     fn validate(&self) -> Result<(), VpnIdentityError> {
-        if self.client_id.is_empty()
-            || self.client_id.len() > VPN_MAX_CLIENT_ID_LEN
-            || !self
-                .client_id
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
-        {
-            return Err(VpnIdentityError::InvalidClientId);
-        }
-        if self.fingerprints.is_empty() {
-            return Err(VpnIdentityError::MissingFingerprint);
-        }
-        if self.fingerprints.len() > VPN_MAX_FINGERPRINTS_PER_IDENTITY {
-            return Err(VpnIdentityError::TooManyFingerprints);
-        }
-        let mut fingerprints = HashSet::with_capacity(self.fingerprints.len());
-        if !self
-            .fingerprints
-            .iter()
-            .copied()
-            .all(|fingerprint| fingerprints.insert(fingerprint))
-        {
-            return Err(VpnIdentityError::DuplicateFingerprint);
-        }
-        if self.client_ipv4.is_none() && self.client_ipv6.is_none() {
-            return Err(VpnIdentityError::MissingClientAddress);
-        }
-        if self
-            .client_ipv4
-            .is_some_and(|address| !valid_ipv4_tunnel_address(address))
-            || self
-                .client_ipv6
-                .is_some_and(|address| !valid_ipv6_tunnel_address(address))
-        {
-            return Err(VpnIdentityError::InvalidClientAddress);
-        }
-        if self.allowed_destinations.len() > VPN_MAX_DESTINATION_NETWORKS_PER_IDENTITY {
-            return Err(VpnIdentityError::TooManyDestinationNetworks);
-        }
-        let mut destination_networks = HashSet::with_capacity(self.allowed_destinations.len());
-        if !self
-            .allowed_destinations
-            .iter()
-            .copied()
-            .all(|network| destination_networks.insert(network))
-        {
-            return Err(VpnIdentityError::DuplicateDestinationNetwork);
-        }
-        if self
-            .allowed_destinations
-            .iter()
-            .any(|network| match network {
-                VpnIpNetwork::V4 { .. } => self.client_ipv4.is_none(),
-                VpnIpNetwork::V6 { .. } => self.client_ipv6.is_none(),
-            })
-        {
-            return Err(VpnIdentityError::AddressFamilyUnavailable);
-        }
+        validate_identity_key(&self.client_id, &self.fingerprints)?;
         self.limits.validate()
     }
+}
+
+fn validate_identity_key(
+    client_id: &str,
+    fingerprints: &[VpnCertificateFingerprint],
+) -> Result<(), VpnIdentityError> {
+    if client_id.is_empty()
+        || client_id.len() > VPN_MAX_CLIENT_ID_LEN
+        || !client_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    {
+        return Err(VpnIdentityError::InvalidClientId);
+    }
+    if fingerprints.is_empty() {
+        return Err(VpnIdentityError::MissingFingerprint);
+    }
+    if fingerprints.len() > VPN_MAX_FINGERPRINTS_PER_IDENTITY {
+        return Err(VpnIdentityError::TooManyFingerprints);
+    }
+    let mut unique = HashSet::with_capacity(fingerprints.len());
+    if !fingerprints
+        .iter()
+        .copied()
+        .all(|fingerprint| unique.insert(fingerprint))
+    {
+        return Err(VpnIdentityError::DuplicateFingerprint);
+    }
+    Ok(())
 }
 
 impl fmt::Debug for VpnIdentity {
@@ -423,12 +475,7 @@ impl fmt::Debug for VpnIdentity {
             .field("client_id", &"[redacted]")
             .field("fingerprint_count", &self.fingerprints.len())
             .field("enabled", &self.enabled)
-            .field("has_ipv4", &self.client_ipv4.is_some())
-            .field("has_ipv6", &self.client_ipv6.is_some())
-            .field(
-                "destination_network_count",
-                &self.allowed_destinations.len(),
-            )
+            .field("data_policy", &self.data_policy)
             .field("limits", &self.limits)
             .finish()
     }
@@ -484,17 +531,17 @@ impl VpnIdentityRegistry {
         let mut ipv6_addresses = HashSet::new();
         for (index, identity) in identities.iter().enumerate() {
             identity.validate()?;
-            if identity.client_ipv4.is_some() && server_ipv4.is_none()
-                || identity.client_ipv6.is_some() && server_ipv6.is_none()
+            if identity.client_ipv4().is_some() && server_ipv4.is_none()
+                || identity.client_ipv6().is_some() && server_ipv6.is_none()
             {
                 return Err(VpnIdentityError::AddressFamilyUnavailable);
             }
             if identity
-                .client_ipv4
+                .client_ipv4()
                 .zip(server_ipv4)
                 .is_some_and(|(client, server)| client == server)
                 || identity
-                    .client_ipv6
+                    .client_ipv6()
                     .zip(server_ipv6)
                     .is_some_and(|(client, server)| client == server)
             {
@@ -515,10 +562,10 @@ impl VpnIdentityRegistry {
                 }
             }
             if identity
-                .client_ipv4
+                .client_ipv4()
                 .is_some_and(|address| !ipv4_addresses.insert(address))
                 || identity
-                    .client_ipv6
+                    .client_ipv6()
                     .is_some_and(|address| !ipv6_addresses.insert(address))
             {
                 return Err(VpnIdentityError::DuplicateClientAddress);

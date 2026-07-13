@@ -30,10 +30,16 @@ fuzz_target!(|input: &[u8]| {
         let _ = decode_vpn_control_message(datagram);
         let _ = parse_vpn_identity_registry_json(datagram);
         let _ = inspect_vpn_ip_packet(datagram);
-        let _ =
-            validate_vpn_ip_packet_policy(fuzz_identity(), VpnPacketDirection::Uplink, datagram);
-        let _ =
-            validate_vpn_ip_packet_policy(fuzz_identity(), VpnPacketDirection::Downlink, datagram);
+        let _ = validate_vpn_ip_packet_policy(
+            fuzz_identity().data_policy(),
+            VpnPacketDirection::Uplink,
+            datagram,
+        );
+        let _ = validate_vpn_ip_packet_policy(
+            fuzz_identity().data_policy(),
+            VpnPacketDirection::Downlink,
+            datagram,
+        );
         let _ = reassembler.ingest(now, datagram);
         assert!(reassembler.inflight_packets() <= limits.max_inflight_packets);
         assert!(reassembler.buffered_bytes() <= limits.max_buffered_bytes);

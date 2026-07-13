@@ -8,7 +8,7 @@ use std::{
 };
 
 use crate::{
-    VpnIdentity, VpnIpPacketMeta, VpnPacketDirection, VpnPacketError, inspect_vpn_ip_packet,
+    VpnDataPolicy, VpnIpPacketMeta, VpnPacketDirection, VpnPacketError, inspect_vpn_ip_packet,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -146,25 +146,25 @@ fn add(counter: &AtomicU64, amount: u64) {
 }
 
 pub fn validate_vpn_ip_packet_policy(
-    identity: &VpnIdentity,
+    policy: &VpnDataPolicy,
     direction: VpnPacketDirection,
     packet: &[u8],
 ) -> Result<VpnIpPacketMeta, VpnDataPolicyError> {
     let metadata = inspect_vpn_ip_packet(packet).map_err(VpnDataPolicyError::Packet)?;
     match direction {
         VpnPacketDirection::Uplink => {
-            if !identity.permits_source(metadata.source) {
+            if !policy.permits_source(metadata.source) {
                 return Err(VpnDataPolicyError::UplinkSourceSpoofed);
             }
-            if !identity.allows_destination(metadata.destination) {
+            if !policy.allows_destination(metadata.destination) {
                 return Err(VpnDataPolicyError::DestinationPolicyRejected);
             }
         }
         VpnPacketDirection::Downlink => {
-            if !identity.permits_source(metadata.destination) {
+            if !policy.permits_source(metadata.destination) {
                 return Err(VpnDataPolicyError::DownlinkDestinationMismatch);
             }
-            if !identity.allows_destination(metadata.source) {
+            if !policy.allows_destination(metadata.source) {
                 return Err(VpnDataPolicyError::DestinationPolicyRejected);
             }
         }
@@ -176,7 +176,7 @@ pub fn validate_vpn_ip_packet_policy(
 mod tests {
     use std::net::{Ipv4Addr, Ipv6Addr};
 
-    use crate::{VpnCertificateFingerprint, VpnIdentityLimits, VpnIpNetwork};
+    use crate::VpnIpNetwork;
 
     use super::*;
 
@@ -274,18 +274,14 @@ mod tests {
         );
     }
 
-    fn identity() -> VpnIdentity {
-        VpnIdentity::new(
-            "client-a",
-            vec![VpnCertificateFingerprint::from_sha256([1; 32])],
-            true,
+    fn identity() -> VpnDataPolicy {
+        VpnDataPolicy::new(
             Some("10.77.0.2".parse().unwrap()),
             Some("fd77::2".parse::<Ipv6Addr>().unwrap()),
             vec![
                 VpnIpNetwork::v4("198.51.100.0".parse::<Ipv4Addr>().unwrap(), 24).unwrap(),
                 VpnIpNetwork::v6("2001:db8::".parse::<Ipv6Addr>().unwrap(), 32).unwrap(),
             ],
-            VpnIdentityLimits::default(),
         )
         .unwrap()
     }

@@ -706,7 +706,8 @@ async fn run_inbound_loop(task: VpnInboundLoop) -> VpnRuntimeTaskExit {
                     Err(VpnDataPathError::ResourceAccountingInvariant) => {
                         return VpnRuntimeTaskExit::ResourceInvariant;
                     }
-                    Err(VpnDataPathError::Quota(_)
+                    Err(VpnDataPathError::NegotiatedPacketTooLarge
+                        | VpnDataPathError::Quota(_)
                         | VpnDataPathError::Fragment(_)
                         | VpnDataPathError::Policy(_)) => {
                         metrics.record_rejected_datagram();
@@ -758,7 +759,8 @@ async fn run_outbound_loop(
                 return VpnRuntimeTaskExit::ResourceInvariant;
             }
             Err(
-                VpnDataPathError::Quota(_)
+                VpnDataPathError::NegotiatedPacketTooLarge
+                | VpnDataPathError::Quota(_)
                 | VpnDataPathError::Fragment(_)
                 | VpnDataPathError::Policy(_),
             ) => {
@@ -1379,6 +1381,7 @@ mod tests {
         ));
         let path = VpnDataPathHandle::new_inactive(
             identity,
+            VPN_MAX_IP_PACKET_LEN,
             generation,
             rate_limiter,
             budget,

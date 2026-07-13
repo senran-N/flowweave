@@ -440,6 +440,7 @@ impl VpnSessionCoordinator {
     ) -> Result<VpnCommittedSession, VpnSessionCommitError> {
         let client_id = session.identity().client_id().to_owned();
         let session_generation = session.accept().session_generation;
+        let max_ip_packet_len = usize::from(session.accept().max_ip_packet_len);
         let limits = session.identity().limits();
         let validation = {
             let mut state = self.lock_state();
@@ -479,6 +480,7 @@ impl VpnSessionCoordinator {
                         .clone();
                     let data_path = VpnDataPathHandle::new_inactive(
                         identity,
+                        max_ip_packet_len,
                         session_generation,
                         rate_limiter.clone(),
                         self.global_budget.clone(),
