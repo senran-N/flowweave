@@ -58,3 +58,5 @@
 应用字节预算不包含 QUIC/TLS、UDP/IP 头、握手、ACK 和重传，不能冒充运营商计费字节的硬上限。真实移动网络试验必须留出传输开销余量，并继续记录接口、源策略路由、两条公网 NAT 地址、路径建立/放弃、持续时间和外部可达性。专用部署与清理流程见 [`deploy/public-soak/README.md`](deploy/public-soak/README.md)。未执行该阶段前，项目继续明确写作“尚未证明真实公网双接口长期 soak”。
 
 2026-07-13 已完成同一物理出口下的公网双接口 smoke：两张临时接口使用独立源策略路由和两个 Docker NAT，服务端观察到两条产品路径建立，15/15 条流完整回显。证据见 [`benchmark-results/2026-07-13-public-same-egress-dual-interface-smoke.md`](benchmark-results/2026-07-13-public-same-egress-dual-interface-smoke.md)。该结果不改变“真实独立双出口尚未证明”的边界。
+
+同日进一步完成 30 分钟同出口双接口 soak：7,031/7,031 条流完整回显，双向应用数据 230,391,808 字节，workload 与两端严格健康门控全部通过。完整证据见 [`benchmark-results/2026-07-13-public-same-egress-dual-interface-soak-30m/`](benchmark-results/2026-07-13-public-same-egress-dual-interface-soak-30m/README.md)。它提高公网/NAT/长时间稳定性置信度，但仍不等于两个独立运营商出口。

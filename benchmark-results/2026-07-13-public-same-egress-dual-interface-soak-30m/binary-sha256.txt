@@ -1,0 +1,3 @@
+82f0c5342c0cbfb7ea6915bdfebf26701472973bccc8056eecc3096fb26a3c25  target/release/flowweave-proxy
+63336ae14ecd279ba45c8d2c1d4846a04c499a7b64b5cc3361546d1ac3ee36c6  target/release/flowweave-proxy-soak
+cc98a75d4e8544e93d8bc8579665879de7e5ea7882ba4bf69ca13ef80247eb5f  target/release/flowweave-proxy-observe

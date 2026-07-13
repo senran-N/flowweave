@@ -1,0 +1,12 @@
+lo               UNKNOWN        127.0.0.1/8 ::1/128 
+eth0@if15        UP             172.30.10.2/24 
+eth1@if16        UP             172.30.20.2/24 
+0:	from all lookup local
+101:	from 172.30.10.2 lookup 101
+102:	from 172.30.20.2 lookup 102
+32766:	from all lookup main
+32767:	from all lookup default
+<TEST_SERVER_IP> from 172.30.10.2 via 172.30.10.1 dev eth0 table 101 uid 0 
+    cache 
+<TEST_SERVER_IP> from 172.30.20.2 via 172.30.20.1 dev eth1 table 102 uid 0 
+    cache 
