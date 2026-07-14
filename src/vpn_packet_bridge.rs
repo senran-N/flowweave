@@ -262,25 +262,31 @@ impl VpnPacketBridge {
         self.metrics.snapshot()
     }
 
-    pub async fn shutdown(mut self) -> VpnPacketBridgeReport {
+    pub fn request_shutdown(&self) {
         self.control.request_shutdown();
-        self.await_report().await
+    }
+
+    pub async fn shutdown(mut self) -> VpnPacketBridgeReport {
+        self.request_shutdown();
+        self.join().await
     }
 
     pub async fn wait(mut self) -> VpnPacketBridgeReport {
-        self.await_report().await
+        self.join().await
     }
 
-    async fn await_report(&mut self) -> VpnPacketBridgeReport {
-        let task = self.task.take().expect("packet bridge task is present");
-        match task.await {
+    pub async fn join(&mut self) -> VpnPacketBridgeReport {
+        let task = self.task.as_mut().expect("packet bridge task is present");
+        let report = match task.await {
             Ok(report) => report,
             Err(_) => VpnPacketBridgeReport {
                 stop_reason: VpnPacketBridgeStopReason::WorkerFailed,
                 metrics: self.metrics.snapshot(),
                 datagram_runtime: None,
             },
-        }
+        };
+        self.task.take();
+        report
     }
 }
 

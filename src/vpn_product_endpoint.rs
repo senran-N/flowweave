@@ -312,13 +312,18 @@ impl VpnServerProductEndpointRuntime {
         self.join().await
     }
 
-    async fn join(&mut self) -> Result<VpnServerProductEndpointReport, VpnProductEndpointError> {
+    pub async fn join(
+        &mut self,
+    ) -> Result<VpnServerProductEndpointReport, VpnProductEndpointError> {
         let task = self
             .task
-            .take()
+            .as_mut()
             .ok_or(VpnProductEndpointError::WorkerFailed)?;
-        task.await
-            .map_err(|_| VpnProductEndpointError::WorkerFailed)
+        let report = task
+            .await
+            .map_err(|_| VpnProductEndpointError::WorkerFailed)?;
+        self.task.take();
+        Ok(report)
     }
 }
 
@@ -565,6 +570,7 @@ pub struct VpnClientProductEndpointReport {
 pub struct VpnClientProductEndpointRuntime {
     endpoint: Endpoint,
     connection: Option<VpnClientProductConnectionRuntime>,
+    connection_report: Option<VpnClientProductConnectionReport>,
     local_addr: SocketAddr,
     established_path_count: usize,
     drain_timeout: Duration,
@@ -593,41 +599,51 @@ impl VpnClientProductEndpointRuntime {
             .packet_bridge_metrics()
     }
 
-    pub async fn shutdown(mut self) -> VpnClientProductEndpointReport {
-        let connection = self
-            .connection
-            .take()
-            .expect("active endpoint runtime has a connection")
-            .shutdown()
-            .await;
-        self.finish(connection).await
-    }
-
-    pub async fn wait(mut self) -> VpnClientProductEndpointReport {
-        let connection = self
-            .connection
-            .take()
-            .expect("active endpoint runtime has a connection")
-            .wait()
-            .await;
-        self.finish(connection).await
-    }
-
-    async fn finish(
-        &mut self,
-        connection: VpnClientProductConnectionReport,
-    ) -> VpnClientProductEndpointReport {
+    pub fn request_shutdown(&self) {
+        if let Some(connection) = self.connection.as_ref() {
+            connection.request_shutdown();
+        }
         self.endpoint.close(
             VPN_CLOSE_PRODUCT_ENDPOINT_STOPPED.into(),
             ENDPOINT_STOPPED_REASON,
         );
+    }
+
+    pub async fn shutdown(mut self) -> VpnClientProductEndpointReport {
+        self.request_shutdown();
+        self.join().await
+    }
+
+    pub async fn wait(mut self) -> VpnClientProductEndpointReport {
+        self.join().await
+    }
+
+    pub async fn join(&mut self) -> VpnClientProductEndpointReport {
+        if self.connection_report.is_none() {
+            let connection = self
+                .connection
+                .as_mut()
+                .expect("active endpoint runtime has a connection")
+                .join()
+                .await;
+            self.connection.take();
+            self.connection_report = Some(connection);
+            self.endpoint.close(
+                VPN_CLOSE_PRODUCT_ENDPOINT_STOPPED.into(),
+                ENDPOINT_STOPPED_REASON,
+            );
+        }
+
         let endpoint_drained = timeout(self.drain_timeout, self.endpoint.wait_all_draining())
             .await
             .is_ok();
         VpnClientProductEndpointReport {
             established_path_count: self.established_path_count,
             endpoint_drained,
-            connection,
+            connection: self
+                .connection_report
+                .take()
+                .expect("completed endpoint runtime has a connection report"),
         }
     }
 }
@@ -645,10 +661,7 @@ impl fmt::Debug for VpnClientProductEndpointRuntime {
 
 impl Drop for VpnClientProductEndpointRuntime {
     fn drop(&mut self) {
-        self.endpoint.close(
-            VPN_CLOSE_PRODUCT_ENDPOINT_STOPPED.into(),
-            ENDPOINT_STOPPED_REASON,
-        );
+        self.request_shutdown();
     }
 }
 
@@ -685,6 +698,7 @@ pub async fn connect_vpn_client_product_endpoint(
                 return Ok(VpnClientProductEndpointRuntime {
                     endpoint,
                     connection: Some(runtime),
+                    connection_report: None,
                     local_addr,
                     established_path_count,
                     drain_timeout: limits.drain_timeout,

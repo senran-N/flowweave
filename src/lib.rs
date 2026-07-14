@@ -48,6 +48,8 @@ mod vpn_product_config;
 #[cfg(target_os = "linux")]
 mod vpn_product_endpoint;
 #[cfg(target_os = "linux")]
+mod vpn_product_process;
+#[cfg(target_os = "linux")]
 mod vpn_product_runtime;
 mod vpn_quota;
 mod vpn_session;
@@ -174,6 +176,11 @@ pub use vpn_product_endpoint::{
     VpnProductPathOpenError, VpnServerProductEndpointReport, VpnServerProductEndpointRuntime,
     VpnServerProductEndpointStopReason, connect_vpn_client_product_endpoint,
     start_vpn_server_product_endpoint,
+};
+#[cfg(target_os = "linux")]
+pub use vpn_product_process::{
+    VpnProductProcessError, VpnProductProcessReport, VpnProductProcessRole,
+    VpnProductProcessStopSignal, run_vpn_client_product_process, run_vpn_server_product_process,
 };
 #[cfg(target_os = "linux")]
 pub use vpn_product_runtime::{

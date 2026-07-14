@@ -498,23 +498,33 @@ impl VpnClientProductConnectionRuntime {
             .metrics_snapshot()
     }
 
+    pub fn request_shutdown(&self) {
+        if let Some(bridge) = self.bridge.as_ref() {
+            bridge.request_shutdown();
+        }
+        self.connection.close(
+            VPN_CLOSE_PRODUCT_RUNTIME_STOPPED.into(),
+            PRODUCT_RUNTIME_STOPPED_REASON,
+        );
+    }
+
     pub async fn shutdown(mut self) -> VpnClientProductConnectionReport {
-        let packet_bridge = self
-            .bridge
-            .take()
-            .expect("active product runtime has a packet bridge")
-            .shutdown()
-            .await;
-        self.report(packet_bridge)
+        self.request_shutdown();
+        self.join().await
     }
 
     pub async fn wait(mut self) -> VpnClientProductConnectionReport {
+        self.join().await
+    }
+
+    pub async fn join(&mut self) -> VpnClientProductConnectionReport {
         let packet_bridge = self
             .bridge
-            .take()
+            .as_mut()
             .expect("active product runtime has a packet bridge")
-            .wait()
+            .join()
             .await;
+        self.bridge.take();
         self.report(packet_bridge)
     }
 
