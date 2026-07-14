@@ -125,6 +125,28 @@ pub struct VpnServerProductConfig {
     max_datagram_len: u16,
     global_reassembly_bytes: usize,
     global_inflight_packets: usize,
+    forwarding: Option<VpnServerForwardingConfig>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VpnServerForwardingConfig {
+    manage_sysctls: bool,
+    ipv4_masquerade: bool,
+    ipv6_masquerade: bool,
+}
+
+impl VpnServerForwardingConfig {
+    pub const fn manage_sysctls(self) -> bool {
+        self.manage_sysctls
+    }
+
+    pub const fn ipv4_masquerade(self) -> bool {
+        self.ipv4_masquerade
+    }
+
+    pub const fn ipv6_masquerade(self) -> bool {
+        self.ipv6_masquerade
+    }
 }
 
 impl VpnServerProductConfig {
@@ -167,6 +189,10 @@ impl VpnServerProductConfig {
     pub const fn global_inflight_packets(&self) -> usize {
         self.global_inflight_packets
     }
+
+    pub const fn forwarding(&self) -> Option<VpnServerForwardingConfig> {
+        self.forwarding
+    }
 }
 
 impl fmt::Debug for VpnServerProductConfig {
@@ -179,6 +205,7 @@ impl fmt::Debug for VpnServerProductConfig {
             .field("max_datagram_len", &self.max_datagram_len)
             .field("global_reassembly_bytes", &self.global_reassembly_bytes)
             .field("global_inflight_packets", &self.global_inflight_packets)
+            .field("forwarding", &self.forwarding)
             .field("credential_paths", &"[redacted]")
             .finish()
     }
@@ -356,6 +383,11 @@ pub fn parse_vpn_server_product_config_json(
         max_datagram_len: raw.max_datagram_len,
         global_reassembly_bytes: raw.global_reassembly_bytes,
         global_inflight_packets: raw.global_inflight_packets,
+        forwarding: raw.forwarding.map(|forwarding| VpnServerForwardingConfig {
+            manage_sysctls: forwarding.manage_sysctls,
+            ipv4_masquerade: forwarding.ipv4_masquerade,
+            ipv6_masquerade: forwarding.ipv6_masquerade,
+        }),
     })
 }
 
@@ -751,6 +783,16 @@ struct RawServerConfig {
     max_datagram_len: u16,
     global_reassembly_bytes: usize,
     global_inflight_packets: usize,
+    #[serde(default)]
+    forwarding: Option<RawServerForwardingConfig>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawServerForwardingConfig {
+    manage_sysctls: bool,
+    ipv4_masquerade: bool,
+    ipv6_masquerade: bool,
 }
 
 #[derive(Deserialize)]
@@ -810,6 +852,7 @@ mod tests {
         assert_eq!(server.tun_name(), "fwvpn0");
         assert_eq!(server.tun_mtu(), 1500);
         assert_eq!(server.private_key_der(), base.join("vpn-server.key.der"));
+        assert_eq!(server.forwarding(), None);
 
         let client = parse_vpn_client_product_config_json(
             include_bytes!("../deploy/vpn-client.json.example"),
@@ -946,6 +989,45 @@ mod tests {
             parse_client_value(unspecified_server_name).unwrap_err(),
             VpnProductConfigError::InvalidServerName
         );
+    }
+
+    #[test]
+    fn server_forwarding_is_explicit_and_strict() {
+        let without_forwarding = parse_server_value(valid_server()).unwrap();
+        assert_eq!(without_forwarding.forwarding(), None);
+
+        let mut enabled = valid_server();
+        enabled["forwarding"] = json!({
+            "manage_sysctls": true,
+            "ipv4_masquerade": true,
+            "ipv6_masquerade": false
+        });
+        let forwarding = parse_server_value(enabled).unwrap().forwarding().unwrap();
+        assert!(forwarding.manage_sysctls());
+        assert!(forwarding.ipv4_masquerade());
+        assert!(!forwarding.ipv6_masquerade());
+
+        let mut unknown = valid_server();
+        unknown["forwarding"] = json!({
+            "manage_sysctls": false,
+            "ipv4_masquerade": false,
+            "ipv6_masquerade": false,
+            "egress_interface": "eth0"
+        });
+        assert!(matches!(
+            parse_server_value(unknown),
+            Err(VpnProductConfigError::InvalidJson { .. })
+        ));
+
+        let mut missing = valid_server();
+        missing["forwarding"] = json!({
+            "manage_sysctls": false,
+            "ipv4_masquerade": false
+        });
+        assert!(matches!(
+            parse_server_value(missing),
+            Err(VpnProductConfigError::InvalidJson { .. })
+        ));
     }
 
     #[test]

@@ -49,7 +49,7 @@ unshare \
     --fork \
     sh -eu -c '
         mount --make-rprivate /
-        mount -t tmpfs tmpfs /run
+        mount -t tmpfs -o mode=0755 tmpfs /run
         mkdir -p /run/netns
         current_netns=$(readlink /proc/self/ns/net)
         if [ "$current_netns" = "$2" ]; then
@@ -155,18 +155,36 @@ unshare \
 
         ip netns add fwserver
         ip netns add fwclient
+        ip netns add fwinternet
         ip link add fwserver0 type veth peer name fwclient0
         ip link set fwserver0 netns fwserver
         ip link set fwclient0 netns fwclient
+        ip link add fwserver1 type veth peer name fwinternet0
+        ip link set fwserver1 netns fwserver
+        ip link set fwinternet0 netns fwinternet
 
         ip netns exec fwserver ip link set lo up
         ip netns exec fwserver ip link set fwserver0 up
         ip netns exec fwserver ip addr add 192.0.2.1/30 dev fwserver0
+        ip netns exec fwserver ip link set fwserver1 up
+        ip netns exec fwserver ip addr add 198.51.100.1/30 dev fwserver1
+        ip netns exec fwserver ip -6 addr add 2001:db8:77::1/64 dev fwserver1 nodad
+        ip netns exec fwserver sh -c '"'"'
+            echo 0 > /proc/sys/net/ipv4/ip_forward
+            echo 0 > /proc/sys/net/ipv6/conf/all/forwarding
+        '"'"'
 
         ip netns exec fwclient ip link set lo up
         ip netns exec fwclient ip link set fwclient0 up
         ip netns exec fwclient ip addr add 192.0.2.2/30 dev fwclient0
         ip netns exec fwclient sh -c '"'"'echo "1000 1000" > /proc/sys/net/ipv4/ping_group_range'"'"'
+
+        ip netns exec fwinternet ip link set lo up
+        ip netns exec fwinternet ip link set fwinternet0 up
+        ip netns exec fwinternet ip addr add 198.51.100.2/30 dev fwinternet0
+        ip netns exec fwinternet ip -6 addr add 2001:db8:77::2/64 dev fwinternet0 nodad
+        ip netns exec fwinternet \
+            ip -6 route add fd77::2/128 via 2001:db8:77::1 dev fwinternet0
 
         run_network_helper \
             fwserver \
@@ -185,6 +203,7 @@ unshare \
 
         server_pid=
         client_pid=
+        internet_pid=
         fault_pid=
         wait_watchdog_pid=
         cleanup_endpoint_lab() {
@@ -196,6 +215,10 @@ unshare \
                 kill "$fault_pid" 2>/dev/null || true
                 wait "$fault_pid" 2>/dev/null || true
             fi
+            if [ -n "$internet_pid" ] && kill -0 "$internet_pid" 2>/dev/null; then
+                kill "$internet_pid" 2>/dev/null || true
+                wait "$internet_pid" 2>/dev/null || true
+            fi
             if [ -n "$client_pid" ] && kill -0 "$client_pid" 2>/dev/null; then
                 kill "$client_pid" 2>/dev/null || true
                 wait "$client_pid" 2>/dev/null || true
@@ -204,6 +227,7 @@ unshare \
                 kill "$server_pid" 2>/dev/null || true
                 wait "$server_pid" 2>/dev/null || true
             fi
+            ip netns del fwinternet 2>/dev/null || true
             ip netns del fwclient 2>/dev/null || true
             ip netns del fwserver 2>/dev/null || true
         }
@@ -600,6 +624,68 @@ unshare \
         ip netns exec fwclient \
             ip -4 route get 192.0.2.1 uid 0 | grep -Fq "dev fwvpn0"
 
+        forwarding_activation=$(
+            run_network_helper \
+                fwserver \
+                "$4" \
+                activate-server \
+                "$3/vpn-server.json" \
+                "$3/network-state/server.json"
+        )
+        test "$forwarding_activation" = activated
+        test -f "$3/network-state/server.json.forwarding"
+        test "$(
+            ip netns exec fwserver cat /proc/sys/net/ipv4/ip_forward
+        )" = 1
+        test "$(
+            ip netns exec fwserver cat /proc/sys/net/ipv6/conf/all/forwarding
+        )" = 1
+
+        rm -f \
+            "$3/forwarding.internet.ready" \
+            "$3/forwarding.internet.log" \
+            "$3/forwarding.client.log"
+        ip netns exec fwinternet \
+            env \
+                FLOWWEAVE_TUN_LAB=1 \
+                FLOWWEAVE_HOST_NETNS="$2" \
+                FLOWWEAVE_TUN_FORWARDING_ROLE=internet \
+                FLOWWEAVE_TUN_ENDPOINT_DIR="$3" \
+                "$1" \
+                --ignored \
+                --exact real_server_forwarding_and_nat \
+                --nocapture \
+            >"$3/forwarding.internet.log" 2>&1 &
+        internet_pid=$!
+        wait_for_endpoint_marker \
+            "$3/forwarding.internet.ready" \
+            "$internet_pid" \
+            "$3/forwarding.internet.log" \
+            "VPN internet 观察端"
+        forwarding_client_status=0
+        ip netns exec fwclient \
+            env \
+                FLOWWEAVE_TUN_LAB=1 \
+                FLOWWEAVE_HOST_NETNS="$2" \
+                FLOWWEAVE_TUN_FORWARDING_ROLE=client \
+                FLOWWEAVE_TUN_ENDPOINT_DIR="$3" \
+                "$1" \
+                --ignored \
+                --exact real_server_forwarding_and_nat \
+                --nocapture \
+            >"$3/forwarding.client.log" 2>&1 || forwarding_client_status=$?
+        if [ "$forwarding_client_status" -ne 0 ]; then
+            cat "$3/forwarding.client.log" >&2 || true
+            cat "$3/forwarding.internet.log" >&2 || true
+            exit "$forwarding_client_status"
+        fi
+        if ! wait "$internet_pid"; then
+            internet_pid=
+            cat "$3/forwarding.internet.log" >&2 || true
+            exit 1
+        fi
+        internet_pid=
+
         ip netns exec fwclient \
             ping -4 -n -c 3 -s 1300 -W 2 -w 8 10.77.0.1
         ip netns exec fwclient \
@@ -650,6 +736,21 @@ unshare \
         fi
         require_log_line_once ready "$3/product.server.log" "VPN 产品服务端"
         require_log_line_once stopped "$3/product.server.log" "VPN 产品服务端"
+        forwarding_deactivation=$(
+            run_network_helper \
+                fwserver \
+                "$4" \
+                deactivate-server \
+                "$3/network-state/server.json"
+        )
+        test "$forwarding_deactivation" = deactivated
+        test ! -e "$3/network-state/server.json.forwarding"
+        test "$(
+            ip netns exec fwserver cat /proc/sys/net/ipv4/ip_forward
+        )" = 0
+        test "$(
+            ip netns exec fwserver cat /proc/sys/net/ipv6/conf/all/forwarding
+        )" = 0
 
         ip netns exec fwserver \
             setpriv \
@@ -696,6 +797,15 @@ unshare \
                 "$3/network-state/client.json"
         )
         test "$fault_route_activation" = activated
+        fault_forwarding_activation=$(
+            run_network_helper \
+                fwserver \
+                "$4" \
+                activate-server \
+                "$3/vpn-server.json" \
+                "$3/network-state/server.json"
+        )
+        test "$fault_forwarding_activation" = activated
         ip netns exec fwclient ip link set fwclient0 down
         wait_for_process_exit \
             "$client_pid" \
@@ -749,6 +859,14 @@ unshare \
         fi
         require_log_line_once ready "$3/product-fault.server.log" "断链门控 VPN 产品服务端"
         require_log_line_once stopped "$3/product-fault.server.log" "断链门控 VPN 产品服务端"
+        fault_forwarding_deactivation=$(
+            run_network_helper \
+                fwserver \
+                "$4" \
+                deactivate-server \
+                "$3/network-state/server.json"
+        )
+        test "$fault_forwarding_deactivation" = deactivated
 
         run_network_helper \
             fwclient \

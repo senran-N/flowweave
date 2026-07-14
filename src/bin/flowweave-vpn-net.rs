@@ -3,8 +3,9 @@
 use std::{env, ffi::OsString, path::PathBuf, process::ExitCode};
 
 use flowweave_lab::{
-    activate_vpn_client_routes, cleanup_vpn_network, deactivate_vpn_client_routes,
-    prepare_vpn_client_network, prepare_vpn_server_network,
+    activate_vpn_client_routes, activate_vpn_server_forwarding, cleanup_vpn_network,
+    deactivate_vpn_client_routes, deactivate_vpn_server_forwarding, prepare_vpn_client_network,
+    prepare_vpn_server_network,
 };
 
 fn main() -> ExitCode {
@@ -98,13 +99,41 @@ fn run() -> Result<&'static str, String> {
                 .map(|outcome| outcome.as_str())
                 .map_err(|error| error.to_string())
         }
+        Some("activate-server") => {
+            let config = arguments
+                .next()
+                .map(PathBuf::from)
+                .ok_or_else(|| usage(&program))?;
+            let state = arguments
+                .next()
+                .map(PathBuf::from)
+                .ok_or_else(|| usage(&program))?;
+            if arguments.next().is_some() {
+                return Err(usage(&program));
+            }
+            activate_vpn_server_forwarding(&config, &state)
+                .map(|outcome| outcome.as_str())
+                .map_err(|error| error.to_string())
+        }
+        Some("deactivate-server") => {
+            let state = arguments
+                .next()
+                .map(PathBuf::from)
+                .ok_or_else(|| usage(&program))?;
+            if arguments.next().is_some() {
+                return Err(usage(&program));
+            }
+            deactivate_vpn_server_forwarding(&state)
+                .map(|outcome| outcome.as_str())
+                .map_err(|error| error.to_string())
+        }
         _ => Err(usage(&program)),
     }
 }
 
 fn usage(program: &OsString) -> String {
     format!(
-        "用法：{} <prepare-client|prepare-server> <product-config> <state-path> <owner-uid> | activate-client <product-config> <state-path> | deactivate-client <state-path> | cleanup <state-path>",
+        "用法：{} <prepare-client|prepare-server> <product-config> <state-path> <owner-uid> | <activate-client|activate-server> <product-config> <state-path> | <deactivate-client|deactivate-server> <state-path> | cleanup <state-path>",
         PathBuf::from(program).display()
     )
 }

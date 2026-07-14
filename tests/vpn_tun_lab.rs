@@ -37,11 +37,16 @@ const SERVER_TUN_IPV4: Ipv4Addr = Ipv4Addr::new(10, 77, 0, 1);
 const CLIENT_TUN_IPV4: Ipv4Addr = Ipv4Addr::new(10, 77, 0, 2);
 const SERVER_TUN_IPV6: Ipv6Addr = Ipv6Addr::new(0xfd77, 0, 0, 0, 0, 0, 0, 1);
 const CLIENT_TUN_IPV6: Ipv6Addr = Ipv6Addr::new(0xfd77, 0, 0, 0, 0, 0, 0, 2);
+const SERVER_INTERNET_IPV4: Ipv4Addr = Ipv4Addr::new(198, 51, 100, 1);
+const INTERNET_IPV4: Ipv4Addr = Ipv4Addr::new(198, 51, 100, 2);
+const INTERNET_IPV6: Ipv6Addr = Ipv6Addr::new(0x2001, 0x0db8, 0x0077, 0, 0, 0, 0, 2);
 const SERVER_QUIC_PORT: u16 = 4433;
 const SERVER_CONTROL_PORT: u16 = 49000;
 const SERVER_UPLINK_IPV4_PORT: u16 = 6100;
 const SERVER_UPLINK_IPV6_PORT: u16 = 6101;
 const SERVER_TCP_IPV4_PORT: u16 = 6200;
+const INTERNET_IPV4_PORT: u16 = 6300;
+const INTERNET_IPV6_PORT: u16 = 6301;
 const IO_TIMEOUT: Duration = Duration::from_secs(10);
 const FAULT_TIMEOUT: Duration = Duration::from_secs(15);
 
@@ -124,6 +129,106 @@ async fn real_tun_endpoint_process_cleanup() {
         Ok("reattach") => drop(attach_existing_vpn_tun("fwvpn0", 1500).unwrap()),
         _ => panic!("missing or invalid FLOWWEAVE_TUN_CLEANUP_ROLE"),
     }
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "必须通过 scripts/run_vpn_tun_lab.sh 在一次性三 network namespace 中运行"]
+async fn real_server_forwarding_and_nat() {
+    assert_isolated_lab();
+    let directory = endpoint_lab_directory();
+    match std::env::var("FLOWWEAVE_TUN_FORWARDING_ROLE").as_deref() {
+        Ok("internet") => run_internet_forwarding_observer(&directory).await,
+        Ok("client") => run_client_forwarding_probe().await,
+        _ => panic!("missing or invalid FLOWWEAVE_TUN_FORWARDING_ROLE"),
+    }
+}
+
+async fn run_internet_forwarding_observer(directory: &Path) {
+    let ipv4 = UdpSocket::bind(SocketAddr::new(
+        IpAddr::V4(INTERNET_IPV4),
+        INTERNET_IPV4_PORT,
+    ))
+    .await
+    .unwrap();
+    let ipv6 = UdpSocket::bind(SocketAddr::new(
+        IpAddr::V6(INTERNET_IPV6),
+        INTERNET_IPV6_PORT,
+    ))
+    .await
+    .unwrap();
+    fs::write(directory.join("forwarding.internet.ready"), b"ready").unwrap();
+
+    receive_and_echo_forwarding_probe(
+        &ipv4,
+        &payload(1200, 0xb1),
+        IpAddr::V4(SERVER_INTERNET_IPV4),
+    )
+    .await;
+    receive_and_echo_forwarding_probe(&ipv6, &payload(1180, 0xc2), IpAddr::V6(CLIENT_TUN_IPV6))
+        .await;
+}
+
+async fn run_client_forwarding_probe() {
+    let ipv4 = UdpSocket::bind(SocketAddr::new(IpAddr::V4(CLIENT_TUN_IPV4), 0))
+        .await
+        .unwrap();
+    let ipv6 = UdpSocket::bind(SocketAddr::new(IpAddr::V6(CLIENT_TUN_IPV6), 0))
+        .await
+        .unwrap();
+    send_and_receive_forwarding_probe(
+        &ipv4,
+        SocketAddr::new(IpAddr::V4(INTERNET_IPV4), INTERNET_IPV4_PORT),
+        &payload(1200, 0xb1),
+    )
+    .await;
+    send_and_receive_forwarding_probe(
+        &ipv6,
+        SocketAddr::new(IpAddr::V6(INTERNET_IPV6), INTERNET_IPV6_PORT),
+        &payload(1180, 0xc2),
+    )
+    .await;
+}
+
+async fn receive_and_echo_forwarding_probe(
+    socket: &UdpSocket,
+    expected: &[u8],
+    expected_peer: IpAddr,
+) {
+    let mut buffer = vec![0_u8; 2048];
+    let (received, peer) = timeout(IO_TIMEOUT, socket.recv_from(&mut buffer))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(peer.ip(), expected_peer);
+    assert_eq!(&buffer[..received], expected);
+    assert_eq!(
+        timeout(IO_TIMEOUT, socket.send_to(expected, peer))
+            .await
+            .unwrap()
+            .unwrap(),
+        expected.len()
+    );
+}
+
+async fn send_and_receive_forwarding_probe(
+    socket: &UdpSocket,
+    destination: SocketAddr,
+    expected: &[u8],
+) {
+    assert_eq!(
+        timeout(IO_TIMEOUT, socket.send_to(expected, destination))
+            .await
+            .unwrap()
+            .unwrap(),
+        expected.len()
+    );
+    let mut buffer = vec![0_u8; 2048];
+    let (received, peer) = timeout(IO_TIMEOUT, socket.recv_from(&mut buffer))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(peer, destination);
+    assert_eq!(&buffer[..received], expected);
 }
 
 async fn run_cleanup_hold_server(directory: &Path) {
@@ -637,7 +742,12 @@ fn prepare_endpoint_deployment(directory: &Path) {
             "tun_mtu": 1500,
             "max_datagram_len": 1200,
             "global_reassembly_bytes": 67108864,
-            "global_inflight_packets": 8192
+            "global_inflight_packets": 8192,
+            "forwarding": {
+                "manage_sysctls": true,
+                "ipv4_masquerade": true,
+                "ipv6_masquerade": false
+            }
         }),
     );
     write_private_json(

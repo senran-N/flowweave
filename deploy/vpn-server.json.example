@@ -9,5 +9,6 @@
   "tun_mtu": 1500,
   "max_datagram_len": 1200,
   "global_reassembly_bytes": 67108864,
-  "global_inflight_packets": 8192
+  "global_inflight_packets": 8192,
+  "forwarding": null
 }

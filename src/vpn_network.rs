@@ -31,11 +31,17 @@ use crate::{
 };
 
 mod client_routes;
+mod server_forwarding;
 
 pub use client_routes::{
     VPN_CLIENT_ROUTE_STATE_MAX_BYTES, VPN_CLIENT_ROUTE_STATE_VERSION,
     VpnClientRouteActivationOutcome, VpnClientRouteDeactivationOutcome, activate_vpn_client_routes,
     deactivate_vpn_client_routes,
+};
+pub use server_forwarding::{
+    VPN_SERVER_FORWARDING_STATE_MAX_BYTES, VPN_SERVER_FORWARDING_STATE_VERSION,
+    VpnServerForwardingActivationOutcome, VpnServerForwardingDeactivationOutcome,
+    activate_vpn_server_forwarding, deactivate_vpn_server_forwarding,
 };
 
 pub const VPN_NETWORK_STATE_VERSION: u16 = 1;
@@ -89,6 +95,8 @@ pub enum VpnNetworkCleanupOutcome {
     AlreadyClean,
     RecoveredInterruptedPrepare,
     RecoveredClientRoutes,
+    RecoveredServerForwarding,
+    RecoveredNetworkSidecars,
 }
 
 impl VpnNetworkCleanupOutcome {
@@ -98,6 +106,8 @@ impl VpnNetworkCleanupOutcome {
             Self::AlreadyClean => "already_clean",
             Self::RecoveredInterruptedPrepare => "recovered_interrupted_prepare",
             Self::RecoveredClientRoutes => "recovered_client_routes",
+            Self::RecoveredServerForwarding => "recovered_server_forwarding",
+            Self::RecoveredNetworkSidecars => "recovered_network_sidecars",
         }
     }
 }
@@ -130,6 +140,22 @@ pub enum VpnNetworkIoStage {
     ClientRouteStateSync,
     ClientRouteStateRename,
     ClientRouteStateRemove,
+    ServerForwardingLockOpen,
+    ServerForwardingLockInspect,
+    ServerForwardingLock,
+    ServerForwardingStateOpen,
+    ServerForwardingStateInspect,
+    ServerForwardingStateRead,
+    ServerForwardingStateWrite,
+    ServerForwardingStateSync,
+    ServerForwardingStateRename,
+    ServerForwardingStateRemove,
+    NftInspect,
+    NftSpawn,
+    Ipv4ForwardingRead,
+    Ipv4ForwardingWrite,
+    Ipv6ForwardingRead,
+    Ipv6ForwardingWrite,
     IpInspect,
     IpSpawn,
     TunDeviceOpen,
@@ -162,6 +188,14 @@ pub enum VpnNetworkIpOperation {
     DeleteTunnelRule,
     DeletePolicyRoute,
     Rename,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VpnNetworkNftOperation {
+    InspectTables,
+    InspectTable,
+    ApplyTable,
+    DeleteTable,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -205,6 +239,27 @@ pub enum VpnNetworkError {
     ClientRouteStateConflict,
     ClientRouteStateDrift,
     ClientRouteSlotUnavailable,
+    ServerForwardingStateTooLarge,
+    ServerForwardingStateInvalidJson {
+        line: usize,
+        column: usize,
+    },
+    ServerForwardingStateUnsupportedVersion,
+    ServerForwardingStateInvalid,
+    ServerForwardingStateConflict,
+    ServerForwardingStateDrift,
+    ServerForwardingTableConflict,
+    ServerForwardingFamilyUnavailable,
+    ServerForwardingBusy,
+    Ipv4ForwardingDisabled,
+    Ipv6ForwardingDisabled,
+    NftBinaryUnavailable,
+    NftBinaryUnsafe,
+    NftCommandFailed {
+        operation: VpnNetworkNftOperation,
+        status: Option<i32>,
+    },
+    NftOutputInvalid(VpnNetworkNftOperation),
     IpBinaryUnavailable,
     IpBinaryUnsafe,
     IpCommandFailed {
@@ -237,6 +292,12 @@ impl fmt::Display for VpnNetworkError {
                     "vpn_client_route_state_invalid_json:{line}:{column}"
                 )
             }
+            Self::ServerForwardingStateInvalidJson { line, column } => {
+                write!(
+                    formatter,
+                    "vpn_server_forwarding_state_invalid_json:{line}:{column}"
+                )
+            }
             Self::IpCommandFailed { operation, status } => {
                 write!(
                     formatter,
@@ -248,6 +309,18 @@ impl fmt::Display for VpnNetworkError {
             }
             Self::IpOutputInvalid(operation) => {
                 write!(formatter, "vpn_network_ip_output:{operation:?}")
+            }
+            Self::NftCommandFailed { operation, status } => {
+                write!(
+                    formatter,
+                    "vpn_network_nft_command:{operation:?}:{}",
+                    status
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "signal".to_owned())
+                )
+            }
+            Self::NftOutputInvalid(operation) => {
+                write!(formatter, "vpn_network_nft_output:{operation:?}")
             }
             other => formatter.write_str(match other {
                 Self::NotRoot => "vpn_network_not_root",
@@ -277,6 +350,22 @@ impl fmt::Display for VpnNetworkError {
                 Self::ClientRouteStateConflict => "vpn_client_route_state_conflict",
                 Self::ClientRouteStateDrift => "vpn_client_route_state_drift",
                 Self::ClientRouteSlotUnavailable => "vpn_client_route_slot_unavailable",
+                Self::ServerForwardingStateTooLarge => "vpn_server_forwarding_state_too_large",
+                Self::ServerForwardingStateUnsupportedVersion => {
+                    "vpn_server_forwarding_state_unsupported_version"
+                }
+                Self::ServerForwardingStateInvalid => "vpn_server_forwarding_state_invalid",
+                Self::ServerForwardingStateConflict => "vpn_server_forwarding_state_conflict",
+                Self::ServerForwardingStateDrift => "vpn_server_forwarding_state_drift",
+                Self::ServerForwardingTableConflict => "vpn_server_forwarding_table_conflict",
+                Self::ServerForwardingFamilyUnavailable => {
+                    "vpn_server_forwarding_family_unavailable"
+                }
+                Self::ServerForwardingBusy => "vpn_server_forwarding_busy",
+                Self::Ipv4ForwardingDisabled => "vpn_server_ipv4_forwarding_disabled",
+                Self::Ipv6ForwardingDisabled => "vpn_server_ipv6_forwarding_disabled",
+                Self::NftBinaryUnavailable => "vpn_network_nft_binary_unavailable",
+                Self::NftBinaryUnsafe => "vpn_network_nft_binary_unsafe",
                 Self::IpBinaryUnavailable => "vpn_network_ip_binary_unavailable",
                 Self::IpBinaryUnsafe => "vpn_network_ip_binary_unsafe",
                 Self::InterfaceExists => "vpn_network_interface_exists",
@@ -290,8 +379,11 @@ impl fmt::Display for VpnNetworkError {
                 | Self::IdentityConfig(_)
                 | Self::StateInvalidJson { .. }
                 | Self::ClientRouteStateInvalidJson { .. }
+                | Self::ServerForwardingStateInvalidJson { .. }
                 | Self::IpCommandFailed { .. }
-                | Self::IpOutputInvalid(_) => unreachable!(),
+                | Self::IpOutputInvalid(_)
+                | Self::NftCommandFailed { .. }
+                | Self::NftOutputInvalid(_) => unreachable!(),
             }),
         }
     }
@@ -1275,14 +1367,18 @@ pub fn cleanup_vpn_network(state_path: &Path) -> Result<VpnNetworkCleanupOutcome
     ensure_privileged_network_helper()?;
     let state_lock = VpnNetworkStateLock::acquire(state_path)?;
     let route_cleanup = client_routes::deactivate_vpn_client_routes_locked(&state_lock)?;
+    let forwarding_cleanup =
+        server_forwarding::deactivate_vpn_server_forwarding_locked(&state_lock)?;
     let Some(state) = state_lock.read()? else {
-        return Ok(
-            if route_cleanup == VpnClientRouteDeactivationOutcome::AlreadyInactive {
-                VpnNetworkCleanupOutcome::AlreadyClean
-            } else {
-                VpnNetworkCleanupOutcome::RecoveredClientRoutes
-            },
-        );
+        let routes_recovered = route_cleanup != VpnClientRouteDeactivationOutcome::AlreadyInactive;
+        let forwarding_recovered =
+            forwarding_cleanup != VpnServerForwardingDeactivationOutcome::AlreadyInactive;
+        return Ok(match (routes_recovered, forwarding_recovered) {
+            (false, false) => VpnNetworkCleanupOutcome::AlreadyClean,
+            (true, false) => VpnNetworkCleanupOutcome::RecoveredClientRoutes,
+            (false, true) => VpnNetworkCleanupOutcome::RecoveredServerForwarding,
+            (true, true) => VpnNetworkCleanupOutcome::RecoveredNetworkSidecars,
+        });
     };
     state.plan()?;
     let ip = IpCommand::discover()?;

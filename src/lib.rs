@@ -149,12 +149,15 @@ pub use vpn_identity_config::{
 #[cfg(target_os = "linux")]
 pub use vpn_network::{
     VPN_CLIENT_ROUTE_STATE_MAX_BYTES, VPN_CLIENT_ROUTE_STATE_VERSION, VPN_NETWORK_STATE_MAX_BYTES,
-    VPN_NETWORK_STATE_VERSION, VpnClientRouteActivationOutcome, VpnClientRouteDeactivationOutcome,
-    VpnNetworkCleanupOutcome, VpnNetworkError, VpnNetworkIoStage, VpnNetworkIpOperation,
-    VpnNetworkPlan, VpnNetworkPrepareOutcome, VpnNetworkRole, VpnNetworkStatePhase,
-    activate_vpn_client_routes, cleanup_vpn_network, deactivate_vpn_client_routes,
-    load_vpn_client_network_plan, load_vpn_server_network_plan, prepare_vpn_client_network,
-    prepare_vpn_server_network,
+    VPN_NETWORK_STATE_VERSION, VPN_SERVER_FORWARDING_STATE_MAX_BYTES,
+    VPN_SERVER_FORWARDING_STATE_VERSION, VpnClientRouteActivationOutcome,
+    VpnClientRouteDeactivationOutcome, VpnNetworkCleanupOutcome, VpnNetworkError,
+    VpnNetworkIoStage, VpnNetworkIpOperation, VpnNetworkNftOperation, VpnNetworkPlan,
+    VpnNetworkPrepareOutcome, VpnNetworkRole, VpnNetworkStatePhase,
+    VpnServerForwardingActivationOutcome, VpnServerForwardingDeactivationOutcome,
+    activate_vpn_client_routes, activate_vpn_server_forwarding, cleanup_vpn_network,
+    deactivate_vpn_client_routes, deactivate_vpn_server_forwarding, load_vpn_client_network_plan,
+    load_vpn_server_network_plan, prepare_vpn_client_network, prepare_vpn_server_network,
 };
 #[cfg(target_os = "linux")]
 pub use vpn_packet_bridge::{
@@ -164,9 +167,10 @@ pub use vpn_packet_bridge::{
 };
 pub use vpn_product_config::{
     VPN_PRODUCT_CONFIG_MAX_BYTES, VPN_PRODUCT_CONFIG_VERSION, VPN_PRODUCT_MAX_EXPLICIT_PATHS,
-    VPN_TUN_NAME_MAX_BYTES, VpnClientProductConfig, VpnProductConfigError, VpnServerProductConfig,
-    load_vpn_client_product_config, load_vpn_server_product_config,
-    parse_vpn_client_product_config_json, parse_vpn_server_product_config_json,
+    VPN_TUN_NAME_MAX_BYTES, VpnClientProductConfig, VpnProductConfigError,
+    VpnServerForwardingConfig, VpnServerProductConfig, load_vpn_client_product_config,
+    load_vpn_server_product_config, parse_vpn_client_product_config_json,
+    parse_vpn_server_product_config_json,
 };
 #[cfg(target_os = "linux")]
 pub use vpn_product_endpoint::{

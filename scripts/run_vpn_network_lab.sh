@@ -35,6 +35,31 @@ install -m 0755 "$TEST_BINARY" "$LAB_TEST_BINARY"
 install -m 0600 deploy/vpn-client.json.example "$LAB_DIR/vpn-client.json"
 install -m 0600 deploy/vpn-server.json.example "$LAB_DIR/vpn-server.json"
 install -m 0600 deploy/vpn-identities.json.example "$LAB_DIR/vpn-identities.json"
+jq '.forwarding = {
+        "manage_sysctls": false,
+        "ipv4_masquerade": true,
+        "ipv6_masquerade": false
+    }' \
+    deploy/vpn-server.json.example >"$LAB_DIR/vpn-server.forwarding-external.json"
+jq '.forwarding = {
+        "manage_sysctls": true,
+        "ipv4_masquerade": true,
+        "ipv6_masquerade": false
+    }' \
+    deploy/vpn-server.json.example >"$LAB_DIR/vpn-server.forwarding-managed.json"
+jq '.forwarding = {
+        "manage_sysctls": true,
+        "ipv4_masquerade": false,
+        "ipv6_masquerade": false
+    }' \
+    deploy/vpn-server.json.example >"$LAB_DIR/vpn-server.forwarding-no-nat.json"
+jq '.forwarding = {
+        "manage_sysctls": true,
+        "ipv4_masquerade": true,
+        "ipv6_masquerade": true
+    }' \
+    deploy/vpn-server.json.example >"$LAB_DIR/vpn-server.forwarding-ipv6-nat.json"
+chmod 0600 "$LAB_DIR"/vpn-server.forwarding-*.json
 
 unshare \
     --user \
@@ -51,16 +76,25 @@ unshare \
             exit 1
         fi
         mount --make-rprivate /
+        mount -t tmpfs -o mode=0755 tmpfs /run
         mount -t sysfs sysfs /sys
         ip link set lo up
 
         chown 0:1000 \
             "$4/vpn-client.json" \
             "$4/vpn-server.json" \
+            "$4/vpn-server.forwarding-external.json" \
+            "$4/vpn-server.forwarding-managed.json" \
+            "$4/vpn-server.forwarding-no-nat.json" \
+            "$4/vpn-server.forwarding-ipv6-nat.json" \
             "$4/vpn-identities.json"
         chmod 0640 \
             "$4/vpn-client.json" \
             "$4/vpn-server.json" \
+            "$4/vpn-server.forwarding-external.json" \
+            "$4/vpn-server.forwarding-managed.json" \
+            "$4/vpn-server.forwarding-no-nat.json" \
+            "$4/vpn-server.forwarding-ipv6-nat.json" \
             "$4/vpn-identities.json"
         chown 0:1000 "$4"
         chmod 0710 "$4"
@@ -400,6 +434,192 @@ unshare \
             "$1" prepare-server "$4/vpn-server.json" "$4/state/server.json" 1000
         )
         test "$server_repeated" = already_prepared
+
+        forwarding_disabled=$(
+            "$1" activate-server "$4/vpn-server.json" "$4/state/server.json"
+        )
+        test "$forwarding_disabled" = disabled
+        test ! -e "$4/state/server.json.forwarding"
+        if nft list table inet flowweave_vpn >/dev/null 2>&1; then
+            echo "禁用的服务端 forwarding 意外创建 nft table" >&2
+            exit 1
+        fi
+
+        echo 0 >/proc/sys/net/ipv4/ip_forward
+        echo 0 >/proc/sys/net/ipv6/conf/all/forwarding
+        expect_failure \
+            vpn_server_ipv4_forwarding_disabled \
+            "$1" activate-server \
+                "$4/vpn-server.forwarding-external.json" \
+                "$4/state/server.json"
+        test ! -e "$4/state/server.json.forwarding"
+        if nft list table inet flowweave_vpn >/dev/null 2>&1; then
+            echo "IPv4 forwarding 拒绝路径遗留 nft table" >&2
+            exit 1
+        fi
+        echo 1 >/proc/sys/net/ipv4/ip_forward
+        expect_failure \
+            vpn_server_ipv6_forwarding_disabled \
+            "$1" activate-server \
+                "$4/vpn-server.forwarding-external.json" \
+                "$4/state/server.json"
+        test ! -e "$4/state/server.json.forwarding"
+        if nft list table inet flowweave_vpn >/dev/null 2>&1; then
+            echo "IPv6 forwarding 拒绝路径遗留 nft table" >&2
+            exit 1
+        fi
+        echo 1 >/proc/sys/net/ipv6/conf/all/forwarding
+        externally_managed=$(
+            "$1" activate-server \
+                "$4/vpn-server.forwarding-external.json" \
+                "$4/state/server.json"
+        )
+        test "$externally_managed" = activated
+        external_deactivated=$(
+            "$1" deactivate-server "$4/state/server.json"
+        )
+        test "$external_deactivated" = deactivated
+        test "$(cat /proc/sys/net/ipv4/ip_forward)" = 1
+        test "$(cat /proc/sys/net/ipv6/conf/all/forwarding)" = 1
+
+        echo 0 >/proc/sys/net/ipv4/ip_forward
+        echo 0 >/proc/sys/net/ipv6/conf/all/forwarding
+        nft add table inet flowweave_vpn
+        expect_failure \
+            vpn_server_forwarding_table_conflict \
+            "$1" activate-server \
+                "$4/vpn-server.forwarding-managed.json" \
+                "$4/state/server.json"
+        nft delete table inet flowweave_vpn
+
+        : >/run/flowweave-vpn-forwarding.lock
+        chmod 0600 /run/flowweave-vpn-forwarding.lock
+        exec 8>/run/flowweave-vpn-forwarding.lock
+        flock -n 8
+        expect_failure \
+            vpn_server_forwarding_busy \
+            "$1" activate-server \
+                "$4/vpn-server.forwarding-managed.json" \
+                "$4/state/server.json"
+        flock -u 8
+
+        forwarding_activated=$(
+            "$1" activate-server \
+                "$4/vpn-server.forwarding-managed.json" \
+                "$4/state/server.json"
+        )
+        test "$forwarding_activated" = activated
+        test -f "$4/state/server.json.forwarding"
+        test "$(cat /proc/sys/net/ipv4/ip_forward)" = 1
+        test "$(cat /proc/sys/net/ipv6/conf/all/forwarding)" = 1
+        nft -j list table inet flowweave_vpn | jq -e \
+            '"'"'[.nftables[] | select(.table or .chain or .rule)] | length == 10'"'"' \
+            >/dev/null
+        forwarding_repeated=$(
+            "$1" activate-server \
+                "$4/vpn-server.forwarding-managed.json" \
+                "$4/state/server.json"
+        )
+        test "$forwarding_repeated" = already_active
+
+        expect_failure \
+            vpn_server_forwarding_state_conflict \
+            "$1" activate-server \
+                "$4/vpn-server.forwarding-ipv6-nat.json" \
+                "$4/state/server.json"
+
+        nft add rule inet flowweave_vpn forward counter comment foreign-rule
+        expect_failure \
+            vpn_server_forwarding_state_drift \
+            "$1" activate-server \
+                "$4/vpn-server.forwarding-managed.json" \
+                "$4/state/server.json"
+        foreign_handle=$(nft -j list table inet flowweave_vpn | jq -r \
+            '"'"'.nftables[] | select(.rule.comment == "foreign-rule") | .rule.handle'"'"')
+        nft delete rule inet flowweave_vpn forward handle "$foreign_handle"
+        test "$(
+            "$1" activate-server \
+                "$4/vpn-server.forwarding-managed.json" \
+                "$4/state/server.json"
+        )" = already_active
+
+        nft list table inet flowweave_vpn >"$4/flowweave-vpn.saved.nft"
+        ownership_token=$(jq -r .ownership_token "$4/state/server.json.forwarding")
+        forward_v4_comment="flowweave-vpn-forwarding:v1:$ownership_token:rule:forward-v4-out"
+        forward_v4_handle=$(nft -j list table inet flowweave_vpn | jq -r \
+            --arg comment "$forward_v4_comment" \
+            '"'"'.nftables[] | select(.rule.comment == $comment) | .rule.handle'"'"')
+        nft delete rule inet flowweave_vpn forward handle "$forward_v4_handle"
+        nft add rule inet flowweave_vpn forward \
+            iifname fwvpn0 ip saddr 10.77.0.2 accept \
+            comment "\"$forward_v4_comment\""
+        expect_failure \
+            vpn_server_forwarding_state_drift \
+            "$1" deactivate-server "$4/state/server.json"
+        nft delete table inet flowweave_vpn
+        nft -f "$4/flowweave-vpn.saved.nft"
+        test "$(
+            "$1" activate-server \
+                "$4/vpn-server.forwarding-managed.json" \
+                "$4/state/server.json"
+        )" = recovered_and_activated
+
+        jq '"'"'.phase = "activating" | .nft_table_fingerprint = null'"'"' \
+            "$4/state/server.json.forwarding" \
+            >"$4/state/server.forwarding.recover.json"
+        chmod 0600 "$4/state/server.forwarding.recover.json"
+        mv \
+            "$4/state/server.forwarding.recover.json" \
+            "$4/state/server.json.forwarding"
+        forwarding_recovered=$(
+            "$1" activate-server \
+                "$4/vpn-server.forwarding-no-nat.json" \
+                "$4/state/server.json"
+        )
+        test "$forwarding_recovered" = recovered_and_activated
+        test "$(jq -r .phase "$4/state/server.json.forwarding")" = active
+        nft -j list table inet flowweave_vpn | jq -e \
+            '"'"'[.nftables[] | select(.rule.comment | strings | contains("masquerade"))] | length == 0'"'"' \
+            >/dev/null
+        test "$(
+            "$1" deactivate-server "$4/state/server.json"
+        )" = deactivated
+        test "$(cat /proc/sys/net/ipv4/ip_forward)" = 0
+        test "$(cat /proc/sys/net/ipv6/conf/all/forwarding)" = 0
+
+        test "$(
+            "$1" activate-server \
+                "$4/vpn-server.forwarding-managed.json" \
+                "$4/state/server.json"
+        )" = activated
+        jq '"'"'.phase = "deactivating"'"'"' \
+            "$4/state/server.json.forwarding" \
+            >"$4/state/server.forwarding.deactivating.json"
+        chmod 0600 "$4/state/server.forwarding.deactivating.json"
+        mv \
+            "$4/state/server.forwarding.deactivating.json" \
+            "$4/state/server.json.forwarding"
+        echo 0 >/proc/sys/net/ipv4/ip_forward
+        echo 0 >/proc/sys/net/ipv6/conf/all/forwarding
+        nft delete table inet flowweave_vpn
+        forwarding_deactivation_recovered=$(
+            "$1" deactivate-server "$4/state/server.json"
+        )
+        test "$forwarding_deactivation_recovered" = recovered_interrupted_deactivation
+        test ! -e "$4/state/server.json.forwarding"
+
+        test "$(
+            "$1" activate-server \
+                "$4/vpn-server.forwarding-managed.json" \
+                "$4/state/server.json"
+        )" = activated
         server_cleaned=$("$1" cleanup "$4/state/server.json")
         test "$server_cleaned" = cleaned
+        test ! -e "$4/state/server.json.forwarding"
+        test "$(cat /proc/sys/net/ipv4/ip_forward)" = 0
+        test "$(cat /proc/sys/net/ipv6/conf/all/forwarding)" = 0
+        if nft list table inet flowweave_vpn >/dev/null 2>&1; then
+            echo "服务端 cleanup 遗留 nft table" >&2
+            exit 1
+        fi
     ' sh "$LAB_BINARY" "$LAB_TEST_BINARY" "$HOST_NETNS" "$LAB_DIR"
