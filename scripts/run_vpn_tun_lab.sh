@@ -534,6 +534,9 @@ unshare \
             5
         client_pid=
         ip netns exec fwserver ip link set fwserver0 up
+        ip netns exec fwclient \
+            ping -4 -n -c 2 -W 2 -w 5 192.0.2.1 \
+            >/dev/null
         if [ "$wait_status" -ne 0 ]; then
             cat "$3/product-startup.client.log" >&2 || true
             echo "未 READY 的 VPN 产品客户端 SIGTERM 后退出码为 $wait_status" >&2
@@ -582,26 +585,25 @@ unshare \
             "$3/product.client.log" \
             "VPN 产品客户端"
 
+        route_activation=$(
+            run_network_helper \
+                fwclient \
+                "$4" \
+                activate-client \
+                "$3/vpn-client.json" \
+                "$3/network-state/client.json"
+        )
+        test "$route_activation" = activated
+        test -f "$3/network-state/client.json.routes"
         ip netns exec fwclient \
-            setpriv \
-                --no-new-privs \
-                --bounding-set=-all \
-                --inh-caps=-all \
-                --ambient-caps=-all \
-                --reuid=1000 \
-                --regid=1000 \
-                --clear-groups \
-                ping -4 -n -c 3 -s 1300 -W 2 -w 8 10.77.0.1
+            ip -4 route get 192.0.2.1 uid 1000 | grep -Fq "dev fwclient0"
         ip netns exec fwclient \
-            setpriv \
-                --no-new-privs \
-                --bounding-set=-all \
-                --inh-caps=-all \
-                --ambient-caps=-all \
-                --reuid=1000 \
-                --regid=1000 \
-                --clear-groups \
-                ping -6 -n -c 3 -s 1300 -W 2 -w 8 fd77::1
+            ip -4 route get 192.0.2.1 uid 0 | grep -Fq "dev fwvpn0"
+
+        ip netns exec fwclient \
+            ping -4 -n -c 3 -s 1300 -W 2 -w 8 10.77.0.1
+        ip netns exec fwclient \
+            ping -6 -n -c 3 -s 1300 -W 2 -w 8 fd77::1
 
         kill -TERM "$client_pid"
         wait_for_process_exit \
@@ -617,6 +619,17 @@ unshare \
         fi
         require_log_line_once ready "$3/product.client.log" "VPN 产品客户端"
         require_log_line_once stopped "$3/product.client.log" "VPN 产品客户端"
+        route_deactivation=$(
+            run_network_helper \
+                fwclient \
+                "$4" \
+                deactivate-client \
+                "$3/network-state/client.json"
+        )
+        test "$route_deactivation" = deactivated
+        test ! -e "$3/network-state/client.json.routes"
+        ip netns exec fwclient \
+            ip -4 route get 192.0.2.1 uid 0 | grep -Fq "dev fwclient0"
         if ! kill -0 "$server_pid" 2>/dev/null; then
             cat "$3/product.server.log" >&2 || true
             echo "VPN 产品客户端正常停止后服务端意外退出" >&2
@@ -674,6 +687,15 @@ unshare \
             "$3/product-fault.client.log" \
             "断链门控 VPN 产品客户端"
 
+        fault_route_activation=$(
+            run_network_helper \
+                fwclient \
+                "$4" \
+                activate-client \
+                "$3/vpn-client.json" \
+                "$3/network-state/client.json"
+        )
+        test "$fault_route_activation" = activated
         ip netns exec fwclient ip link set fwclient0 down
         wait_for_process_exit \
             "$client_pid" \
@@ -697,6 +719,15 @@ unshare \
             echo "外层断链未返回稳定的 VPN 产品客户端错误" >&2
             exit 1
         fi
+        fault_route_deactivation=$(
+            run_network_helper \
+                fwclient \
+                "$4" \
+                deactivate-client \
+                "$3/network-state/client.json"
+        )
+        test "$fault_route_deactivation" = deactivated
+        test ! -e "$3/network-state/client.json.routes"
         if ! kill -0 "$server_pid" 2>/dev/null; then
             cat "$3/product-fault.server.log" >&2 || true
             echo "外层断链后 VPN 产品服务端意外退出" >&2

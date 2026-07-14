@@ -30,6 +30,14 @@ use crate::{
     vpn_product_config::{validate_vpn_tun_mtu, validate_vpn_tun_name},
 };
 
+mod client_routes;
+
+pub use client_routes::{
+    VPN_CLIENT_ROUTE_STATE_MAX_BYTES, VPN_CLIENT_ROUTE_STATE_VERSION,
+    VpnClientRouteActivationOutcome, VpnClientRouteDeactivationOutcome, activate_vpn_client_routes,
+    deactivate_vpn_client_routes,
+};
+
 pub const VPN_NETWORK_STATE_VERSION: u16 = 1;
 pub const VPN_NETWORK_STATE_MAX_BYTES: usize = 64 * 1024;
 
@@ -80,6 +88,7 @@ pub enum VpnNetworkCleanupOutcome {
     Cleaned,
     AlreadyClean,
     RecoveredInterruptedPrepare,
+    RecoveredClientRoutes,
 }
 
 impl VpnNetworkCleanupOutcome {
@@ -88,6 +97,7 @@ impl VpnNetworkCleanupOutcome {
             Self::Cleaned => "cleaned",
             Self::AlreadyClean => "already_clean",
             Self::RecoveredInterruptedPrepare => "recovered_interrupted_prepare",
+            Self::RecoveredClientRoutes => "recovered_client_routes",
         }
     }
 }
@@ -113,6 +123,13 @@ pub enum VpnNetworkIoStage {
     StateRename,
     StateRemove,
     StateDirectorySync,
+    ClientRouteStateOpen,
+    ClientRouteStateInspect,
+    ClientRouteStateRead,
+    ClientRouteStateWrite,
+    ClientRouteStateSync,
+    ClientRouteStateRename,
+    ClientRouteStateRemove,
     IpInspect,
     IpSpawn,
     TunDeviceOpen,
@@ -131,11 +148,19 @@ pub enum VpnNetworkIpOperation {
     InspectLink,
     InspectAddresses,
     InspectRoute,
+    InspectPolicyRule,
+    InspectPolicyRoute,
     SetAlias,
     SetMtu,
     SetUp,
     AddAddress,
     AddRoute,
+    AddUidEscapeRule,
+    AddTunnelRule,
+    AddPolicyRoute,
+    DeleteUidEscapeRule,
+    DeleteTunnelRule,
+    DeletePolicyRoute,
     Rename,
 }
 
@@ -170,6 +195,16 @@ pub enum VpnNetworkError {
     StateInvalid,
     StateConflict,
     StateDrift,
+    ClientRouteStateTooLarge,
+    ClientRouteStateInvalidJson {
+        line: usize,
+        column: usize,
+    },
+    ClientRouteStateUnsupportedVersion,
+    ClientRouteStateInvalid,
+    ClientRouteStateConflict,
+    ClientRouteStateDrift,
+    ClientRouteSlotUnavailable,
     IpBinaryUnavailable,
     IpBinaryUnsafe,
     IpCommandFailed {
@@ -195,6 +230,12 @@ impl fmt::Display for VpnNetworkError {
             }
             Self::StateInvalidJson { line, column } => {
                 write!(formatter, "vpn_network_state_invalid_json:{line}:{column}")
+            }
+            Self::ClientRouteStateInvalidJson { line, column } => {
+                write!(
+                    formatter,
+                    "vpn_client_route_state_invalid_json:{line}:{column}"
+                )
             }
             Self::IpCommandFailed { operation, status } => {
                 write!(
@@ -228,6 +269,14 @@ impl fmt::Display for VpnNetworkError {
                 Self::StateInvalid => "vpn_network_state_invalid",
                 Self::StateConflict => "vpn_network_state_conflict",
                 Self::StateDrift => "vpn_network_state_drift",
+                Self::ClientRouteStateTooLarge => "vpn_client_route_state_too_large",
+                Self::ClientRouteStateUnsupportedVersion => {
+                    "vpn_client_route_state_unsupported_version"
+                }
+                Self::ClientRouteStateInvalid => "vpn_client_route_state_invalid",
+                Self::ClientRouteStateConflict => "vpn_client_route_state_conflict",
+                Self::ClientRouteStateDrift => "vpn_client_route_state_drift",
+                Self::ClientRouteSlotUnavailable => "vpn_client_route_slot_unavailable",
                 Self::IpBinaryUnavailable => "vpn_network_ip_binary_unavailable",
                 Self::IpBinaryUnsafe => "vpn_network_ip_binary_unsafe",
                 Self::InterfaceExists => "vpn_network_interface_exists",
@@ -240,6 +289,7 @@ impl fmt::Display for VpnNetworkError {
                 | Self::ProductConfig(_)
                 | Self::IdentityConfig(_)
                 | Self::StateInvalidJson { .. }
+                | Self::ClientRouteStateInvalidJson { .. }
                 | Self::IpCommandFailed { .. }
                 | Self::IpOutputInvalid(_) => unreachable!(),
             }),
@@ -1224,8 +1274,15 @@ pub fn prepare_vpn_server_network(
 pub fn cleanup_vpn_network(state_path: &Path) -> Result<VpnNetworkCleanupOutcome, VpnNetworkError> {
     ensure_privileged_network_helper()?;
     let state_lock = VpnNetworkStateLock::acquire(state_path)?;
+    let route_cleanup = client_routes::deactivate_vpn_client_routes_locked(&state_lock)?;
     let Some(state) = state_lock.read()? else {
-        return Ok(VpnNetworkCleanupOutcome::AlreadyClean);
+        return Ok(
+            if route_cleanup == VpnClientRouteDeactivationOutcome::AlreadyInactive {
+                VpnNetworkCleanupOutcome::AlreadyClean
+            } else {
+                VpnNetworkCleanupOutcome::RecoveredClientRoutes
+            },
+        );
     };
     state.plan()?;
     let ip = IpCommand::discover()?;

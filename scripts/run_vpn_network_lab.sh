@@ -148,6 +148,110 @@ unshare \
         )
         test "$repeated" = already_prepared
 
+        activated=$(
+            "$1" activate-client "$4/vpn-client.json" "$4/state/client.json"
+        )
+        test "$activated" = activated
+        test -f "$4/state/client.json.routes"
+        route_table=$(jq -r .route_table "$4/state/client.json.routes")
+        route_protocol=$(jq -r .route_protocol "$4/state/client.json.routes")
+        uid_priority=$(jq -r .uid_rule_priority "$4/state/client.json.routes")
+        tunnel_priority=$(jq -r .tunnel_rule_priority "$4/state/client.json.routes")
+        ip -N -j -4 rule show | jq -e \
+            --argjson priority "$uid_priority" \
+            --arg protocol "$route_protocol" \
+            '"'"'.[] | select(.priority == $priority and .uid_start == 1000 and .uid_end == 1000 and .table == "254" and .protocol == $protocol)'"'"' \
+            >/dev/null
+        ip -N -j -4 rule show | jq -e \
+            --argjson priority "$tunnel_priority" \
+            --arg table "$route_table" \
+            --arg protocol "$route_protocol" \
+            '"'"'.[] | select(.priority == $priority and .table == $table and .protocol == $protocol)'"'"' \
+            >/dev/null
+        ip -N -j -4 route show table "$route_table" | jq -e \
+            --arg protocol "$route_protocol" \
+            '"'"'.[] | select(.dst == "default" and .dev == "fwvpn0" and .protocol == $protocol)'"'"' \
+            >/dev/null
+        ip -N -j -6 route show table "$route_table" | jq -e \
+            --arg protocol "$route_protocol" \
+            '"'"'.[] | select(.dst == "default" and .dev == "fwvpn0" and .protocol == $protocol)'"'"' \
+            >/dev/null
+        active_repeated=$(
+            "$1" activate-client "$4/vpn-client.json" "$4/state/client.json"
+        )
+        test "$active_repeated" = already_active
+
+        cp "$4/vpn-client.json" "$4/vpn-client.route-original.json"
+        jq ".allowed_destinations = [\"198.51.100.0/24\", \"::/0\"]" \
+            "$4/vpn-client.json" >"$4/vpn-client.route-changed.json"
+        chown 0:1000 "$4/vpn-client.route-changed.json"
+        chmod 0640 "$4/vpn-client.route-changed.json"
+        mv "$4/vpn-client.route-changed.json" "$4/vpn-client.json"
+        expect_failure \
+            vpn_client_route_state_conflict \
+            "$1" activate-client "$4/vpn-client.json" "$4/state/client.json"
+        mv "$4/vpn-client.route-original.json" "$4/vpn-client.json"
+        chown 0:1000 "$4/vpn-client.json"
+        chmod 0640 "$4/vpn-client.json"
+
+        route_metric=$(jq -r .route_metric "$4/state/client.json.routes")
+        ip -4 route add 203.0.113.0/24 \
+            dev fwvpn0 \
+            table "$route_table" \
+            proto "$route_protocol" \
+            metric "$route_metric"
+        expect_failure \
+            vpn_client_route_state_drift \
+            "$1" activate-client "$4/vpn-client.json" "$4/state/client.json"
+        ip -4 route del 203.0.113.0/24 \
+            dev fwvpn0 \
+            table "$route_table" \
+            proto "$route_protocol" \
+            metric "$route_metric"
+
+        ip -4 rule add \
+            priority "$tunnel_priority" \
+            to 203.0.113.0/24 \
+            lookup "$route_table" \
+            protocol "$route_protocol"
+        expect_failure \
+            vpn_client_route_state_drift \
+            "$1" deactivate-client "$4/state/client.json"
+        ip -4 rule del \
+            priority "$tunnel_priority" \
+            to 203.0.113.0/24 \
+            lookup "$route_table" \
+            protocol "$route_protocol"
+
+        jq ".phase = \"activating\"" \
+            "$4/state/client.json.routes" >"$4/state/client.routes.recover.json"
+        chmod 0600 "$4/state/client.routes.recover.json"
+        mv "$4/state/client.routes.recover.json" "$4/state/client.json.routes"
+        cp "$4/vpn-client.json" "$4/vpn-client.route-recover-original.json"
+        jq ".allowed_destinations = [\"198.51.100.0/24\", \"::/0\"]" \
+            "$4/vpn-client.json" >"$4/vpn-client.route-recover-changed.json"
+        chown 0:1000 "$4/vpn-client.route-recover-changed.json"
+        chmod 0640 "$4/vpn-client.route-recover-changed.json"
+        mv "$4/vpn-client.route-recover-changed.json" "$4/vpn-client.json"
+        route_recovered=$(
+            "$1" activate-client "$4/vpn-client.json" "$4/state/client.json"
+        )
+        test "$route_recovered" = recovered_and_activated
+        test "$(jq -r .phase "$4/state/client.json.routes")" = active
+        jq -e \
+            '"'"'.destination_networks == ["198.51.100.0/24", "::/0"]'"'"' \
+            "$4/state/client.json.routes" \
+            >/dev/null
+        mv "$4/vpn-client.route-recover-original.json" "$4/vpn-client.json"
+        chown 0:1000 "$4/vpn-client.json"
+        chmod 0640 "$4/vpn-client.json"
+
+        deactivated=$("$1" deactivate-client "$4/state/client.json")
+        test "$deactivated" = deactivated
+        test ! -e "$4/state/client.json.routes"
+        inactive_repeated=$("$1" deactivate-client "$4/state/client.json")
+        test "$inactive_repeated" = already_inactive
+
         setpriv \
             --no-new-privs \
             --bounding-set=-all \
@@ -232,8 +336,29 @@ unshare \
         test -f "$4/state/client.json"
         ip link show dev fwvpn0 >/dev/null
         ip link set dev fwvpn0 alias "flowweave-vpn-net:v1:$ownership_token"
+
+        cleanup_activated=$(
+            "$1" activate-client "$4/vpn-client.json" "$4/state/client.json"
+        )
+        test "$cleanup_activated" = activated
+        cleanup_route_table=$(jq -r .route_table "$4/state/client.json.routes")
+        cleanup_uid_priority=$(jq -r .uid_rule_priority "$4/state/client.json.routes")
+        cleanup_tunnel_priority=$(jq -r .tunnel_rule_priority "$4/state/client.json.routes")
         cleaned=$("$1" cleanup "$4/state/client.json")
         test "$cleaned" = cleaned
+        test ! -e "$4/state/client.json.routes"
+        for family in -4 -6; do
+            ip -N -j "$family" rule show | jq -e \
+                --argjson uid_priority "$cleanup_uid_priority" \
+                --argjson tunnel_priority "$cleanup_tunnel_priority" \
+                --arg table "$cleanup_route_table" \
+                '"'"'[.[] | select(.priority == $uid_priority or .priority == $tunnel_priority or .table == $table)] | length == 0'"'"' \
+                >/dev/null
+            ip -N -j "$family" route show table all | jq -e \
+                --arg table "$cleanup_route_table" \
+                '"'"'[.[] | select(.table == $table)] | length == 0'"'"' \
+                >/dev/null
+        done
         already_clean=$("$1" cleanup "$4/state/client.json")
         test "$already_clean" = already_clean
 

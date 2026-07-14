@@ -148,9 +148,11 @@ pub use vpn_identity_config::{
 };
 #[cfg(target_os = "linux")]
 pub use vpn_network::{
-    VPN_NETWORK_STATE_MAX_BYTES, VPN_NETWORK_STATE_VERSION, VpnNetworkCleanupOutcome,
-    VpnNetworkError, VpnNetworkIoStage, VpnNetworkIpOperation, VpnNetworkPlan,
-    VpnNetworkPrepareOutcome, VpnNetworkRole, VpnNetworkStatePhase, cleanup_vpn_network,
+    VPN_CLIENT_ROUTE_STATE_MAX_BYTES, VPN_CLIENT_ROUTE_STATE_VERSION, VPN_NETWORK_STATE_MAX_BYTES,
+    VPN_NETWORK_STATE_VERSION, VpnClientRouteActivationOutcome, VpnClientRouteDeactivationOutcome,
+    VpnNetworkCleanupOutcome, VpnNetworkError, VpnNetworkIoStage, VpnNetworkIpOperation,
+    VpnNetworkPlan, VpnNetworkPrepareOutcome, VpnNetworkRole, VpnNetworkStatePhase,
+    activate_vpn_client_routes, cleanup_vpn_network, deactivate_vpn_client_routes,
     load_vpn_client_network_plan, load_vpn_server_network_plan, prepare_vpn_client_network,
     prepare_vpn_server_network,
 };
