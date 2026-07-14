@@ -1,8 +1,10 @@
-# FlowWeave 最小代理部署
+# FlowWeave 部署
 
-当前入口只转发一个固定 TCP 目标：本地应用连接客户端 loopback TCP 端口，客户端通过标准 TLS 1.3 MPQUIC 连接服务端，服务端只允许配置中的唯一 `allowed_target`。它不是 TUN、SOCKS5、开放代理或 UDP 转发器。
+本目录同时包含固定目标 TCP 代理的可复现部署入口，以及 Linux VPN 的受控试点单元。固定目标代理只转发配置中的唯一 TCP 目标；VPN 单元会创建 TUN，并可按显式配置接管客户端路由或启用服务端 forwarding/NAT。两者不是同一个产品合同，也都不是开放代理或 SOCKS5 服务。
 
-`vpn-server.json.example`、`vpn-client.json.example` 和 `vpn-identities.json.example` 已经是代码严格校验的 VPN 配置合同，并由独立的 `flowweave-vpn server|client` 非特权产品进程读取。该进程只附着 root helper 已准备的 TUN，不创建接口或修改地址、路由、NAT、forwarding、DNS；服务端在 UDP Endpoint 已启动后 READY，客户端只在 DNS、严格 TLS 名称校验、MPQUIC、显式路径、`FWC1 ACCEPT`、DATAGRAM 和包桥接全部完成后 READY。`flowweave-vpn-net` root helper 能从同一配置派生两端点对点 TUN、client `allowed_destinations` policy routes，以及显式启用的 server forwarding/NAT；三类事务均使用 root-only 版本状态、计划指纹、随机归属标记、独占锁和原子 journal 完成幂等 prepare/cleanup/activate/deactivate、失败回滚与崩溃恢复。它们已经在隔离 client/server/internet 三 network namespace 中组合通过 READY 后路由接管、IPv4 masquerade、IPv6 无 NAT 返回路由、双栈流量、正常停止、外层失联非零退出和 `SIGKILL` 清理，但尚无安装级 VPN systemd 单元或 DNS 编排；不要把当前开发入口当成生产可部署 VPN。身份格式与剩余边界见 [VPN_IDENTITY.md](../VPN_IDENTITY.md) 和 [VPN_RESEARCH.md](../VPN_RESEARCH.md)。
+`vpn-server.json.example`、`vpn-client.json.example` 和 `vpn-identities.json.example` 是代码严格校验的 VPN 配置合同，并由独立的 `flowweave-vpn server|client` 非特权产品进程读取。该进程只附着 root helper 已准备的 TUN，不创建接口或修改地址、路由、NAT、forwarding、DNS；服务端在 UDP Endpoint 已启动后 READY，客户端只在 DNS、严格 TLS 名称校验、MPQUIC、显式路径、`FWC1 ACCEPT`、DATAGRAM 和包桥接全部完成后 READY。`flowweave-vpn-net` root helper 从同一配置派生两端点对点 TUN、client `allowed_destinations` policy routes，以及显式启用的 server forwarding/NAT；三类事务均使用 root-only 版本状态、计划指纹、随机归属标记、独占锁和原子 journal 完成幂等 prepare/cleanup/activate/deactivate、失败回滚与崩溃恢复。
+
+`flowweave-vpn-client.service` 与 `flowweave-vpn-server.service` 现已把这些边界串成 `prepare → 非特权数据进程 READY → activate`，并让所有停止和失败路径按 `deactivate → cleanup` 收敛。只有短命、带 `+` 前缀的网络事务绕过 `User=flowweave` 和主进程沙箱；常驻数据进程保持空 capability、`NoNewPrivileges` 和只允许 `/dev/net/tun` 的设备边界。真实 user-systemd 门控已覆盖正常停止、prepare 失败、READY 前失败、activate 失败和运行中异常退出；正式单元另有静态权限合同和离线安全审计。DNS 接管、内部长期重连、多客户端长期压力、跨版本升级/回退和真实宿主安装验收仍未完成，因此这些单元只能用于有恢复通道的受控试点，不能据此宣称生产 VPN。身份格式与剩余边界见 [VPN_IDENTITY.md](../VPN_IDENTITY.md) 和 [VPN_RESEARCH.md](../VPN_RESEARCH.md)。
 
 客户端样例中的 `expected_client_ipv4/ipv6` 与 `expected_server_ipv4/ipv6` 必须和服务端身份文件对该客户端的静态分配完全一致。它们不是让客户端自行申请地址：服务端证书身份仍是最终授权来源；root helper 现在使用同一字段准备最小 TUN，数据进程在 `FWC1 ACCEPT` 后继续拒绝任何配置漂移。
 
@@ -11,23 +13,24 @@
 ```bash
 cargo test vpn_product_config -- --nocapture
 cargo test vpn_product_runtime -- --nocapture
+./scripts/run_vpn_systemd_lab.sh
 ./scripts/run_vpn_network_lab.sh
 ./scripts/run_vpn_tun_lab.sh
 ```
 
-后两条命令需要 Linux 的 `unshare`、mount namespace、`ip`、`nft`、`flock`、`ping`、`setpriv`、`jq` 以及当前用户的 `/etc/subuid`、`/etc/subgid` 映射。第一条隔离脚本专测 privileged TUN、policy-route、forwarding/NAT 事务的锁、幂等、冲突、漂移、sysctl 原值恢复、活动 fd、崩溃恢复、归属保护和中途回滚；第二条用同一 helper 准备 client/server/internet 三个嵌套 network namespace 和两端真实 TUN，再验证 UDP/TCP/ICMP/MTU/失联/`SIGKILL`，并以 UID 1000、空 capability、`NoNewPrivileges` 运行真实 `flowweave-vpn` server/client，核对 READY 后路由接管、产品 UID 外层逃生、IPv4 NAT 出口源地址、IPv6 无 NAT 源地址、正常停止和断链后的双向撤销。所有等待都有上限，退出后私有 `/run` mount、nft table、sysctl 变化与全部网络空间消失。
+`run_vpn_systemd_lab.sh` 使用当前会话的真实 user systemd manager 和临时 unit，只验证 READY/失败/清理顺序与 `NoNewPrivileges` 分界，不触碰网络；trap 会删除 unit、二进制副本和状态目录。后两条命令需要 Linux 的 `unshare`、mount namespace、`ip`、`nft`、`flock`、`ping`、`setpriv`、`jq` 以及当前用户的 `/etc/subuid`、`/etc/subgid` 映射。network 脚本专测 privileged TUN、policy-route、forwarding/NAT 事务的锁、幂等、冲突、漂移、sysctl 原值恢复、活动 fd、崩溃恢复、归属保护和中途回滚；TUN 脚本用同一 helper 准备 client/server/internet 三个嵌套 network namespace 和两端真实 TUN，再验证 UDP/TCP/ICMP/MTU/失联/`SIGKILL`，并以 UID 1000、空 capability、`NoNewPrivileges` 运行真实 `flowweave-vpn` server/client，核对 READY 后路由接管、产品 UID 外层逃生、IPv4 NAT 出口源地址、IPv6 无 NAT 源地址、正常停止和断链后的双向撤销。所有等待都有上限，退出后私有 `/run` mount、nft table、sysctl 变化与全部网络空间消失。
 
-VPN 配置与身份文件未来应安装为 `root:flowweave 0640`：数据进程只有读取权，root helper 额外要求 root owner、同一非零 group、无符号链接且 group 不可写；私钥文件仍保持更严格的私有权限。helper 当前命令合同为：
+VPN 配置与身份文件应安装为 `root:flowweave 0640`：数据进程只有读取权，root helper 额外要求 root owner、同一非零 group、无符号链接且 group 不可写；私钥文件仍保持更严格的 `flowweave:flowweave 0400`。helper 当前命令合同为：
 
 ```bash
-flowweave-vpn-net prepare-client /etc/flowweave/vpn-client.json /run/flowweave/vpn-client.network.json "$(id -u flowweave)"
-flowweave-vpn-net prepare-server /etc/flowweave/vpn-server.json /run/flowweave/vpn-server.network.json "$(id -u flowweave)"
-flowweave-vpn-net activate-client /etc/flowweave/vpn-client.json /run/flowweave/vpn-client.network.json
-flowweave-vpn-net activate-server /etc/flowweave/vpn-server.json /run/flowweave/vpn-server.network.json
-flowweave-vpn-net deactivate-client /run/flowweave/vpn-client.network.json
-flowweave-vpn-net deactivate-server /run/flowweave/vpn-server.network.json
-flowweave-vpn-net cleanup /run/flowweave/vpn-client.network.json
-flowweave-vpn-net cleanup /run/flowweave/vpn-server.network.json
+flowweave-vpn-net prepare-client /etc/flowweave/vpn-client.json /run/flowweave-vpn-client.network.json @flowweave
+flowweave-vpn-net prepare-server /etc/flowweave/vpn-server.json /run/flowweave-vpn-server.network.json @flowweave
+flowweave-vpn-net activate-client /etc/flowweave/vpn-client.json /run/flowweave-vpn-client.network.json
+flowweave-vpn-net activate-server /etc/flowweave/vpn-server.json /run/flowweave-vpn-server.network.json
+flowweave-vpn-net deactivate-client /run/flowweave-vpn-client.network.json
+flowweave-vpn-net deactivate-server /run/flowweave-vpn-server.network.json
+flowweave-vpn-net cleanup /run/flowweave-vpn-client.network.json
+flowweave-vpn-net cleanup /run/flowweave-vpn-server.network.json
 ```
 
 服务端样例把 `forwarding` 设为 `null`，因此 `activate-server` 只返回稳定结果 `disabled`，不触碰 nftables 或 sysctl。只有明确需要本机充当 VPN 路由器时才配置对象：
@@ -51,7 +54,75 @@ flowweave-vpn client /etc/flowweave/vpn-client.json
 
 无 `NOTIFY_SOCKET` 时，成功就绪与正常停止分别在 stdout 输出唯一稳定行 `ready`、`stopped`；存在 systemd notify socket 时还会发送 `READY=1`、`STOPPING=1`。SIGTERM/Ctrl-C 在 DNS/QUIC 启动阶段也会立即取消且不误报 `ready`。Endpoint 或连接意外结束返回非零且不输出 `stopped`。SIGHUP 当前会有界关闭并返回 `vpn_process_reload_unsupported`，尚未实现在线重载。
 
-这里只记录已验证的接口合同，不是在当前版本建议直接对宿主机执行：`activate-client` 已通过专用 UID `lookup main` 保护产品外层 DNS/QUIC，`activate-server` 已建立可验证归属、可恢复的 forwarding/NAT 事务；但尚无 Type=notify systemd 单元自动保证它们只在 READY 后调用，并在所有正常/异常退出路径按 `deactivate → cleanup` 收敛。DNS 的安装和回退也未完成。开发验证必须继续使用上述隔离脚本。
+正式 Type=notify 单元只在主进程发送 `READY=1` 后运行 `activate-*`。没有单独的 `ExecStop=`：systemd 先终止并等待数据进程退出，再按声明顺序执行两条 `ExecStopPost=`，先撤销路由/forwarding，后清理 TUN。`ExecStopPost=` 同时覆盖 prepare 失败、READY 前失败、activate 失败、正常停止、异常退出和重启。状态保存在 `/run/flowweave-vpn-{client,server}.network.json` 及其 sidecar；若 helper 因外部漂移拒绝清理，不得手工删除状态文件后强行继续，应先查明并恢复它所记录对象的归属。
+
+## VPN 受控试点安装
+
+以下步骤只适用于 Linux systemd 主机，并要求管理员保留带外控制台或等价恢复通道。客户端样例默认包含 `0.0.0.0/0` 和 `::/0`；首次试点应先把客户端配置和服务端对应身份的 `allowed_destinations` 同时缩窄为一个可验证测试网段，确认停止与回退后再评估全隧道。FlowWeave 当前不管理 DNS，应用仍使用宿主 DNS 配置，可能产生 DNS 泄漏或在全隧道路由下失效。
+
+在源码目录构建并安装两个二进制和对应 unit：
+
+```bash
+cargo build --release --bin flowweave-vpn --bin flowweave-vpn-net
+getent group flowweave >/dev/null || sudo groupadd --system flowweave
+id -u flowweave >/dev/null 2>&1 || \
+  sudo useradd --system --gid flowweave --home-dir /nonexistent --shell /usr/bin/nologin flowweave
+sudo install -d -o root -g flowweave -m 0750 /etc/flowweave
+sudo install -d -o root -g root -m 0755 /usr/local/share/doc/flowweave
+sudo install -o root -g root -m 0755 target/release/flowweave-vpn /usr/local/bin/flowweave-vpn
+sudo install -o root -g root -m 0755 target/release/flowweave-vpn-net /usr/local/bin/flowweave-vpn-net
+sudo install -o root -g root -m 0644 VPN_RESEARCH.md /usr/local/share/doc/flowweave/VPN_RESEARCH.md
+```
+
+服务端安装真实配置、身份、证书和私钥；客户端安装自己的配置、证书和私钥。样例中的占位名称、证书指纹和地址不能直接用于运行：
+
+```bash
+# 服务端主机
+sudo install -o root -g flowweave -m 0640 deploy/vpn-server.json.example /etc/flowweave/vpn-server.json
+sudo install -o root -g flowweave -m 0640 deploy/vpn-identities.json.example /etc/flowweave/vpn-identities.json
+sudo install -o root -g root -m 0644 vpn-server.cert.der vpn-client-ca.cert.der /etc/flowweave/
+sudo install -o flowweave -g flowweave -m 0400 vpn-server.key.der /etc/flowweave/vpn-server.key.der
+sudo install -o root -g root -m 0644 deploy/flowweave-vpn-server.service /etc/systemd/system/flowweave-vpn-server.service
+
+# 客户端主机
+sudo install -o root -g flowweave -m 0640 deploy/vpn-client.json.example /etc/flowweave/vpn-client.json
+sudo install -o root -g root -m 0644 vpn-server-ca.cert.der vpn-client.cert.der /etc/flowweave/
+sudo install -o flowweave -g flowweave -m 0400 vpn-client.key.der /etc/flowweave/vpn-client.key.der
+sudo install -o root -g root -m 0644 deploy/flowweave-vpn-client.service /etc/systemd/system/flowweave-vpn-client.service
+```
+
+先启动并验证服务端，再启动客户端。`systemctl start` 只有在数据进程 READY 且网络激活成功后才返回成功；完成真实流量、路由和停止清理验证后再 `enable`：
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl start flowweave-vpn-server.service
+sudo systemctl status flowweave-vpn-server.service
+
+sudo systemctl start flowweave-vpn-client.service
+sudo systemctl status flowweave-vpn-client.service
+# 客户端主机
+ip rule show
+# 服务端主机；仅 forwarding 对象已启用时存在
+sudo nft list table inet flowweave_vpn
+
+# 两端验证通过后，分别启用开机启动
+sudo systemctl enable flowweave-vpn-server.service
+sudo systemctl enable flowweave-vpn-client.service
+```
+
+服务端 `forwarding: null` 时不存在 `flowweave_vpn` nft table，属于预期禁用状态。停止 unit 会自动先撤销网络接管再删除 TUN。若 unit 文件损坏或已被移除，可使用同一幂等 helper 做恢复；命令失败时保留状态并排查，不能用删除 journal 代替归属验证：
+
+```bash
+sudo systemctl stop flowweave-vpn-client.service
+sudo /usr/local/bin/flowweave-vpn-net deactivate-client /run/flowweave-vpn-client.network.json
+sudo /usr/local/bin/flowweave-vpn-net cleanup /run/flowweave-vpn-client.network.json
+
+sudo systemctl stop flowweave-vpn-server.service
+sudo /usr/local/bin/flowweave-vpn-net deactivate-server /run/flowweave-vpn-server.network.json
+sudo /usr/local/bin/flowweave-vpn-net cleanup /run/flowweave-vpn-server.network.json
+```
+
+以下第 1～7 节仍是固定目标 TCP 代理的部署流程。
 
 ## 1. 构建和安装
 

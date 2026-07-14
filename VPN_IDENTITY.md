@@ -1,6 +1,6 @@
 # FlowWeave VPN 身份与轮换合同
 
-本文件描述 VPN 模式的身份地基。它不是 TUN 部署说明；当前仓库仍没有可供宿主机安装的 VPN 数据进程、路由或 NAT 单元。
+本文件描述 VPN 模式的身份地基，不替代 [deploy/README.md](deploy/README.md) 的受控试点步骤。仓库现已有非特权 VPN 数据进程、事务化 TUN/路由/NAT helper 和 Type=notify client/server 单元，但 DNS、内部长期重连、身份运维工具、真实宿主安装验收与跨版本回退仍未完成。
 
 ## 信任链
 
@@ -115,4 +115,4 @@ openssl x509 -in client-cert.pem -outform DER |
 - IPv4/IPv6 严格头检查之后的上行源地址防伪、双向 ACL 与下行错投拒绝；
 - 身份文件失败重载保持活动会话，成功禁用重载原子撤销并关闭当前连接。
 
-尚未完成产品 client/server 命令、TUN 读写、路由/NAT/DNS 准备单元、身份配置 SIGHUP 接线、长期多客户端资源攻击/故障注入，以及 nightly + AddressSanitizer 门控。这些完成前，本合同仍只能证明可接线的数据面地基，不能证明 VPN 已可部署。
+尚未完成身份配置 SIGHUP 接线、专用身份运维工具、DNS 接管与回退、内部长期重连、长期多客户端资源攻击/故障注入、真实宿主安装/升级门控，以及 nightly + AddressSanitizer 门控。现有产品命令、TUN/路由/NAT 事务和 systemd 生命周期只把身份地基接入受控试点，不能据此证明 VPN 已达到生产可部署标准。

@@ -412,6 +412,7 @@ mod tests {
     use std::{
         fs,
         os::unix::{ffi::OsStrExt, net::UnixDatagram},
+        path::Path,
         sync::atomic::{AtomicU64, Ordering},
         time::Duration,
     };
@@ -482,6 +483,67 @@ mod tests {
                     .to_string(),
                 "vpn_process_notify_socket_invalid"
             );
+        }
+    }
+
+    #[test]
+    fn vpn_systemd_units_bind_privilege_to_short_network_transactions() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        for (unit_name, role) in [
+            ("flowweave-vpn-client.service", "client"),
+            ("flowweave-vpn-server.service", "server"),
+        ] {
+            let unit = fs::read_to_string(root.join("deploy").join(unit_name)).unwrap();
+            let lines = unit.lines().collect::<Vec<_>>();
+            assert!(lines.contains(&"Type=notify"));
+            assert!(lines.contains(&"NotifyAccess=main"));
+            assert!(lines.contains(&"User=flowweave"));
+            assert!(lines.contains(&"Group=flowweave"));
+            assert!(lines.iter().any(|line| {
+                line.starts_with(&format!(
+                    "ExecStartPre=+/usr/local/bin/flowweave-vpn-net prepare-{role} "
+                )) && line.ends_with(" @flowweave")
+            }));
+            let exec_start = format!(
+                "ExecStart=/usr/local/bin/flowweave-vpn {role} /etc/flowweave/vpn-{role}.json"
+            );
+            assert!(lines.contains(&exec_start.as_str()));
+            assert!(lines.iter().any(|line| {
+                line.starts_with(&format!(
+                    "ExecStartPost=+/usr/local/bin/flowweave-vpn-net activate-{role} "
+                ))
+            }));
+            let stop_post = lines
+                .iter()
+                .filter(|line| line.starts_with("ExecStopPost="))
+                .copied()
+                .collect::<Vec<_>>();
+            assert_eq!(stop_post.len(), 2);
+            assert!(stop_post[0].contains(&format!("deactivate-{role}")));
+            assert!(stop_post[1].contains(" cleanup "));
+            assert!(!lines.iter().any(|line| line.starts_with("ExecStop=")));
+            for required in [
+                "Restart=on-failure",
+                "TimeoutStartSec=90s",
+                "TimeoutStopSec=30s",
+                "CapabilityBoundingSet=",
+                "AmbientCapabilities=",
+                "NoNewPrivileges=true",
+                "DevicePolicy=closed",
+                "DeviceAllow=/dev/net/tun rw",
+                "ProtectKernelTunables=true",
+                "ProtectProc=invisible",
+                "ProtectSystem=strict",
+                "ProcSubset=pid",
+                "RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK",
+                "RestrictNamespaces=true",
+                "MemoryDenyWriteExecute=true",
+            ] {
+                assert!(
+                    lines.contains(&required),
+                    "{unit_name} 缺少 systemd 合同 {required}"
+                );
+            }
         }
     }
 }
