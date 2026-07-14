@@ -8,24 +8,27 @@ UNIT_NAME="flowweave-vpn-systemd-lab-$$.service"
 UNIT_PATH="$UNIT_DIRECTORY/$UNIT_NAME"
 LAB_DIRECTORY=$(mktemp -d "$RUNTIME_DIR/flowweave-vpn-systemd-state.XXXXXX")
 LAB_BINARY=$(mktemp "$RUNTIME_DIR/flowweave-vpn-systemd-lab.XXXXXX")
+LAB_PRODUCT_BINARY=$(mktemp "$RUNTIME_DIR/flowweave-vpn-systemd-product.XXXXXX")
 
 cleanup_lab() {
     systemctl --user stop "$UNIT_NAME" >/dev/null 2>&1 || true
     systemctl --user reset-failed "$UNIT_NAME" >/dev/null 2>&1 || true
-    rm -f "$UNIT_PATH" "$LAB_BINARY"
+    rm -f "$UNIT_PATH" "$LAB_BINARY" "$LAB_PRODUCT_BINARY"
     rm -rf "$LAB_DIRECTORY"
     systemctl --user daemon-reload >/dev/null 2>&1 || true
 }
 trap cleanup_lab EXIT HUP INT TERM
 
 cd "$ROOT_DIR"
+cargo build --bin flowweave-vpn
+PRODUCT_BINARY="$ROOT_DIR/target/debug/flowweave-vpn"
 TEST_BINARY=$(
     cargo test --test vpn_systemd_lab --no-run --message-format=json |
         jq -r 'select(.profile.test == true and .target.name == "vpn_systemd_lab") | .executable' |
         tail -n 1
 )
-if [ -z "$TEST_BINARY" ] || [ ! -x "$TEST_BINARY" ]; then
-    echo "无法定位 vpn_systemd_lab 测试二进制" >&2
+if [ ! -x "$PRODUCT_BINARY" ] || [ -z "$TEST_BINARY" ] || [ ! -x "$TEST_BINARY" ]; then
+    echo "无法定位 flowweave-vpn 或 vpn_systemd_lab 测试二进制" >&2
     exit 1
 fi
 if ! systemctl --user show-environment >/dev/null 2>&1; then
@@ -33,10 +36,12 @@ if ! systemctl --user show-environment >/dev/null 2>&1; then
     exit 1
 fi
 install -m 0755 "$TEST_BINARY" "$LAB_BINARY"
+install -m 0755 "$PRODUCT_BINARY" "$LAB_PRODUCT_BINARY"
 mkdir -p "$UNIT_DIRECTORY"
 sed \
     -e "s|@LAB_DIRECTORY@|$LAB_DIRECTORY|g" \
     -e "s|@ENV_BINARY@|$(command -v env)|g" \
+    -e "s|@PRODUCT_BINARY@|$LAB_PRODUCT_BINARY|g" \
     -e "s|@TEST_BINARY@|$LAB_BINARY|g" \
     tests/fixtures/flowweave-vpn-systemd-lab.service.in >"$UNIT_PATH"
 chmod 0600 "$UNIT_PATH"
@@ -86,6 +91,15 @@ expect_start_failure() {
     fi
 }
 
+expect_reload_failure() {
+    if systemctl --user reload "$UNIT_NAME" \
+        >"$LAB_DIRECTORY/systemctl.stdout" \
+        2>"$LAB_DIRECTORY/systemctl.stderr"; then
+        echo "预期失败的 systemd VPN reload 意外成功" >&2
+        exit 1
+    fi
+}
+
 start_successfully() {
     if ! systemctl --user start "$UNIT_NAME" \
         >"$LAB_DIRECTORY/systemctl.stdout" \
@@ -105,8 +119,20 @@ grep -Fq "prepare uid=$(id -u) capabilities=0000000000000000 no_new_privileges=0
     "$LAB_DIRECTORY/lifecycle.log"
 grep -Fq "data_start uid=$(id -u) capabilities=0000000000000000 no_new_privileges=1" \
     "$LAB_DIRECTORY/lifecycle.log"
+systemctl --user reload "$UNIT_NAME"
+expect_sequence prepare,data_start,data_ready,activate,reload_caller,reload
+grep -Fq "reload_caller uid=$(id -u) capabilities=0000000000000000 no_new_privileges=1" \
+    "$LAB_DIRECTORY/lifecycle.log"
 systemctl --user stop "$UNIT_NAME"
-expect_sequence prepare,data_start,data_ready,activate,data_stopped,deactivate,cleanup
+expect_sequence prepare,data_start,data_ready,activate,reload_caller,reload,data_stopped,deactivate,cleanup
+
+reset_scenario reload_failure
+start_successfully
+expect_reload_failure
+expect_sequence prepare,data_start,data_ready,activate,reload_caller,reload
+systemctl --user is-active --quiet "$UNIT_NAME"
+systemctl --user stop "$UNIT_NAME"
+expect_sequence prepare,data_start,data_ready,activate,reload_caller,reload,data_stopped,deactivate,cleanup
 
 reset_scenario prepare_failure
 expect_start_failure

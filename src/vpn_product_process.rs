@@ -2,22 +2,32 @@ use std::{
     env,
     error::Error,
     ffi::OsStr,
-    fmt,
+    fmt, fs,
     io::{self, Write},
     os::{
         linux::net::SocketAddrExt,
-        unix::{ffi::OsStrExt, net::UnixDatagram},
+        unix::{
+            ffi::OsStrExt,
+            fs::{FileTypeExt, MetadataExt, PermissionsExt},
+            net::UnixDatagram,
+        },
     },
-    path::Path,
+    path::{Component, Path, PathBuf},
     sync::Arc,
+    time::Duration,
 };
 
-use tokio::signal::unix::{Signal, SignalKind, signal};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::{UnixListener, UnixStream},
+    signal::unix::{Signal, SignalKind, signal},
+    time::timeout,
+};
 
 use crate::{
     VpnPacketBridgeStopReason, VpnProductBootstrapError, VpnProductEndpointError,
-    VpnProductEndpointLimits, VpnServerProductEndpointStopReason, VpnTunAttachError,
-    attach_existing_vpn_tun, connect_vpn_client_product_endpoint,
+    VpnProductEndpointLimits, VpnServerProductBootstrap, VpnServerProductEndpointStopReason,
+    VpnTunAttachError, attach_existing_vpn_tun, connect_vpn_client_product_endpoint,
     load_vpn_client_product_bootstrap, load_vpn_server_product_bootstrap,
     start_vpn_server_product_endpoint,
 };
@@ -27,6 +37,13 @@ const STOPPED_LINE: &str = "stopped";
 const SERVER_READY_NOTIFICATION: &str = "READY=1\nSTATUS=FlowWeave VPN server ready";
 const CLIENT_READY_NOTIFICATION: &str = "READY=1\nSTATUS=FlowWeave VPN client ready";
 const STOPPING_NOTIFICATION: &str = "STOPPING=1\nSTATUS=FlowWeave VPN stopping";
+const SERVER_RELOAD_SOCKET_ENV: &str = "FLOWWEAVE_VPN_SERVER_RELOAD_SOCKET";
+const SERVER_RELOAD_REQUEST: &[u8; 4] = b"FWR1";
+const SERVER_RELOAD_RESPONSE_OK: u8 = 0;
+const SERVER_RELOAD_RESPONSE_REJECTED: u8 = 1;
+const SERVER_RELOAD_IO_TIMEOUT: Duration = Duration::from_secs(2);
+const SERVER_RELOAD_SUCCEEDED_STATUS: &str = "STATUS=FlowWeave VPN identities reloaded";
+const SERVER_RELOAD_FAILED_STATUS: &str = "STATUS=FlowWeave VPN identity reload rejected";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VpnProductProcessRole {
@@ -48,6 +65,8 @@ pub struct VpnProductProcessReport {
     pub established_path_count: usize,
     pub completed_sessions: u64,
     pub packet_bridge_stop_reason: Option<VpnPacketBridgeStopReason>,
+    pub identity_reloads: u64,
+    pub identity_reload_failures: u64,
 }
 
 #[derive(Debug)]
@@ -59,6 +78,11 @@ pub enum VpnProductProcessError {
     NotifySocketInvalid,
     Notify(io::ErrorKind),
     StatusOutput(io::ErrorKind),
+    ReloadSocketInvalid,
+    ReloadSocketDirectoryUnsafe,
+    ReloadSocketBind(io::ErrorKind),
+    ReloadSocketPermissions(io::ErrorKind),
+    ReloadControl(io::ErrorKind),
     ReloadUnsupported,
     UnexpectedServerStop,
     UnexpectedClientStop,
@@ -75,8 +99,17 @@ impl fmt::Display for VpnProductProcessError {
             Self::Signal(kind) => write!(formatter, "vpn_process_signal:{kind:?}"),
             Self::Notify(kind) => write!(formatter, "vpn_process_notify:{kind:?}"),
             Self::StatusOutput(kind) => write!(formatter, "vpn_process_status_output:{kind:?}"),
+            Self::ReloadSocketBind(kind) => {
+                write!(formatter, "vpn_process_reload_socket_bind:{kind:?}")
+            }
+            Self::ReloadSocketPermissions(kind) => {
+                write!(formatter, "vpn_process_reload_socket_permissions:{kind:?}")
+            }
+            Self::ReloadControl(kind) => write!(formatter, "vpn_process_reload_control:{kind:?}"),
             other => formatter.write_str(match other {
                 Self::NotifySocketInvalid => "vpn_process_notify_socket_invalid",
+                Self::ReloadSocketInvalid => "vpn_process_reload_socket_invalid",
+                Self::ReloadSocketDirectoryUnsafe => "vpn_process_reload_socket_directory_unsafe",
                 Self::ReloadUnsupported => "vpn_process_reload_unsupported",
                 Self::UnexpectedServerStop => "vpn_process_unexpected_server_stop",
                 Self::UnexpectedClientStop => "vpn_process_unexpected_client_stop",
@@ -87,11 +120,42 @@ impl fmt::Display for VpnProductProcessError {
                 | Self::Endpoint(_)
                 | Self::Signal(_)
                 | Self::Notify(_)
-                | Self::StatusOutput(_) => unreachable!(),
+                | Self::StatusOutput(_)
+                | Self::ReloadSocketBind(_)
+                | Self::ReloadSocketPermissions(_)
+                | Self::ReloadControl(_) => unreachable!(),
             }),
         }
     }
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VpnServerReloadRequestError {
+    SocketInvalid,
+    Connect(io::ErrorKind),
+    Io(io::ErrorKind),
+    Timeout,
+    Rejected,
+    InvalidResponse,
+}
+
+impl fmt::Display for VpnServerReloadRequestError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Connect(kind) => write!(formatter, "vpn_server_reload_connect:{kind:?}"),
+            Self::Io(kind) => write!(formatter, "vpn_server_reload_io:{kind:?}"),
+            other => formatter.write_str(match other {
+                Self::SocketInvalid => "vpn_server_reload_socket_invalid",
+                Self::Timeout => "vpn_server_reload_timeout",
+                Self::Rejected => "vpn_server_reload_rejected",
+                Self::InvalidResponse => "vpn_server_reload_invalid_response",
+                Self::Connect(_) | Self::Io(_) => unreachable!(),
+            }),
+        }
+    }
+}
+
+impl Error for VpnServerReloadRequestError {}
 
 impl Error for VpnProductProcessError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
@@ -122,25 +186,229 @@ impl From<VpnProductEndpointError> for VpnProductProcessError {
     }
 }
 
+struct VpnServerReloadControl {
+    listener: UnixListener,
+    path: PathBuf,
+    device: u64,
+    inode: u64,
+}
+
+impl VpnServerReloadControl {
+    fn bind_from_environment() -> Result<Option<Self>, VpnProductProcessError> {
+        let Some(path) = env::var_os(SERVER_RELOAD_SOCKET_ENV).map(PathBuf::from) else {
+            return Ok(None);
+        };
+        Self::bind(&path).map(Some)
+    }
+
+    fn bind(path: &Path) -> Result<Self, VpnProductProcessError> {
+        validate_reload_socket_path(path)
+            .map_err(|()| VpnProductProcessError::ReloadSocketInvalid)?;
+        let parent = path
+            .parent()
+            .ok_or(VpnProductProcessError::ReloadSocketInvalid)?;
+        let parent_metadata = fs::symlink_metadata(parent)
+            .map_err(|error| VpnProductProcessError::ReloadSocketBind(error.kind()))?;
+        // SAFETY: geteuid has no pointer arguments and only returns the current effective UID.
+        let effective_uid = unsafe { libc::geteuid() };
+        if parent_metadata.file_type().is_symlink()
+            || !parent_metadata.is_dir()
+            || parent_metadata.uid() != effective_uid
+            || parent_metadata.permissions().mode() & 0o077 != 0
+        {
+            return Err(VpnProductProcessError::ReloadSocketDirectoryUnsafe);
+        }
+        let listener = UnixListener::bind(path)
+            .map_err(|error| VpnProductProcessError::ReloadSocketBind(error.kind()))?;
+        if let Err(error) = fs::set_permissions(path, fs::Permissions::from_mode(0o600)) {
+            let _ = fs::remove_file(path);
+            return Err(VpnProductProcessError::ReloadSocketPermissions(
+                error.kind(),
+            ));
+        }
+        let metadata = fs::symlink_metadata(path)
+            .map_err(|error| VpnProductProcessError::ReloadSocketPermissions(error.kind()))?;
+        if !metadata.file_type().is_socket()
+            || metadata.uid() != effective_uid
+            || metadata.permissions().mode() & 0o177 != 0
+        {
+            let _ = fs::remove_file(path);
+            return Err(VpnProductProcessError::ReloadSocketDirectoryUnsafe);
+        }
+        Ok(Self {
+            listener,
+            path: path.to_owned(),
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        })
+    }
+
+    async fn accept(&self) -> Result<UnixStream, VpnProductProcessError> {
+        self.listener
+            .accept()
+            .await
+            .map(|(stream, _)| stream)
+            .map_err(|error| VpnProductProcessError::ReloadControl(error.kind()))
+    }
+}
+
+impl Drop for VpnServerReloadControl {
+    fn drop(&mut self) {
+        let Ok(metadata) = fs::symlink_metadata(&self.path) else {
+            return;
+        };
+        if metadata.file_type().is_socket()
+            && metadata.dev() == self.device
+            && metadata.ino() == self.inode
+        {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+
+fn validate_reload_socket_path(path: &Path) -> Result<(), ()> {
+    if !path.is_absolute() || path.file_name().is_none() {
+        return Err(());
+    }
+    let mut components = path.components();
+    if components.next() != Some(Component::RootDir)
+        || !components.all(|component| matches!(component, Component::Normal(_)))
+    {
+        return Err(());
+    }
+    Ok(())
+}
+
+pub async fn request_vpn_server_identity_reload(
+    socket_path: impl AsRef<Path>,
+) -> Result<(), VpnServerReloadRequestError> {
+    let socket_path = socket_path.as_ref();
+    validate_reload_socket_path(socket_path)
+        .map_err(|()| VpnServerReloadRequestError::SocketInvalid)?;
+    let mut stream = timeout(SERVER_RELOAD_IO_TIMEOUT, UnixStream::connect(socket_path))
+        .await
+        .map_err(|_| VpnServerReloadRequestError::Timeout)?
+        .map_err(|error| VpnServerReloadRequestError::Connect(error.kind()))?;
+    let (response, trailing_response_bytes) = timeout(SERVER_RELOAD_IO_TIMEOUT, async {
+        stream.write_all(SERVER_RELOAD_REQUEST).await?;
+        stream.shutdown().await?;
+        let mut response = [0_u8; 1];
+        stream.read_exact(&mut response).await?;
+        let mut trailing = [0_u8; 1];
+        let trailing_response_bytes = stream.read(&mut trailing).await?;
+        Ok::<(u8, usize), io::Error>((response[0], trailing_response_bytes))
+    })
+    .await
+    .map_err(|_| VpnServerReloadRequestError::Timeout)?
+    .map_err(|error| VpnServerReloadRequestError::Io(error.kind()))?;
+    if trailing_response_bytes != 0 {
+        return Err(VpnServerReloadRequestError::InvalidResponse);
+    }
+    match response {
+        SERVER_RELOAD_RESPONSE_OK => Ok(()),
+        SERVER_RELOAD_RESPONSE_REJECTED => Err(VpnServerReloadRequestError::Rejected),
+        _ => Err(VpnServerReloadRequestError::InvalidResponse),
+    }
+}
+
+async fn accept_reload_request(
+    control: Option<&VpnServerReloadControl>,
+) -> Result<UnixStream, VpnProductProcessError> {
+    match control {
+        Some(control) => control.accept().await,
+        None => std::future::pending().await,
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct ServerReloadCounters {
+    succeeded: u64,
+    failed: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ServerReloadOutcome {
+    Succeeded,
+    Rejected,
+}
+
+fn reload_server_identities(
+    bootstrap: &VpnServerProductBootstrap,
+    counters: &mut ServerReloadCounters,
+) -> ServerReloadOutcome {
+    match bootstrap.reload_identities() {
+        Ok(_) => {
+            counters.succeeded = counters.succeeded.saturating_add(1);
+            let _ = notify_systemd(SERVER_RELOAD_SUCCEEDED_STATUS);
+            eprintln!("vpn_server_identity_reloaded");
+            ServerReloadOutcome::Succeeded
+        }
+        Err(error) => {
+            counters.failed = counters.failed.saturating_add(1);
+            let _ = notify_systemd(SERVER_RELOAD_FAILED_STATUS);
+            eprintln!("vpn_server_identity_reload_failed:{error}");
+            ServerReloadOutcome::Rejected
+        }
+    }
+}
+
+async fn handle_reload_request(
+    mut stream: UnixStream,
+    bootstrap: &VpnServerProductBootstrap,
+    counters: &mut ServerReloadCounters,
+) {
+    let request = timeout(SERVER_RELOAD_IO_TIMEOUT, async {
+        let mut request = [0_u8; SERVER_RELOAD_REQUEST.len()];
+        stream.read_exact(&mut request).await?;
+        let mut trailing = [0_u8; 1];
+        let trailing_request_bytes = stream.read(&mut trailing).await?;
+        Ok::<([u8; SERVER_RELOAD_REQUEST.len()], usize), io::Error>((
+            request,
+            trailing_request_bytes,
+        ))
+    })
+    .await;
+    let outcome = match request {
+        Ok(Ok((request, 0))) if &request == SERVER_RELOAD_REQUEST => {
+            reload_server_identities(bootstrap, counters)
+        }
+        Ok(Ok(_)) | Ok(Err(_)) | Err(_) => ServerReloadOutcome::Rejected,
+    };
+    let response = match outcome {
+        ServerReloadOutcome::Succeeded => SERVER_RELOAD_RESPONSE_OK,
+        ServerReloadOutcome::Rejected => SERVER_RELOAD_RESPONSE_REJECTED,
+    };
+    let _ = timeout(SERVER_RELOAD_IO_TIMEOUT, stream.write_all(&[response])).await;
+}
+
 pub async fn run_vpn_server_product_process(
     config_path: impl AsRef<Path>,
 ) -> Result<VpnProductProcessReport, VpnProductProcessError> {
     let mut signals = ProductSignals::new()?;
     let bootstrap = Arc::new(load_vpn_server_product_bootstrap(config_path.as_ref())?);
+    let reload_control = VpnServerReloadControl::bind_from_environment()?;
+    let mut reload_counters = ServerReloadCounters::default();
     let attached =
         attach_existing_vpn_tun(bootstrap.config().tun_name(), bootstrap.config().tun_mtu())?;
     let mut runtime = start_vpn_server_product_endpoint(
-        bootstrap,
+        bootstrap.clone(),
         attached.device(),
         VpnProductEndpointLimits::default(),
     )?;
-    if let Some(signal) = signals.recv_pending().await? {
-        let stopping = notify_systemd(STOPPING_NOTIFICATION);
-        runtime.request_shutdown();
-        let report = runtime.join().await?;
-        drop(attached);
-        stopping?;
-        return finish_server_stop(signal, report);
+    while let Some(signal) = signals.recv_pending().await? {
+        match signal {
+            ProductSignal::Hangup => {
+                reload_server_identities(&bootstrap, &mut reload_counters);
+            }
+            ProductSignal::Terminate | ProductSignal::Interrupt => {
+                let stopping = notify_systemd(STOPPING_NOTIFICATION);
+                runtime.request_shutdown();
+                let report = runtime.join().await?;
+                drop(attached);
+                stopping?;
+                return finish_server_stop(signal, report, reload_counters);
+            }
+        }
     }
     if let Err(error) = emit_ready(VpnProductProcessRole::Server) {
         runtime.request_shutdown();
@@ -148,22 +416,35 @@ pub async fn run_vpn_server_product_process(
         return Err(error);
     }
 
-    tokio::select! {
-        biased;
-        signal = signals.recv() => {
-            let signal = signal?;
-            let stopping = notify_systemd(STOPPING_NOTIFICATION);
-            runtime.request_shutdown();
-            let report = runtime.join().await?;
-            drop(attached);
-            stopping?;
-            finish_server_stop(signal, report)
-        }
-        result = runtime.join() => {
-            let _ = result?;
-            drop(attached);
-            let _ = notify_systemd("STATUS=FlowWeave VPN server stopped unexpectedly");
-            Err(VpnProductProcessError::UnexpectedServerStop)
+    loop {
+        tokio::select! {
+            biased;
+            signal = signals.recv() => {
+                let signal = signal?;
+                match signal {
+                    ProductSignal::Hangup => {
+                        reload_server_identities(&bootstrap, &mut reload_counters);
+                    }
+                    ProductSignal::Terminate | ProductSignal::Interrupt => {
+                        let stopping = notify_systemd(STOPPING_NOTIFICATION);
+                        runtime.request_shutdown();
+                        let report = runtime.join().await?;
+                        drop(attached);
+                        stopping?;
+                        return finish_server_stop(signal, report, reload_counters);
+                    }
+                }
+            }
+            request = accept_reload_request(reload_control.as_ref()) => {
+                let request = request?;
+                handle_reload_request(request, &bootstrap, &mut reload_counters).await;
+            }
+            result = runtime.join() => {
+                let _ = result?;
+                drop(attached);
+                let _ = notify_systemd("STATUS=FlowWeave VPN server stopped unexpectedly");
+                return Err(VpnProductProcessError::UnexpectedServerStop);
+            }
         }
     }
 }
@@ -238,12 +519,15 @@ fn finish_pre_ready_stop(
         established_path_count: 0,
         completed_sessions: 0,
         packet_bridge_stop_reason: None,
+        identity_reloads: 0,
+        identity_reload_failures: 0,
     })
 }
 
 fn finish_server_stop(
     signal: ProductSignal,
     report: crate::VpnServerProductEndpointReport,
+    reload_counters: ServerReloadCounters,
 ) -> Result<VpnProductProcessReport, VpnProductProcessError> {
     validate_server_shutdown(&report)?;
     finish_clean_stop(VpnProductProcessReport {
@@ -255,6 +539,8 @@ fn finish_server_stop(
         packet_bridge_stop_reason: report
             .last_connection
             .map(|connection| connection.packet_bridge.stop_reason),
+        identity_reloads: reload_counters.succeeded,
+        identity_reload_failures: reload_counters.failed,
     })
 }
 
@@ -275,6 +561,8 @@ fn finish_client_stop(
         established_path_count: report.established_path_count,
         completed_sessions: 1,
         packet_bridge_stop_reason: Some(report.connection.packet_bridge.stop_reason),
+        identity_reloads: 0,
+        identity_reload_failures: 0,
     })
 }
 
@@ -427,6 +715,8 @@ mod tests {
             SERVER_READY_NOTIFICATION,
             CLIENT_READY_NOTIFICATION,
             STOPPING_NOTIFICATION,
+            SERVER_RELOAD_SUCCEEDED_STATUS,
+            SERVER_RELOAD_FAILED_STATUS,
         ] {
             assert!(!message.contains("10."));
             assert!(!message.contains("fd"));
@@ -486,6 +776,137 @@ mod tests {
         }
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn synchronous_reload_control_reports_commit_and_rejection_without_losing_old_state() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let deployment = crate::vpn_product_runtime::tests::TestDeployment::new();
+        fs::set_permissions(&deployment.path, fs::Permissions::from_mode(0o700)).unwrap();
+        let identity_path = deployment.path.join("vpn-identities.json");
+        let socket_path = deployment.path.join("reload.sock");
+        let bootstrap =
+            Arc::new(crate::load_vpn_server_product_bootstrap(&deployment.server_config).unwrap());
+        let control = VpnServerReloadControl::bind(&socket_path).unwrap();
+        assert_eq!(
+            fs::symlink_metadata(&socket_path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        let server_bootstrap = bootstrap.clone();
+        let server = tokio::spawn(async move {
+            let mut counters = ServerReloadCounters::default();
+            for _ in 0..3 {
+                let stream = control.accept().await.unwrap();
+                handle_reload_request(stream, &server_bootstrap, &mut counters).await;
+            }
+            counters
+        });
+
+        let mut identity: serde_json::Value =
+            serde_json::from_slice(&fs::read(&identity_path).unwrap()).unwrap();
+        identity["identities"][0]["fingerprints"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::Value::from("22".repeat(32)));
+        crate::vpn_product_runtime::tests::write_json(&identity_path, &identity);
+        request_vpn_server_identity_reload(&socket_path)
+            .await
+            .unwrap();
+        assert_eq!(
+            bootstrap
+                .coordinator()
+                .registry_snapshot()
+                .fingerprint_count(),
+            2
+        );
+
+        let mut malformed = UnixStream::connect(&socket_path).await.unwrap();
+        malformed.write_all(b"FWR1x").await.unwrap();
+        malformed.shutdown().await.unwrap();
+        let mut malformed_response = [0_u8; 1];
+        malformed.read_exact(&mut malformed_response).await.unwrap();
+        assert_eq!(malformed_response[0], SERVER_RELOAD_RESPONSE_REJECTED);
+        assert_eq!(
+            bootstrap
+                .coordinator()
+                .registry_snapshot()
+                .fingerprint_count(),
+            2
+        );
+
+        fs::write(&identity_path, b"{invalid-json").unwrap();
+        assert_eq!(
+            request_vpn_server_identity_reload(&socket_path)
+                .await
+                .unwrap_err(),
+            VpnServerReloadRequestError::Rejected
+        );
+        let counters = server.await.unwrap();
+        assert_eq!(counters.succeeded, 1);
+        assert_eq!(counters.failed, 1);
+        assert_eq!(
+            bootstrap
+                .coordinator()
+                .registry_snapshot()
+                .fingerprint_count(),
+            2
+        );
+        assert!(!socket_path.exists());
+
+        let invalid_response_listener = UnixListener::bind(&socket_path).unwrap();
+        let invalid_response_server = tokio::spawn(async move {
+            let (mut stream, _) = invalid_response_listener.accept().await.unwrap();
+            let mut request = [0_u8; SERVER_RELOAD_REQUEST.len()];
+            stream.read_exact(&mut request).await.unwrap();
+            assert_eq!(&request, SERVER_RELOAD_REQUEST);
+            let mut trailing = [0_u8; 1];
+            assert_eq!(stream.read(&mut trailing).await.unwrap(), 0);
+            stream
+                .write_all(&[SERVER_RELOAD_RESPONSE_OK, 0xff])
+                .await
+                .unwrap();
+        });
+        assert_eq!(
+            request_vpn_server_identity_reload(&socket_path)
+                .await
+                .unwrap_err(),
+            VpnServerReloadRequestError::InvalidResponse
+        );
+        invalid_response_server.await.unwrap();
+        fs::remove_file(&socket_path).unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn reload_control_rejects_relative_paths_and_shared_directories() {
+        use std::os::unix::fs::PermissionsExt;
+
+        assert_eq!(
+            validate_reload_socket_path(Path::new("relative.sock")),
+            Err(())
+        );
+        let deployment = crate::vpn_product_runtime::tests::TestDeployment::new();
+        fs::set_permissions(&deployment.path, fs::Permissions::from_mode(0o750)).unwrap();
+        assert!(matches!(
+            VpnServerReloadControl::bind(&deployment.path.join("reload.sock")),
+            Err(VpnProductProcessError::ReloadSocketDirectoryUnsafe)
+        ));
+
+        fs::set_permissions(&deployment.path, fs::Permissions::from_mode(0o700)).unwrap();
+        let socket_path = deployment.path.join("reload.sock");
+        let moved_socket_path = deployment.path.join("moved.sock");
+        let control = VpnServerReloadControl::bind(&socket_path).unwrap();
+        fs::rename(&socket_path, &moved_socket_path).unwrap();
+        let replacement = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+        drop(control);
+        assert!(socket_path.exists());
+        drop(replacement);
+        fs::remove_file(socket_path).unwrap();
+        fs::remove_file(moved_socket_path).unwrap();
+    }
+
     #[test]
     fn vpn_systemd_units_bind_privilege_to_short_network_transactions() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -508,6 +929,18 @@ mod tests {
                 "ExecStart=/usr/local/bin/flowweave-vpn {role} /etc/flowweave/vpn-{role}.json"
             );
             assert!(lines.contains(&exec_start.as_str()));
+            if role == "server" {
+                assert!(lines.contains(&"RuntimeDirectory=flowweave-vpn-server"));
+                assert!(lines.contains(&"RuntimeDirectoryMode=0700"));
+                assert!(lines.contains(
+                    &"Environment=FLOWWEAVE_VPN_SERVER_RELOAD_SOCKET=/run/flowweave-vpn-server/reload.sock"
+                ));
+                assert!(lines.contains(
+                    &"ExecReload=/usr/local/bin/flowweave-vpn reload-server /run/flowweave-vpn-server/reload.sock"
+                ));
+            } else {
+                assert!(!lines.iter().any(|line| line.starts_with("ExecReload=")));
+            }
             assert!(lines.iter().any(|line| {
                 line.starts_with(&format!(
                     "ExecStartPost=+/usr/local/bin/flowweave-vpn-net activate-{role} "

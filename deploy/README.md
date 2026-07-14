@@ -4,7 +4,7 @@
 
 `vpn-server.json.example`、`vpn-client.json.example` 和 `vpn-identities.json.example` 是代码严格校验的 VPN 配置合同，并由独立的 `flowweave-vpn server|client` 非特权产品进程读取。该进程只附着 root helper 已准备的 TUN，不创建接口或修改地址、路由、NAT、forwarding、DNS；服务端在 UDP Endpoint 已启动后 READY，客户端只在 DNS、严格 TLS 名称校验、MPQUIC、显式路径、`FWC1 ACCEPT`、DATAGRAM 和包桥接全部完成后 READY。`flowweave-vpn-net` root helper 从同一配置派生两端点对点 TUN、client `allowed_destinations` policy routes，以及显式启用的 server forwarding/NAT；三类事务均使用 root-only 版本状态、计划指纹、随机归属标记、独占锁和原子 journal 完成幂等 prepare/cleanup/activate/deactivate、失败回滚与崩溃恢复。
 
-`flowweave-vpn-client.service` 与 `flowweave-vpn-server.service` 现已把这些边界串成 `prepare → 非特权数据进程 READY → activate`，并让所有停止和失败路径按 `deactivate → cleanup` 收敛。只有短命、带 `+` 前缀的网络事务绕过 `User=flowweave` 和主进程沙箱；常驻数据进程保持空 capability、`NoNewPrivileges` 和只允许 `/dev/net/tun` 的设备边界。真实 user-systemd 门控已覆盖正常停止、prepare 失败、READY 前失败、activate 失败和运行中异常退出；正式单元另有静态权限合同和离线安全审计。DNS 接管、内部长期重连、多客户端长期压力、跨版本升级/回退和真实宿主安装验收仍未完成，因此这些单元只能用于有恢复通道的受控试点，不能据此宣称生产 VPN。身份格式与剩余边界见 [VPN_IDENTITY.md](../VPN_IDENTITY.md) 和 [VPN_RESEARCH.md](../VPN_RESEARCH.md)。
+`flowweave-vpn-client.service` 与 `flowweave-vpn-server.service` 现已把这些边界串成 `prepare → 非特权数据进程 READY → activate`，并让所有停止和失败路径按 `deactivate → cleanup` 收敛。只有短命、带 `+` 前缀的网络事务绕过 `User=flowweave` 和主进程沙箱；常驻数据进程保持空 capability、`NoNewPrivileges` 和只允许 `/dev/net/tun` 的设备边界。服务端另在 systemd 创建的 `0700` RuntimeDirectory 中提供 `0600` 身份 reload socket，`ExecReload` 仍以非特权用户同步等待真实提交结果。真实 user-systemd 门控已覆盖正常停止、prepare 失败、READY 前失败、activate 失败、运行中异常退出，以及 reload 成功/失败后主进程存活；正式单元另有静态权限合同和离线安全审计。DNS 接管、内部长期重连、多客户端长期压力、跨版本升级/回退和真实宿主安装验收仍未完成，因此这些单元只能用于有恢复通道的受控试点，不能据此宣称生产 VPN。身份格式与剩余边界见 [VPN_IDENTITY.md](../VPN_IDENTITY.md) 和 [VPN_RESEARCH.md](../VPN_RESEARCH.md)。
 
 客户端样例中的 `expected_client_ipv4/ipv6` 与 `expected_server_ipv4/ipv6` 必须和服务端身份文件对该客户端的静态分配完全一致。它们不是让客户端自行申请地址：服务端证书身份仍是最终授权来源；root helper 现在使用同一字段准备最小 TUN，数据进程在 `FWC1 ACCEPT` 后继续拒绝任何配置漂移。
 
@@ -50,9 +50,10 @@ flowweave-vpn-net cleanup /run/flowweave-vpn-server.network.json
 ```bash
 flowweave-vpn server /etc/flowweave/vpn-server.json
 flowweave-vpn client /etc/flowweave/vpn-client.json
+flowweave-vpn reload-server /run/flowweave-vpn-server/reload.sock
 ```
 
-无 `NOTIFY_SOCKET` 时，成功就绪与正常停止分别在 stdout 输出唯一稳定行 `ready`、`stopped`；存在 systemd notify socket 时还会发送 `READY=1`、`STOPPING=1`。SIGTERM/Ctrl-C 在 DNS/QUIC 启动阶段也会立即取消且不误报 `ready`。Endpoint 或连接意外结束返回非零且不输出 `stopped`。SIGHUP 当前会有界关闭并返回 `vpn_process_reload_unsupported`，尚未实现在线重载。
+无 `NOTIFY_SOCKET` 时，成功就绪与正常停止分别在 stdout 输出唯一稳定行 `ready`、`stopped`；存在 systemd notify socket 时还会发送 `READY=1`、`STOPPING=1`。SIGTERM/Ctrl-C 在 DNS/QUIC 启动阶段也会立即取消且不误报 `ready`。Endpoint 或连接意外结束返回非零且不输出 `stopped`。服务端 SIGHUP 会调用同一身份重载函数并保持进程运行，但同步运维入口是 `reload-server` 控制 socket；客户端 SIGHUP 仍返回 `vpn_process_reload_unsupported`，证书/私钥切换需要受控重启，直到内部重连 supervisor 完成。
 
 正式 Type=notify 单元只在主进程发送 `READY=1` 后运行 `activate-*`。没有单独的 `ExecStop=`：systemd 先终止并等待数据进程退出，再按声明顺序执行两条 `ExecStopPost=`，先撤销路由/forwarding，后清理 TUN。`ExecStopPost=` 同时覆盖 prepare 失败、READY 前失败、activate 失败、正常停止、异常退出和重启。状态保存在 `/run/flowweave-vpn-{client,server}.network.json` 及其 sidecar；若 helper 因外部漂移拒绝清理，不得手工删除状态文件后强行继续，应先查明并恢复它所记录对象的归属。
 
@@ -109,6 +110,26 @@ sudo nft list table inet flowweave_vpn
 sudo systemctl enable flowweave-vpn-server.service
 sudo systemctl enable flowweave-vpn-client.service
 ```
+
+### 服务端身份在线重载
+
+只在同目录、同文件系统内原子替换身份文件，然后调用同步 reload；命令返回零才确认候选已进入内存。若返回 `vpn_server_reload_rejected`，服务端已明确拒绝候选，旧注册表和健康会话继续有效。若返回 connect/I/O/timeout/invalid-response 类错误，结果是不确定的：服务端可能已经提交，只是响应丢失；检查 journal 中的 `vpn_server_identity_reloaded` 或 `vpn_server_identity_reload_failed:*`，并在服务仍 active 时安全重试同一候选。磁盘文件从不自动回退，重启前必须取得一次明确成功的 reload：
+
+```bash
+sudo install -o root -g flowweave -m 0640 vpn-identities.next.json \
+  /etc/flowweave/.vpn-identities.next
+sudo mv -f /etc/flowweave/.vpn-identities.next /etc/flowweave/vpn-identities.json
+sudo systemctl reload flowweave-vpn-server.service
+sudo journalctl -u flowweave-vpn-server.service -n 50 --no-pager
+```
+
+在线允许证书指纹重叠/撤销、`client_id` 归属、目标 ACL 和 limits 变化，但仍要服从服务端全局重组预算。以下变化会同步返回非零并要求受控重启，因为它们会改变 root helper 已提交的 TUN 或 nft 真值：
+
+- 服务端虚拟 IPv4/IPv6；
+- 任一客户端虚拟地址的增加、删除或迁移；
+- 已配置 forwarding 时，改变 enabled 身份的地址集合，例如直接把身份从 `true` 改为 `false`。
+
+证书轮换顺序为：先把新指纹加入同一身份的第二槽并 reload；再在客户端安装新证书/私钥并受控重启客户端；确认新 mTLS 会话后，从服务端身份删除旧指纹并再次 reload。增加第二指纹不会中断旧会话；删除正在使用的旧指纹会立即以 `identity_revoked` 关闭旧连接。客户端尚无在线 TLS 身份切换，因此本阶段轮换会产生一次客户端重连窗口。详细身份合同见 [VPN_IDENTITY.md](../VPN_IDENTITY.md)。
 
 服务端 `forwarding: null` 时不存在 `flowweave_vpn` nft table，属于预期禁用状态。停止 unit 会自动先撤销网络接管再删除 TUN。若 unit 文件损坏或已被移除，可使用同一幂等 helper 做恢复；命令失败时保留状态并排查，不能用删除 journal 代替归属验证：
 

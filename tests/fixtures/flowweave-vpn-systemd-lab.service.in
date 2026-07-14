@@ -8,6 +8,8 @@ EnvironmentFile=@LAB_DIRECTORY@/environment
 ExecStartPre=+@ENV_BINARY@ FLOWWEAVE_VPN_SYSTEMD_STAGE=prepare @TEST_BINARY@ --ignored --exact vpn_systemd_lifecycle_role --nocapture
 ExecStart=@ENV_BINARY@ FLOWWEAVE_VPN_SYSTEMD_STAGE=data @TEST_BINARY@ --ignored --exact vpn_systemd_lifecycle_role --nocapture
 ExecStartPost=+@ENV_BINARY@ FLOWWEAVE_VPN_SYSTEMD_STAGE=activate @TEST_BINARY@ --ignored --exact vpn_systemd_lifecycle_role --nocapture
+ExecReload=@ENV_BINARY@ FLOWWEAVE_VPN_SYSTEMD_STAGE=reload_caller @TEST_BINARY@ --ignored --exact vpn_systemd_lifecycle_role --nocapture
+ExecReload=@PRODUCT_BINARY@ reload-server @LAB_DIRECTORY@/reload.sock
 ExecStopPost=+@ENV_BINARY@ FLOWWEAVE_VPN_SYSTEMD_STAGE=deactivate @TEST_BINARY@ --ignored --exact vpn_systemd_lifecycle_role --nocapture
 ExecStopPost=+@ENV_BINARY@ FLOWWEAVE_VPN_SYSTEMD_STAGE=cleanup @TEST_BINARY@ --ignored --exact vpn_systemd_lifecycle_role --nocapture
 Restart=no

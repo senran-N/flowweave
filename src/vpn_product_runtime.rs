@@ -3,6 +3,7 @@ use std::{
     fmt,
     fs::{self, File},
     io::{self, Read},
+    net::IpAddr,
     path::Path,
     sync::{
         Arc,
@@ -24,15 +25,16 @@ use crate::{
     MultipathScheduler, PtoRecovery, QuicCongestion, VPN_CAP_IPV4, VPN_CAP_IPV6,
     VPN_REQUIRED_CAPABILITIES, VPN_WIRE_VERSION_V1, VpnClientDataPathConfig,
     VpnClientDataPathConfigError, VpnClientDataPathError, VpnClientDataPathFactory,
-    VpnClientProductConfig, VpnControlError, VpnDatagramRole, VpnDatagramRuntimeConfig,
-    VpnDatagramRuntimeConfigError, VpnDatagramRuntimeStartError, VpnHello, VpnIdentityConfigError,
-    VpnManagedServerOutcome, VpnManagedSessionError, VpnPacketBridge, VpnPacketBridgeConfig,
-    VpnPacketBridgeConfigError, VpnPacketBridgeMetricsSnapshot, VpnPacketBridgeReport,
-    VpnPacketBridgeStartError, VpnPacketDevice, VpnProductConfigError, VpnReject,
-    VpnServerNegotiationConfig, VpnServerProductConfig, VpnSessionCoordinator, VpnSessionError,
-    build_vpn_client_tls_config, build_vpn_server_tls_config, configure_transport,
-    load_vpn_client_product_config, load_vpn_identity_registry, load_vpn_server_product_config,
-    start_vpn_datagram_runtime, vpn_client_control_handshake, vpn_server_managed_control_handshake,
+    VpnClientProductConfig, VpnControlError, VpnCoordinatorReloadReport, VpnDatagramRole,
+    VpnDatagramRuntimeConfig, VpnDatagramRuntimeConfigError, VpnDatagramRuntimeStartError,
+    VpnHello, VpnIdentityConfigError, VpnIdentityRegistry, VpnManagedServerOutcome,
+    VpnManagedSessionError, VpnPacketBridge, VpnPacketBridgeConfig, VpnPacketBridgeConfigError,
+    VpnPacketBridgeMetricsSnapshot, VpnPacketBridgeReport, VpnPacketBridgeStartError,
+    VpnPacketDevice, VpnProductConfigError, VpnReject, VpnServerNegotiationConfig,
+    VpnServerProductConfig, VpnSessionCoordinator, VpnSessionError, build_vpn_client_tls_config,
+    build_vpn_server_tls_config, configure_transport, load_vpn_client_product_config,
+    load_vpn_identity_registry, load_vpn_server_product_config, start_vpn_datagram_runtime,
+    vpn_client_control_handshake, vpn_server_managed_control_handshake,
 };
 
 pub const VPN_PRODUCT_CREDENTIAL_MAX_BYTES: usize = 1024 * 1024;
@@ -188,6 +190,45 @@ impl Error for VpnProductBootstrapError {
     }
 }
 
+#[derive(Debug)]
+pub enum VpnServerIdentityReloadError {
+    Identity(VpnIdentityConfigError),
+    IdentityLimitExceedsGlobalBudget,
+    NetworkTopologyChanged,
+    ForwardingIdentitySetChanged,
+}
+
+impl fmt::Display for VpnServerIdentityReloadError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Identity(error) => write!(formatter, "vpn_server_identity_reload:{error}"),
+            other => formatter.write_str(match other {
+                Self::IdentityLimitExceedsGlobalBudget => {
+                    "vpn_server_identity_reload_global_budget"
+                }
+                Self::NetworkTopologyChanged => {
+                    "vpn_server_identity_reload_network_change_requires_restart"
+                }
+                Self::ForwardingIdentitySetChanged => {
+                    "vpn_server_identity_reload_forwarding_change_requires_restart"
+                }
+                Self::Identity(_) => unreachable!(),
+            }),
+        }
+    }
+}
+
+impl Error for VpnServerIdentityReloadError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Identity(error) => Some(error),
+            Self::IdentityLimitExceedsGlobalBudget
+            | Self::NetworkTopologyChanged
+            | Self::ForwardingIdentitySetChanged => None,
+        }
+    }
+}
+
 pub struct VpnServerProductBootstrap {
     config: VpnServerProductConfig,
     tls_config: ServerConfig,
@@ -221,6 +262,28 @@ impl VpnServerProductBootstrap {
 
     pub const fn packet_bridge_config(&self) -> VpnPacketBridgeConfig {
         self.packet_bridge
+    }
+
+    pub fn reload_identities(
+        &self,
+    ) -> Result<VpnCoordinatorReloadReport, VpnServerIdentityReloadError> {
+        let candidate = load_vpn_identity_registry(self.config.identity_file())
+            .map_err(VpnServerIdentityReloadError::Identity)?;
+        validate_server_identity_budget(&self.config, &candidate)
+            .map_err(|_| VpnServerIdentityReloadError::IdentityLimitExceedsGlobalBudget)?;
+        let current = self.coordinator.registry_snapshot();
+        if server_network_identity_contract(&current)
+            != server_network_identity_contract(&candidate)
+        {
+            return Err(VpnServerIdentityReloadError::NetworkTopologyChanged);
+        }
+        if self.config.forwarding().is_some()
+            && server_forwarding_identity_contract(&current)
+                != server_forwarding_identity_contract(&candidate)
+        {
+            return Err(VpnServerIdentityReloadError::ForwardingIdentitySetChanged);
+        }
+        Ok(self.coordinator.replace_registry(candidate))
     }
 
     fn acquire_runtime(&self) -> Option<VpnProductRuntimeLease> {
@@ -757,6 +820,63 @@ pub fn load_vpn_client_product_bootstrap(
     build_client_bootstrap(config)
 }
 
+fn validate_server_identity_budget(
+    config: &VpnServerProductConfig,
+    registry: &VpnIdentityRegistry,
+) -> Result<(), VpnProductBootstrapError> {
+    if registry
+        .identities()
+        .iter()
+        .any(|identity| identity.limits().max_reassembly_bytes() > config.global_reassembly_bytes())
+    {
+        return Err(VpnProductBootstrapError::IdentityLimitExceedsGlobalBudget);
+    }
+    Ok(())
+}
+
+fn server_network_identity_contract(
+    registry: &VpnIdentityRegistry,
+) -> (
+    Option<std::net::Ipv4Addr>,
+    Option<std::net::Ipv6Addr>,
+    Vec<IpAddr>,
+) {
+    let mut client_addresses = registry
+        .identities()
+        .iter()
+        .flat_map(|identity| {
+            identity
+                .client_ipv4()
+                .map(IpAddr::V4)
+                .into_iter()
+                .chain(identity.client_ipv6().map(IpAddr::V6))
+        })
+        .collect::<Vec<_>>();
+    client_addresses.sort_unstable();
+    (
+        registry.server_ipv4(),
+        registry.server_ipv6(),
+        client_addresses,
+    )
+}
+
+fn server_forwarding_identity_contract(registry: &VpnIdentityRegistry) -> Vec<IpAddr> {
+    let mut client_addresses = registry
+        .identities()
+        .iter()
+        .filter(|identity| identity.enabled())
+        .flat_map(|identity| {
+            identity
+                .client_ipv4()
+                .map(IpAddr::V4)
+                .into_iter()
+                .chain(identity.client_ipv6().map(IpAddr::V6))
+        })
+        .collect::<Vec<_>>();
+    client_addresses.sort_unstable();
+    client_addresses
+}
+
 fn build_server_bootstrap(
     config: VpnServerProductConfig,
 ) -> Result<VpnServerProductBootstrap, VpnProductBootstrapError> {
@@ -782,13 +902,7 @@ fn build_server_bootstrap(
 
     let registry = load_vpn_identity_registry(config.identity_file())
         .map_err(VpnProductBootstrapError::Identity)?;
-    if registry
-        .identities()
-        .iter()
-        .any(|identity| identity.limits().max_reassembly_bytes() > config.global_reassembly_bytes())
-    {
-        return Err(VpnProductBootstrapError::IdentityLimitExceedsGlobalBudget);
-    }
+    validate_server_identity_budget(&config, &registry)?;
     let coordinator = VpnSessionCoordinator::with_resource_limits(
         registry,
         1,
@@ -1170,6 +1284,95 @@ pub(crate) mod tests {
             load_vpn_server_product_bootstrap(&deployment.server_config),
             Err(VpnProductBootstrapError::IdentityLimitExceedsGlobalBudget)
         ));
+    }
+
+    #[test]
+    fn server_identity_reload_accepts_policy_and_fingerprint_changes_but_rejects_network_drift() {
+        let deployment = TestDeployment::new();
+        let bootstrap = load_vpn_server_product_bootstrap(&deployment.server_config).unwrap();
+        let identity_path = deployment.path.join("vpn-identities.json");
+        let mut identity: serde_json::Value =
+            serde_json::from_slice(&fs::read(&identity_path).unwrap()).unwrap();
+        identity["identities"][0]["fingerprints"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::Value::from("22".repeat(32)));
+        identity["identities"][0]["allowed_destinations"] =
+            serde_json::json!(["10.0.0.0/8", "::/0"]);
+        write_json(&identity_path, &identity);
+
+        let report = bootstrap.reload_identities().unwrap();
+        assert_eq!(report.identities.previous_fingerprint_count, 1);
+        assert_eq!(report.identities.fingerprint_count, 2);
+        assert_eq!(report.sessions, crate::VpnSessionReconcileReport::default());
+
+        identity["identities"][0]["client_ipv4"] = serde_json::Value::from("10.77.0.3");
+        write_json(&identity_path, &identity);
+        assert!(matches!(
+            bootstrap.reload_identities(),
+            Err(VpnServerIdentityReloadError::NetworkTopologyChanged)
+        ));
+        let current = bootstrap.coordinator().registry_snapshot();
+        assert_eq!(
+            current.identities()[0].client_ipv4(),
+            Some("10.77.0.2".parse().unwrap())
+        );
+        assert_eq!(current.fingerprint_count(), 2);
+    }
+
+    #[test]
+    fn server_identity_reload_reuses_initial_global_budget_validation() {
+        let deployment = TestDeployment::new();
+        let identity_path = deployment.path.join("vpn-identities.json");
+        let mut identity: serde_json::Value =
+            serde_json::from_slice(&fs::read(&identity_path).unwrap()).unwrap();
+        identity["identities"][0]["limits"]["max_reassembly_bytes"] =
+            serde_json::Value::from(1_048_576);
+        write_json(&identity_path, &identity);
+        let mut server: serde_json::Value =
+            serde_json::from_slice(&fs::read(&deployment.server_config).unwrap()).unwrap();
+        server["global_reassembly_bytes"] = serde_json::Value::from(1_048_576);
+        write_json(&deployment.server_config, &server);
+        let bootstrap = load_vpn_server_product_bootstrap(&deployment.server_config).unwrap();
+
+        identity["identities"][0]["limits"]["max_reassembly_bytes"] =
+            serde_json::Value::from(8_388_608);
+        write_json(&identity_path, &identity);
+        assert!(matches!(
+            bootstrap.reload_identities(),
+            Err(VpnServerIdentityReloadError::IdentityLimitExceedsGlobalBudget)
+        ));
+        assert_eq!(
+            bootstrap.coordinator().registry_snapshot().identities()[0]
+                .limits()
+                .max_reassembly_bytes(),
+            1_048_576
+        );
+    }
+
+    #[test]
+    fn server_identity_reload_rejects_enabled_set_drift_when_forwarding_is_configured() {
+        let deployment = TestDeployment::new();
+        let mut server: serde_json::Value =
+            serde_json::from_slice(&fs::read(&deployment.server_config).unwrap()).unwrap();
+        server["forwarding"] = serde_json::json!({
+            "manage_sysctls": false,
+            "ipv4_masquerade": true,
+            "ipv6_masquerade": false
+        });
+        write_json(&deployment.server_config, &server);
+        let bootstrap = load_vpn_server_product_bootstrap(&deployment.server_config).unwrap();
+        let identity_path = deployment.path.join("vpn-identities.json");
+        let mut identity: serde_json::Value =
+            serde_json::from_slice(&fs::read(&identity_path).unwrap()).unwrap();
+        identity["identities"][0]["enabled"] = serde_json::Value::Bool(false);
+        write_json(&identity_path, &identity);
+
+        assert!(matches!(
+            bootstrap.reload_identities(),
+            Err(VpnServerIdentityReloadError::ForwardingIdentitySetChanged)
+        ));
+        assert!(bootstrap.coordinator().registry_snapshot().identities()[0].enabled());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 3)]

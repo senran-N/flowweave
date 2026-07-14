@@ -11,7 +11,13 @@ use std::{
     time::Duration,
 };
 
-use tokio::{signal::unix::SignalKind, time::sleep};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::UnixListener,
+    signal::unix::SignalKind,
+    task::JoinHandle,
+    time::sleep,
+};
 
 #[tokio::test(flavor = "current_thread")]
 #[ignore = "必须通过 scripts/run_vpn_systemd_lab.sh 由真实 user systemd manager 运行"]
@@ -21,7 +27,7 @@ async fn vpn_systemd_lifecycle_role() {
     let scenario = env::var("FLOWWEAVE_VPN_SYSTEMD_SCENARIO").unwrap();
     let directory = lab_directory();
     match stage.as_str() {
-        "prepare" | "activate" | "deactivate" | "cleanup" => {
+        "prepare" | "activate" | "reload_caller" | "deactivate" | "cleanup" => {
             append_stage(&directory, &stage);
             if scenario == "prepare_failure" && stage == "prepare"
                 || scenario == "activate_failure" && stage == "activate"
@@ -42,6 +48,12 @@ async fn run_data_role(directory: &Path, scenario: &str) {
     }
 
     let mut terminate = tokio::signal::unix::signal(SignalKind::terminate()).unwrap();
+    let reload_listener = UnixListener::bind(directory.join("reload.sock")).unwrap();
+    let reload_task = tokio::spawn(run_reload_control(
+        reload_listener,
+        directory.to_owned(),
+        scenario.to_owned(),
+    ));
     append_stage(directory, "data_ready");
     send_notify(b"READY=1\nSTATUS=FlowWeave VPN systemd lifecycle lab ready");
     if scenario == "unexpected_exit" {
@@ -53,6 +65,7 @@ async fn run_data_role(directory: &Path, scenario: &str) {
             }
             tokio::select! {
                 _ = terminate.recv() => {
+                    stop_reload_control(reload_task, directory).await;
                     append_stage(directory, "data_stopped");
                     send_notify(b"STOPPING=1");
                     return;
@@ -63,8 +76,29 @@ async fn run_data_role(directory: &Path, scenario: &str) {
     }
 
     terminate.recv().await;
+    stop_reload_control(reload_task, directory).await;
     append_stage(directory, "data_stopped");
     send_notify(b"STOPPING=1");
+}
+
+async fn run_reload_control(listener: UnixListener, directory: PathBuf, scenario: String) {
+    loop {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut request = [0_u8; 4];
+        let response = if stream.read_exact(&mut request).await.is_ok() && &request == b"FWR1" {
+            append_stage(&directory, "reload");
+            u8::from(scenario == "reload_failure")
+        } else {
+            1
+        };
+        stream.write_all(&[response]).await.unwrap();
+    }
+}
+
+async fn stop_reload_control(task: JoinHandle<()>, directory: &Path) {
+    task.abort();
+    let _ = task.await;
+    let _ = fs::remove_file(directory.join("reload.sock"));
 }
 
 fn append_stage(directory: &Path, stage: &str) {

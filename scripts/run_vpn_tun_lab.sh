@@ -56,6 +56,8 @@ unshare \
             echo "TUN 实验拒绝在宿主网络空间运行" >&2
             exit 1
         fi
+        state_directory=$3
+        product_binary=$5
         ip tuntap add dev fwvpn0 mode tun user 1000
 
         env \
@@ -138,6 +140,9 @@ unshare \
         chmod 0770 "$3"
         mkdir "$3/network-state"
         chmod 0700 "$3/network-state"
+        mkdir "$3/reload-control"
+        chown 1000:1000 "$3/reload-control"
+        chmod 0700 "$3/reload-control"
 
         run_network_helper() {
             endpoint_namespace=$1
@@ -151,6 +156,30 @@ unshare \
                         mount -t sysfs sysfs /sys
                         exec "$@"
                     '"'"' sh "$@"
+        }
+
+        run_product_reload() {
+            ip netns exec fwserver \
+                setpriv \
+                    --no-new-privs \
+                    --bounding-set=-all \
+                    --inh-caps=-all \
+                    --ambient-caps=-all \
+                    --reuid=1000 \
+                    --regid=1000 \
+                    --clear-groups \
+                    "$product_binary" reload-server \
+                    "$state_directory/reload-control/server.sock"
+        }
+
+        install_identity_candidate() {
+            candidate=$1
+            install -o 0 -g 1000 -m 0640 \
+                "$candidate" \
+                "$state_directory/.vpn-identities.next"
+            mv -f \
+                "$state_directory/.vpn-identities.next" \
+                "$state_directory/vpn-identities.json"
         }
 
         ip netns add fwserver
@@ -582,7 +611,9 @@ unshare \
                 --reuid=1000 \
                 --regid=1000 \
                 --clear-groups \
-                "$5" server "$3/vpn-server.json" \
+                env \
+                    FLOWWEAVE_VPN_SERVER_RELOAD_SOCKET="$3/reload-control/server.sock" \
+                    "$5" server "$3/vpn-server.json" \
             >"$3/product.server.log" 2>&1 &
         server_pid=$!
         wait_for_log_line \
@@ -690,6 +721,114 @@ unshare \
             ping -4 -n -c 3 -s 1300 -W 2 -w 8 10.77.0.1
         ip netns exec fwclient \
             ping -6 -n -c 3 -s 1300 -W 2 -w 8 fd77::1
+
+        install -o 0 -g 0 -m 0600 \
+            "$3/vpn-identities.json" \
+            "$3/vpn-identities.original.json"
+        printf "%s" "{invalid-json" >"$3/vpn-identities.invalid.json"
+        install_identity_candidate "$3/vpn-identities.invalid.json"
+        if run_product_reload >"$3/reload-invalid.log" 2>&1; then
+            echo "无效身份 JSON reload 意外成功" >&2
+            exit 1
+        fi
+        grep -Fqx vpn_server_reload_rejected "$3/reload-invalid.log"
+        kill -0 "$client_pid"
+        kill -0 "$server_pid"
+        ip netns exec fwclient \
+            ping -4 -n -c 1 -s 1300 -W 2 -w 5 10.77.0.1 >/dev/null
+
+        jq \
+            ".identities[0].client_ipv4 = \"10.77.0.3\"" \
+            "$3/vpn-identities.original.json" \
+            >"$3/vpn-identities-network-drift.json"
+        install_identity_candidate "$3/vpn-identities-network-drift.json"
+        if run_product_reload >"$3/reload-network-drift.log" 2>&1; then
+            echo "改变 TUN host route 的身份 reload 意外成功" >&2
+            exit 1
+        fi
+        grep -Fqx vpn_server_reload_rejected "$3/reload-network-drift.log"
+        kill -0 "$client_pid"
+        kill -0 "$server_pid"
+
+        jq \
+            ".identities[0].enabled = false" \
+            "$3/vpn-identities.original.json" \
+            >"$3/vpn-identities-forwarding-drift.json"
+        install_identity_candidate "$3/vpn-identities-forwarding-drift.json"
+        if run_product_reload >"$3/reload-forwarding-drift.log" 2>&1; then
+            echo "改变 nft 精确源地址集合的身份 reload 意外成功" >&2
+            exit 1
+        fi
+        grep -Fqx vpn_server_reload_rejected "$3/reload-forwarding-drift.log"
+        kill -0 "$client_pid"
+        kill -0 "$server_pid"
+        ip netns exec fwclient \
+            ping -6 -n -c 1 -s 1300 -W 2 -w 5 fd77::1 >/dev/null
+
+        replacement_fingerprint=2222222222222222222222222222222222222222222222222222222222222222
+        jq \
+            --arg replacement "$replacement_fingerprint" \
+            ".identities[0].fingerprints += [\$replacement]" \
+            "$3/vpn-identities.original.json" \
+            >"$3/vpn-identities-overlap.json"
+        install_identity_candidate "$3/vpn-identities-overlap.json"
+        run_product_reload
+        kill -0 "$client_pid"
+        kill -0 "$server_pid"
+        ip netns exec fwclient \
+            ping -4 -n -c 1 -s 1300 -W 2 -w 5 10.77.0.1 >/dev/null
+
+        jq \
+            --arg replacement "$replacement_fingerprint" \
+            ".identities[0].fingerprints = [\$replacement]" \
+            "$3/vpn-identities.original.json" \
+            >"$3/vpn-identities-revoked.json"
+        install_identity_candidate "$3/vpn-identities-revoked.json"
+        run_product_reload
+        wait_for_process_exit \
+            "$client_pid" \
+            "$3/product.client.log" \
+            "身份指纹在线撤销后的 VPN 产品客户端" \
+            10
+        client_pid=
+        if [ "$wait_status" -eq 0 ]; then
+            cat "$3/product.client.log" >&2 || true
+            echo "身份指纹在线撤销后客户端意外以零状态退出" >&2
+            exit 1
+        fi
+        require_log_line_once ready "$3/product.client.log" "身份 reload 门控 VPN 产品客户端"
+        if grep -Fqx stopped "$3/product.client.log"; then
+            cat "$3/product.client.log" >&2 || true
+            echo "身份撤销被错误报告为正常停止" >&2
+            exit 1
+        fi
+        grep -Fqx vpn_process_unexpected_client_stop "$3/product.client.log"
+        kill -0 "$server_pid"
+
+        install_identity_candidate "$3/vpn-identities.original.json"
+        run_product_reload
+        : >"$3/product.client.log"
+        ip netns exec fwclient \
+            setpriv \
+                --no-new-privs \
+                --bounding-set=-all \
+                --inh-caps=-all \
+                --ambient-caps=-all \
+                --reuid=1000 \
+                --regid=1000 \
+                --clear-groups \
+                "$5" client "$3/vpn-client.json" \
+            >"$3/product.client.log" 2>&1 &
+        client_pid=$!
+        wait_for_log_line \
+            ready \
+            "$client_pid" \
+            "$3/product.client.log" \
+            "身份恢复后的 VPN 产品客户端"
+        ip netns exec fwclient \
+            ping -4 -n -c 1 -s 1300 -W 2 -w 5 10.77.0.1 >/dev/null
+        ip netns exec fwclient \
+            ping -6 -n -c 1 -s 1300 -W 2 -w 5 fd77::1 >/dev/null
 
         kill -TERM "$client_pid"
         wait_for_process_exit \
