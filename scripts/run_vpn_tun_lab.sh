@@ -13,23 +13,27 @@ if [ -z "$SUBUID_START" ] || [ -z "$SUBGID_START" ]; then
 fi
 
 cd "$ROOT_DIR"
+cargo build --bin flowweave-vpn-net
+NETWORK_BINARY="$ROOT_DIR/target/debug/flowweave-vpn-net"
 TEST_BINARY=$(
     cargo test --test vpn_tun_lab --no-run --message-format=json |
         jq -r 'select(.profile.test == true and .target.name == "vpn_tun_lab") | .executable' |
         tail -n 1
 )
 
-if [ -z "$TEST_BINARY" ] || [ ! -x "$TEST_BINARY" ]; then
-    echo "无法定位 vpn_tun_lab 测试二进制" >&2
+if [ ! -x "$NETWORK_BINARY" ] || [ -z "$TEST_BINARY" ] || [ ! -x "$TEST_BINARY" ]; then
+    echo "无法定位 VPN 网络 helper 或 vpn_tun_lab 测试二进制" >&2
     exit 1
 fi
 
 # target/ 位于用户主目录内，降权后的 namespace 用户可能没有目录穿越权限。
 # 将只读测试二进制暂存到所有用户可穿越的 /tmp，退出时无条件清理。
 LAB_BINARY=$(mktemp /tmp/flowweave-vpn-tun-lab.XXXXXX)
+LAB_NETWORK_BINARY=$(mktemp /tmp/flowweave-vpn-net.XXXXXX)
 LAB_STATE_DIR=$(mktemp -d /tmp/flowweave-vpn-endpoint-lab.XXXXXX)
-trap 'rm -f "$LAB_BINARY"; rm -rf "$LAB_STATE_DIR"' EXIT HUP INT TERM
+trap 'rm -f "$LAB_BINARY" "$LAB_NETWORK_BINARY"; rm -rf "$LAB_STATE_DIR"' EXIT HUP INT TERM
 install -m 0755 "$TEST_BINARY" "$LAB_BINARY"
+install -m 0755 "$NETWORK_BINARY" "$LAB_NETWORK_BINARY"
 
 unshare \
     --user \
@@ -118,8 +122,32 @@ unshare \
             --exact real_tun_endpoint_protocol_mtu_and_connection_loss \
             --nocapture
         chown -R 1000:1000 "$3"/*
+        chown 0:1000 \
+            "$3/vpn-client.json" \
+            "$3/vpn-server.json" \
+            "$3/vpn-identities.json"
+        chmod 0640 \
+            "$3/vpn-client.json" \
+            "$3/vpn-server.json" \
+            "$3/vpn-identities.json"
         chown 0:1000 "$3"
         chmod 0770 "$3"
+        mkdir "$3/network-state"
+        chmod 0700 "$3/network-state"
+
+        run_network_helper() {
+            endpoint_namespace=$1
+            shift
+            ip netns exec "$endpoint_namespace" \
+                unshare \
+                    --mount \
+                    --fork \
+                    sh -eu -c '"'"'
+                        mount --make-rprivate /
+                        mount -t sysfs sysfs /sys
+                        exec "$@"
+                    '"'"' sh "$@"
+        }
 
         ip netns add fwserver
         ip netns add fwclient
@@ -130,23 +158,26 @@ unshare \
         ip netns exec fwserver ip link set lo up
         ip netns exec fwserver ip link set fwserver0 up
         ip netns exec fwserver ip addr add 192.0.2.1/30 dev fwserver0
-        ip netns exec fwserver ip tuntap add dev fwvpn0 mode tun user 1000
-        ip netns exec fwserver ip link set dev fwvpn0 mtu 1500 up
-        ip netns exec fwserver ip addr add 10.77.0.1/32 dev fwvpn0
-        ip netns exec fwserver ip -6 addr add fd77::1/128 dev fwvpn0 nodad
-        ip netns exec fwserver ip route add 10.77.0.2/32 dev fwvpn0
-        ip netns exec fwserver ip -6 route add fd77::2/128 dev fwvpn0
 
         ip netns exec fwclient ip link set lo up
         ip netns exec fwclient ip link set fwclient0 up
         ip netns exec fwclient ip addr add 192.0.2.2/30 dev fwclient0
-        ip netns exec fwclient ip tuntap add dev fwvpn0 mode tun user 1000
-        ip netns exec fwclient ip link set dev fwvpn0 mtu 1500 up
-        ip netns exec fwclient ip addr add 10.77.0.2/32 dev fwvpn0
-        ip netns exec fwclient ip -6 addr add fd77::2/128 dev fwvpn0 nodad
-        ip netns exec fwclient ip route add 10.77.0.1/32 dev fwvpn0
-        ip netns exec fwclient ip -6 route add fd77::1/128 dev fwvpn0
         ip netns exec fwclient sh -c '"'"'echo "1000 1000" > /proc/sys/net/ipv4/ping_group_range'"'"'
+
+        run_network_helper \
+            fwserver \
+            "$4" \
+            prepare-server \
+            "$3/vpn-server.json" \
+            "$3/network-state/server.json" \
+            1000
+        run_network_helper \
+            fwclient \
+            "$4" \
+            prepare-client \
+            "$3/vpn-client.json" \
+            "$3/network-state/client.json" \
+            1000
 
         server_pid=
         client_pid=
@@ -388,4 +419,20 @@ unshare \
                         --exact real_tun_endpoint_process_cleanup \
                         --nocapture
         done
-    ' sh "$LAB_BINARY" "$HOST_NETNS" "$LAB_STATE_DIR"
+
+        run_network_helper \
+            fwclient \
+            "$4" \
+            cleanup \
+            "$3/network-state/client.json"
+        run_network_helper \
+            fwserver \
+            "$4" \
+            cleanup \
+            "$3/network-state/server.json"
+        if ip netns exec fwclient ip link show dev fwvpn0 >/dev/null 2>&1 \
+            || ip netns exec fwserver ip link show dev fwvpn0 >/dev/null 2>&1; then
+            echo "VPN 网络 helper cleanup 遗留 TUN" >&2
+            exit 1
+        fi
+    ' sh "$LAB_BINARY" "$HOST_NETNS" "$LAB_STATE_DIR" "$LAB_NETWORK_BINARY"

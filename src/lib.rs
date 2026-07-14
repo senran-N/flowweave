@@ -41,6 +41,8 @@ mod vpn_datagram_runtime;
 mod vpn_identity;
 mod vpn_identity_config;
 #[cfg(target_os = "linux")]
+mod vpn_network;
+#[cfg(target_os = "linux")]
 mod vpn_packet_bridge;
 mod vpn_product_config;
 #[cfg(target_os = "linux")]
@@ -141,6 +143,14 @@ pub use vpn_identity_config::{
     SharedVpnIdentityRegistry, VPN_IDENTITY_CONFIG_MAX_BYTES, VPN_IDENTITY_CONFIG_VERSION,
     VpnIdentityConfigError, VpnIdentityReloadReport, load_vpn_identity_registry,
     parse_vpn_identity_registry_json,
+};
+#[cfg(target_os = "linux")]
+pub use vpn_network::{
+    VPN_NETWORK_STATE_MAX_BYTES, VPN_NETWORK_STATE_VERSION, VpnNetworkCleanupOutcome,
+    VpnNetworkError, VpnNetworkIoStage, VpnNetworkIpOperation, VpnNetworkPlan,
+    VpnNetworkPrepareOutcome, VpnNetworkRole, VpnNetworkStatePhase, cleanup_vpn_network,
+    load_vpn_client_network_plan, load_vpn_server_network_plan, prepare_vpn_client_network,
+    prepare_vpn_server_network,
 };
 #[cfg(target_os = "linux")]
 pub use vpn_packet_bridge::{

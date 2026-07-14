@@ -459,7 +459,7 @@ fn read_private_config(path: &Path) -> Result<Vec<u8>, VpnProductConfigError> {
 fn enforce_private_permissions(metadata: &fs::Metadata) -> Result<(), VpnProductConfigError> {
     use std::os::unix::fs::PermissionsExt;
 
-    if metadata.permissions().mode() & 0o077 != 0 {
+    if metadata.permissions().mode() & 0o037 != 0 {
         return Err(VpnProductConfigError::UnsafePermissions);
     }
     Ok(())
@@ -1049,7 +1049,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn product_config_file_requires_private_permissions() {
+    fn product_config_file_allows_read_only_group_access() {
         use std::os::unix::fs::PermissionsExt;
 
         let directory = TestDirectory::new();
@@ -1060,12 +1060,17 @@ mod tests {
         let path = directory.path().join("server.json");
         fs::write(&path, serde_json::to_vec(&valid_server()).unwrap()).unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
+        assert!(load_vpn_server_product_config(&path).is_ok());
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o660)).unwrap();
         assert_eq!(
             load_vpn_server_product_config(&path).unwrap_err(),
             VpnProductConfigError::UnsafePermissions
         );
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
-        assert!(load_vpn_server_product_config(&path).is_ok());
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o604)).unwrap();
+        assert_eq!(
+            load_vpn_server_product_config(&path).unwrap_err(),
+            VpnProductConfigError::UnsafePermissions
+        );
 
         let oversized = directory.path().join("oversized.json");
         fs::write(&oversized, vec![b' '; VPN_PRODUCT_CONFIG_MAX_BYTES + 1]).unwrap();

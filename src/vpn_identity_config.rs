@@ -165,7 +165,7 @@ pub fn load_vpn_identity_registry(
 fn enforce_private_permissions(metadata: &fs::Metadata) -> Result<(), VpnIdentityConfigError> {
     use std::os::unix::fs::PermissionsExt;
 
-    if metadata.permissions().mode() & 0o077 != 0 {
+    if metadata.permissions().mode() & 0o037 != 0 {
         return Err(VpnIdentityConfigError::UnsafePermissions);
     }
     Ok(())
@@ -497,7 +497,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn identity_file_rejects_group_or_other_permissions() {
+    fn identity_file_allows_read_only_group_access() {
         use std::os::unix::fs::PermissionsExt;
 
         let directory = TestDirectory::new();
@@ -509,6 +509,13 @@ mod tests {
                 .as_bytes(),
         );
         fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
+        assert!(load_vpn_identity_registry(&path).is_ok());
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o660)).unwrap();
+        assert_eq!(
+            load_vpn_identity_registry(&path).unwrap_err(),
+            VpnIdentityConfigError::UnsafePermissions
+        );
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o604)).unwrap();
         assert_eq!(
             load_vpn_identity_registry(&path).unwrap_err(),
             VpnIdentityConfigError::UnsafePermissions
