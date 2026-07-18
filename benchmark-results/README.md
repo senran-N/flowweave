@@ -4,6 +4,8 @@
 
 全部 CSV 的冻结 SHA-256 位于 `SHA256SUMS`。在仓库根目录运行 `./scripts/verify_evidence.sh` 会校验每个文件并拒绝清单之外新增或缺失的 CSV。历史文件不得覆盖、补行或以同一合同重跑；新实验必须使用新文件名和新预注册合同。
 
+- `2026-07-14-linux-mptcp-a-smoke-v1.csv` / `2026-07-14-linux-mptcp-a-formal-10-v1.csv`：Linux `7.0.11-arch1-1` 原生 `IPPROTO_MPTCP`、default scheduler、Cubic 与严格 TLS 1.3 的 A 组对照。smoke 2 场、formal 正反向各五场的基础设施全部闭合且无 TCP fallback，双路始终保持两个子流；正式完整闭环为正向 `0/5`、反向 `1/5`，唯一恢复间隔 `2199.883 ms`。所有场次故障后都从线路二交付了新校验记录，但其余九场未在合同截止前完成全部数据和最终响应。FlowWeave v6.9 正反向各 `10/10` 且逐场 `<1 s`，因此按预注册连续性分支胜出。SHA-256 分别为 `eecf7215331fb2a60c828b9523a3d01a26a5b9922aabcb8e3cacd7f7ca647ed5` / `525064bc594d077bf85e962b4fe39c255b8994f6c10e5412cc70930e343fb6f4`。
+- `2026-07-14-linux-mptcp-b-smoke-v1.csv` / `2026-07-14-linux-mptcp-b-formal-30-v1.csv`：相同 Linux MPTCP/TLS 身份下的 B 组持续单流对照。正式平衡双路中位 `29.089 Mbit/s`、逐轮 `5/5` 通过聚合门槛；异构中位 `27.561 Mbit/s`、逐轮 `4/5`。FlowWeave 对应为 `26.580/27.509 Mbit/s`：MPTCP 平衡高约 `9.4%`，异构高约 `0.2%`，没有任何一方在两个场景都领先至少 15%，正式结论为无决定性差异。SHA-256 分别为 `be4f51dea337b85d209fcc043150e3eb91ce4efbd03de54f9b7e3f872fd2b5cd` / `ab288f7e0b9d0e0f0d49d3264b5ba533db7a8dd92cc6c9f4ce3041770aebfdb2`。完整合同和边界见 `MPTCP_COMPARISON.md`、`MPTCP_RESULTS.md`。
 - `2026-07-13-public-same-egress-dual-interface-soak-30m/`：关闭干扰原始 UDP 的本地 VPN 后，在受控公网服务端与“两张客户端接口 + 两条源策略路由 + 两个 Docker NAT + 同一物理出口”之间完成 30 分钟 TLS/MPQUIC soak。7,031/7,031 条流完整回显，双向应用数据 230,391,808 字节，workload 与两端严格健康门控均通过；该证据不声称两个独立运营商出口。
 
 - `2026-07-11-scheduler-screening.csv`：删减候选前，四种多路径调度与两条单路基线，在平衡和异构线路下使用 5 对固定随机种子的 2 MiB 候选筛选。它证明 MinRTT 在异构线路只有 1/5 轮达到“快 15%”，因此已被删除。该筛选不等同于 `BENCHMARK.md` 规定的 20 秒或 64 MiB 最终验收。

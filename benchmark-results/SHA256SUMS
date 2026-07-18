@@ -133,3 +133,7 @@ cebfe2f5a9aa0bbb6bcd507b2ca225483f3d345e03ddd82d9e117ad0b810e3ce  benchmark-resu
 e93f70c5bd6c20c5a0b0b2ada8194712d672225f60f584b2d37c386937e51234  benchmark-results/2026-07-13-hysteria-2-9-3-c-formal-20-v2.csv
 ea6a5ea7415e48c28360f5e8c8414f1da5ec5a25d134c0451c99a2388682ae5d  benchmark-results/2026-07-13-hysteria-2-9-3-c-smoke-v2.csv
 9ee7719b0c362039ef4af9e021e6bf5a4a37383e89bea7ade38a3b3c486015f0  benchmark-results/2026-07-13-hysteria-2-9-3-c-smoke.csv
+525064bc594d077bf85e962b4fe39c255b8994f6c10e5412cc70930e343fb6f4  benchmark-results/2026-07-14-linux-mptcp-a-formal-10-v1.csv
+eecf7215331fb2a60c828b9523a3d01a26a5b9922aabcb8e3cacd7f7ca647ed5  benchmark-results/2026-07-14-linux-mptcp-a-smoke-v1.csv
+ab288f7e0b9d0e0f0d49d3264b5ba533db7a8dd92cc6c9f4ce3041770aebfdb2  benchmark-results/2026-07-14-linux-mptcp-b-formal-30-v1.csv
+be4f51dea337b85d209fcc043150e3eb91ce4efbd03de54f9b7e3f872fd2b5cd  benchmark-results/2026-07-14-linux-mptcp-b-smoke-v1.csv

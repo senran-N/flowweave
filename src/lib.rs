@@ -24,6 +24,8 @@ use tokio::{
 
 mod b_ingress;
 mod hysteria;
+#[cfg(target_os = "linux")]
+mod mptcp;
 mod proxy;
 mod proxy_observe;
 mod proxy_soak;
@@ -65,6 +67,12 @@ pub use hysteria::{
     HysteriaRealtimeConfig, HysteriaRealtimeReport, HysteriaThroughputConfig,
     HysteriaThroughputReport, run_hysteria_failover, run_hysteria_realtime,
     run_hysteria_throughput, verify_hysteria_binary,
+};
+#[cfg(target_os = "linux")]
+pub use mptcp::{
+    MptcpFailoverConfig, MptcpFailoverReport, MptcpInfoSnapshot, MptcpPathMode,
+    MptcpRuntimeIdentity, MptcpThroughputConfig, MptcpThroughputReport, run_mptcp_failover,
+    run_mptcp_throughput,
 };
 pub use proxy::{
     PROXY_EVENT_SCHEMA, ProxyClientConfig, ProxyMetricsSnapshot, ProxyRuntime, ProxyServerConfig,
