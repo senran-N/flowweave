@@ -305,6 +305,29 @@ unshare \
             return 1
         }
 
+        wait_for_log_prefix_count() {
+            expected_prefix=$1
+            expected_count=$2
+            process_pid=$3
+            process_log=$4
+            description=$5
+            prefix_attempts=0
+            while [ "$prefix_attempts" -lt 800 ]; do
+                prefix_count=$(grep -Fc "$expected_prefix" "$process_log" 2>/dev/null || true)
+                if [ "$prefix_count" -ge "$expected_count" ]; then
+                    return 0
+                fi
+                if ! kill -0 "$process_pid" 2>/dev/null; then
+                    break
+                fi
+                prefix_attempts=$((prefix_attempts + 1))
+                sleep 0.05
+            done
+            cat "$process_log" >&2 || true
+            echo "$description 未在固定截止内输出 $expected_count 条 $expected_prefix" >&2
+            return 1
+        }
+
         wait_for_process_exit() {
             process_pid=$1
             process_log=$2
@@ -558,6 +581,7 @@ unshare \
             "$3/product.server.log" \
             "$3/product.client.log" \
             "$3/product-fault.server.log" \
+            "$3/product-fault.server-restart.log" \
             "$3/product-fault.client.log"
 
         ip netns exec fwserver ip link set fwserver0 down
@@ -602,6 +626,30 @@ unshare \
         fi
         require_log_line_once stopped "$3/product-startup.client.log" "启动中止的 VPN 产品客户端"
 
+        ip netns exec fwclient \
+            setpriv \
+                --no-new-privs \
+                --bounding-set=-all \
+                --inh-caps=-all \
+                --ambient-caps=-all \
+                --reuid=1000 \
+                --regid=1000 \
+                --clear-groups \
+                "$5" client "$3/vpn-client.json" \
+            >"$3/product.client.log" 2>&1 &
+        client_pid=$!
+        wait_for_log_prefix_count \
+            "vpn_client_startup_failed:" \
+            1 \
+            "$client_pid" \
+            "$3/product.client.log" \
+            "READY 前内部重试门控 VPN 产品客户端"
+        if grep -Fqx ready "$3/product.client.log"; then
+            cat "$3/product.client.log" >&2 || true
+            echo "服务端启动前 VPN 产品客户端错误输出 READY" >&2
+            exit 1
+        fi
+
         ip netns exec fwserver \
             setpriv \
                 --no-new-privs \
@@ -622,23 +670,12 @@ unshare \
             "$3/product.server.log" \
             "VPN 产品服务端"
 
-        ip netns exec fwclient \
-            setpriv \
-                --no-new-privs \
-                --bounding-set=-all \
-                --inh-caps=-all \
-                --ambient-caps=-all \
-                --reuid=1000 \
-                --regid=1000 \
-                --clear-groups \
-                "$5" client "$3/vpn-client.json" \
-            >"$3/product.client.log" 2>&1 &
-        client_pid=$!
         wait_for_log_line \
             ready \
             "$client_pid" \
             "$3/product.client.log" \
-            "VPN 产品客户端"
+            "READY 前重试恢复后的 VPN 产品客户端"
+        kill -0 "$client_pid"
 
         route_activation=$(
             run_network_helper \
@@ -785,15 +822,16 @@ unshare \
             >"$3/vpn-identities-revoked.json"
         install_identity_candidate "$3/vpn-identities-revoked.json"
         run_product_reload
-        wait_for_process_exit \
+        wait_for_log_prefix_count \
+            vpn_client_connection_lost: \
+            1 \
             "$client_pid" \
             "$3/product.client.log" \
-            "身份指纹在线撤销后的 VPN 产品客户端" \
-            10
-        client_pid=
-        if [ "$wait_status" -eq 0 ]; then
-            cat "$3/product.client.log" >&2 || true
-            echo "身份指纹在线撤销后客户端意外以零状态退出" >&2
+            "身份指纹在线撤销后的 VPN 产品客户端"
+        kill -0 "$client_pid"
+        if ip netns exec fwclient \
+            ping -4 -n -c 1 -s 1300 -W 1 -w 2 10.77.0.1 >/dev/null 2>&1; then
+            echo "身份撤销离线期 IPv4 流量意外成功" >&2
             exit 1
         fi
         require_log_line_once ready "$3/product.client.log" "身份 reload 门控 VPN 产品客户端"
@@ -802,29 +840,28 @@ unshare \
             echo "身份撤销被错误报告为正常停止" >&2
             exit 1
         fi
-        grep -Fqx vpn_process_unexpected_client_stop "$3/product.client.log"
         kill -0 "$server_pid"
 
         install_identity_candidate "$3/vpn-identities.original.json"
         run_product_reload
-        : >"$3/product.client.log"
-        ip netns exec fwclient \
-            setpriv \
-                --no-new-privs \
-                --bounding-set=-all \
-                --inh-caps=-all \
-                --ambient-caps=-all \
-                --reuid=1000 \
-                --regid=1000 \
-                --clear-groups \
-                "$5" client "$3/vpn-client.json" \
-            >"$3/product.client.log" 2>&1 &
-        client_pid=$!
-        wait_for_log_line \
-            ready \
+        wait_for_log_prefix_count \
+            vpn_client_reconnected: \
+            1 \
             "$client_pid" \
             "$3/product.client.log" \
             "身份恢复后的 VPN 产品客户端"
+        reconnect_line=$(grep -F "vpn_client_reconnected:" "$3/product.client.log" | head -n 1)
+        offline_dropped_packets=$(
+            printf "%s\n" "$reconnect_line" |
+                sed -n "s/.*offline_dropped_packets=\([0-9][0-9]*\).*/\1/p"
+        )
+        if [ -z "$offline_dropped_packets" ] || [ "$offline_dropped_packets" -lt 1 ]; then
+            cat "$3/product.client.log" >&2 || true
+            echo "身份撤销离线期未记录丢弃的 TUN 包" >&2
+            exit 1
+        fi
+        require_log_line_once ready "$3/product.client.log" "身份恢复后的 VPN 产品客户端"
+        kill -0 "$client_pid"
         ip netns exec fwclient \
             ping -4 -n -c 1 -s 1300 -W 2 -w 5 10.77.0.1 >/dev/null
         ip netns exec fwclient \
@@ -946,15 +983,18 @@ unshare \
         )
         test "$fault_forwarding_activation" = activated
         ip netns exec fwclient ip link set fwclient0 down
-        wait_for_process_exit \
+        wait_for_log_prefix_count \
+            vpn_client_connection_lost: \
+            1 \
             "$client_pid" \
             "$3/product-fault.client.log" \
-            "外层断链后的 VPN 产品客户端" \
-            20
-        client_pid=
-        if [ "$wait_status" -eq 0 ]; then
-            cat "$3/product-fault.client.log" >&2 || true
-            echo "外层断链后 VPN 产品客户端意外以零状态退出" >&2
+            "外层断链后的 VPN 产品客户端"
+        kill -0 "$client_pid"
+        kill -0 "$server_pid"
+        test -e "$3/network-state/client.json.routes"
+        if ip netns exec fwclient \
+            ping -4 -n -c 1 -s 1300 -W 1 -w 2 10.77.0.1 >/dev/null 2>&1; then
+            echo "外层断链离线期 IPv4 流量意外成功" >&2
             exit 1
         fi
         require_log_line_once ready "$3/product-fault.client.log" "断链门控 VPN 产品客户端"
@@ -963,11 +1003,108 @@ unshare \
             echo "外层断链被错误报告为 VPN 产品客户端正常停止" >&2
             exit 1
         fi
-        if ! grep -Fqx vpn_process_unexpected_client_stop "$3/product-fault.client.log"; then
-            cat "$3/product-fault.client.log" >&2 || true
-            echo "外层断链未返回稳定的 VPN 产品客户端错误" >&2
+
+        ip netns exec fwclient ip link set fwclient0 up
+        wait_for_log_prefix_count \
+            vpn_client_reconnected: \
+            1 \
+            "$client_pid" \
+            "$3/product-fault.client.log" \
+            "外层链路恢复后的 VPN 产品客户端"
+        kill -0 "$client_pid"
+        ip netns exec fwclient \
+            ping -4 -n -c 1 -s 1300 -W 2 -w 5 10.77.0.1 >/dev/null
+        ip netns exec fwclient \
+            ping -6 -n -c 1 -s 1300 -W 2 -w 5 fd77::1 >/dev/null
+
+        kill -TERM "$server_pid"
+        wait_for_process_exit \
+            "$server_pid" \
+            "$3/product-fault.server.log" \
+            "服务端重启门控的旧 VPN 产品服务端 SIGTERM" \
+            10
+        server_pid=
+        if [ "$wait_status" -ne 0 ]; then
+            cat "$3/product-fault.server.log" >&2 || true
+            echo "服务端重启门控的旧 VPN 产品服务端未正常停止" >&2
             exit 1
         fi
+        require_log_line_once ready "$3/product-fault.server.log" "断链门控 VPN 产品服务端"
+        require_log_line_once stopped "$3/product-fault.server.log" "断链门控 VPN 产品服务端"
+        wait_for_log_prefix_count \
+            vpn_client_connection_lost: \
+            2 \
+            "$client_pid" \
+            "$3/product-fault.client.log" \
+            "服务端停止后的 VPN 产品客户端"
+        kill -0 "$client_pid"
+
+        ip netns exec fwserver \
+            setpriv \
+                --no-new-privs \
+                --bounding-set=-all \
+                --inh-caps=-all \
+                --ambient-caps=-all \
+                --reuid=1000 \
+                --regid=1000 \
+                --clear-groups \
+                "$5" server "$3/vpn-server.json" \
+            >"$3/product-fault.server-restart.log" 2>&1 &
+        server_pid=$!
+        wait_for_log_line \
+            ready \
+            "$server_pid" \
+            "$3/product-fault.server-restart.log" \
+            "重启后的 VPN 产品服务端"
+        wait_for_log_prefix_count \
+            vpn_client_reconnected: \
+            2 \
+            "$client_pid" \
+            "$3/product-fault.client.log" \
+            "服务端重启后的 VPN 产品客户端"
+        kill -0 "$client_pid"
+        ip netns exec fwclient \
+            ping -4 -n -c 1 -s 1300 -W 2 -w 5 10.77.0.1 >/dev/null
+        ip netns exec fwclient \
+            ping -6 -n -c 1 -s 1300 -W 2 -w 5 fd77::1 >/dev/null
+
+        kill -TERM "$server_pid"
+        wait_for_process_exit \
+            "$server_pid" \
+            "$3/product-fault.server-restart.log" \
+            "重启后的 VPN 产品服务端 SIGTERM" \
+            10
+        server_pid=
+        if [ "$wait_status" -ne 0 ]; then
+            cat "$3/product-fault.server-restart.log" >&2 || true
+            echo "重启后的 VPN 产品服务端未正常停止" >&2
+            exit 1
+        fi
+        require_log_line_once ready "$3/product-fault.server-restart.log" "重启后的 VPN 产品服务端"
+        require_log_line_once stopped "$3/product-fault.server-restart.log" "重启后的 VPN 产品服务端"
+        wait_for_log_prefix_count \
+            vpn_client_connection_lost: \
+            3 \
+            "$client_pid" \
+            "$3/product-fault.client.log" \
+            "第二次服务端停止后的 VPN 产品客户端"
+        kill -0 "$client_pid"
+        test -e "$3/network-state/client.json.routes"
+
+        kill -TERM "$client_pid"
+        wait_for_process_exit \
+            "$client_pid" \
+            "$3/product-fault.client.log" \
+            "离线重连等待中的 VPN 产品客户端 SIGTERM" \
+            10
+        client_pid=
+        if [ "$wait_status" -ne 0 ]; then
+            cat "$3/product-fault.client.log" >&2 || true
+            echo "离线重连等待中的 VPN 产品客户端未正常停止" >&2
+            exit 1
+        fi
+        require_log_line_once ready "$3/product-fault.client.log" "断链门控 VPN 产品客户端"
+        require_log_line_once stopped "$3/product-fault.client.log" "断链门控 VPN 产品客户端"
         fault_route_deactivation=$(
             run_network_helper \
                 fwclient \
@@ -977,27 +1114,6 @@ unshare \
         )
         test "$fault_route_deactivation" = deactivated
         test ! -e "$3/network-state/client.json.routes"
-        if ! kill -0 "$server_pid" 2>/dev/null; then
-            cat "$3/product-fault.server.log" >&2 || true
-            echo "外层断链后 VPN 产品服务端意外退出" >&2
-            exit 1
-        fi
-
-        ip netns exec fwclient ip link set fwclient0 up
-        kill -TERM "$server_pid"
-        wait_for_process_exit \
-            "$server_pid" \
-            "$3/product-fault.server.log" \
-            "断链恢复后的 VPN 产品服务端 SIGTERM" \
-            10
-        server_pid=
-        if [ "$wait_status" -ne 0 ]; then
-            cat "$3/product-fault.server.log" >&2 || true
-            echo "断链恢复后 VPN 产品服务端未正常停止" >&2
-            exit 1
-        fi
-        require_log_line_once ready "$3/product-fault.server.log" "断链门控 VPN 产品服务端"
-        require_log_line_once stopped "$3/product-fault.server.log" "断链门控 VPN 产品服务端"
         fault_forwarding_deactivation=$(
             run_network_helper \
                 fwserver \

@@ -13,7 +13,7 @@ ExecReload=@PRODUCT_BINARY@ reload-server @LAB_DIRECTORY@/reload.sock
 ExecStopPost=+@ENV_BINARY@ FLOWWEAVE_VPN_SYSTEMD_STAGE=deactivate @TEST_BINARY@ --ignored --exact vpn_systemd_lifecycle_role --nocapture
 ExecStopPost=+@ENV_BINARY@ FLOWWEAVE_VPN_SYSTEMD_STAGE=cleanup @TEST_BINARY@ --ignored --exact vpn_systemd_lifecycle_role --nocapture
 Restart=no
-TimeoutStartSec=10s
+TimeoutStartSec=3s
 TimeoutStopSec=10s
 # User managers cannot change the kernel capability bounding set. The formal
 # system units keep CapabilityBoundingSet= empty; their contract is tested statically.

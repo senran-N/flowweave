@@ -142,6 +142,10 @@ reset_scenario before_ready_failure
 expect_start_failure
 expect_sequence prepare,data_start,data_before_ready_failure,deactivate,cleanup
 
+reset_scenario before_ready_timeout
+expect_start_failure
+expect_sequence prepare,data_start,data_waiting_before_ready,data_stopped,deactivate,cleanup
+
 reset_scenario activate_failure
 expect_start_failure
 expect_sequence prepare,data_start,data_ready,activate,data_stopped,deactivate,cleanup

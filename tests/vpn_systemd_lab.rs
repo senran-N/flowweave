@@ -48,6 +48,13 @@ async fn run_data_role(directory: &Path, scenario: &str) {
     }
 
     let mut terminate = tokio::signal::unix::signal(SignalKind::terminate()).unwrap();
+    if scenario == "before_ready_timeout" {
+        append_stage(directory, "data_waiting_before_ready");
+        terminate.recv().await;
+        append_stage(directory, "data_stopped");
+        send_notify(b"STOPPING=1");
+        return;
+    }
     let reload_listener = UnixListener::bind(directory.join("reload.sock")).unwrap();
     let reload_task = tokio::spawn(run_reload_control(
         reload_listener,

@@ -17,18 +17,25 @@ use std::{
     time::Duration,
 };
 
+use ring::rand::{SecureRandom, SystemRandom};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{UnixListener, UnixStream},
     signal::unix::{Signal, SignalKind, signal},
-    time::timeout,
+    time::{Instant, sleep, timeout},
 };
 
+use crate::vpn_packet_bridge::{
+    VpnClientPacketPumpReport, VpnClientPacketPumpStartError, VpnClientPacketPumpStopReason,
+    start_vpn_client_packet_pump,
+};
+use crate::vpn_product_endpoint::connect_vpn_client_product_endpoint_with_packet_pump;
 use crate::{
-    VpnPacketBridgeStopReason, VpnProductBootstrapError, VpnProductEndpointError,
-    VpnProductEndpointLimits, VpnServerProductBootstrap, VpnServerProductEndpointStopReason,
-    VpnTunAttachError, attach_existing_vpn_tun, connect_vpn_client_product_endpoint,
-    load_vpn_client_product_bootstrap, load_vpn_server_product_bootstrap,
+    VpnDatagramRuntimeStopReason, VpnPacketBridgeStopReason, VpnProductBootstrapError,
+    VpnProductConnectFailure, VpnProductConnectionStartError, VpnProductEndpointError,
+    VpnProductEndpointLimits, VpnProductPathOpenError, VpnRejectReason, VpnServerProductBootstrap,
+    VpnServerProductEndpointStopReason, VpnSessionError, VpnTunAttachError,
+    attach_existing_vpn_tun, load_vpn_client_product_bootstrap, load_vpn_server_product_bootstrap,
     start_vpn_server_product_endpoint,
 };
 
@@ -44,6 +51,13 @@ const SERVER_RELOAD_RESPONSE_REJECTED: u8 = 1;
 const SERVER_RELOAD_IO_TIMEOUT: Duration = Duration::from_secs(2);
 const SERVER_RELOAD_SUCCEEDED_STATUS: &str = "STATUS=FlowWeave VPN identities reloaded";
 const SERVER_RELOAD_FAILED_STATUS: &str = "STATUS=FlowWeave VPN identity reload rejected";
+const CLIENT_STARTING_STATUS: &str = "STATUS=FlowWeave VPN client waiting for initial connection";
+const CLIENT_RECONNECTING_STATUS: &str = "STATUS=FlowWeave VPN client reconnecting";
+const CLIENT_RECONNECTED_STATUS: &str = "STATUS=FlowWeave VPN client reconnected";
+const CLIENT_RECONNECT_FAILED_STATUS: &str =
+    "STATUS=FlowWeave VPN client reconnect failed permanently";
+const VPN_CLIENT_RECONNECT_INITIAL_DELAY_MS: u64 = 250;
+const VPN_CLIENT_RECONNECT_MAX_DELAY_MS: u64 = 30_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VpnProductProcessRole {
@@ -67,6 +81,15 @@ pub struct VpnProductProcessReport {
     pub packet_bridge_stop_reason: Option<VpnPacketBridgeStopReason>,
     pub identity_reloads: u64,
     pub identity_reload_failures: u64,
+    pub startup_attempts: u64,
+    pub startup_failures: u64,
+    pub startup_millis: u64,
+    pub reconnect_attempts: u64,
+    pub reconnect_successes: u64,
+    pub reconnect_failures: u64,
+    pub offline_millis: u64,
+    pub offline_dropped_packets: u64,
+    pub offline_dropped_bytes: u64,
 }
 
 #[derive(Debug)]
@@ -74,6 +97,8 @@ pub enum VpnProductProcessError {
     Bootstrap(VpnProductBootstrapError),
     Tun(VpnTunAttachError),
     Endpoint(VpnProductEndpointError),
+    ClientPacketPumpStart(VpnClientPacketPumpStartError),
+    ClientPacketPumpStopped(VpnClientPacketPumpStopReason),
     Signal(io::ErrorKind),
     NotifySocketInvalid,
     Notify(io::ErrorKind),
@@ -96,6 +121,15 @@ impl fmt::Display for VpnProductProcessError {
             Self::Bootstrap(error) => write!(formatter, "vpn_process_bootstrap:{error}"),
             Self::Tun(error) => write!(formatter, "vpn_process_tun:{error}"),
             Self::Endpoint(error) => write!(formatter, "vpn_process_endpoint:{error}"),
+            Self::ClientPacketPumpStart(error) => {
+                write!(formatter, "vpn_process_client_packet_pump_start:{error}")
+            }
+            Self::ClientPacketPumpStopped(reason) => {
+                write!(
+                    formatter,
+                    "vpn_process_client_packet_pump_stopped:{reason:?}"
+                )
+            }
             Self::Signal(kind) => write!(formatter, "vpn_process_signal:{kind:?}"),
             Self::Notify(kind) => write!(formatter, "vpn_process_notify:{kind:?}"),
             Self::StatusOutput(kind) => write!(formatter, "vpn_process_status_output:{kind:?}"),
@@ -118,6 +152,8 @@ impl fmt::Display for VpnProductProcessError {
                 Self::Bootstrap(_)
                 | Self::Tun(_)
                 | Self::Endpoint(_)
+                | Self::ClientPacketPumpStart(_)
+                | Self::ClientPacketPumpStopped(_)
                 | Self::Signal(_)
                 | Self::Notify(_)
                 | Self::StatusOutput(_)
@@ -163,6 +199,7 @@ impl Error for VpnProductProcessError {
             Self::Bootstrap(error) => Some(error),
             Self::Tun(error) => Some(error),
             Self::Endpoint(error) => Some(error),
+            Self::ClientPacketPumpStart(error) => Some(error),
             _ => None,
         }
     }
@@ -183,6 +220,12 @@ impl From<VpnTunAttachError> for VpnProductProcessError {
 impl From<VpnProductEndpointError> for VpnProductProcessError {
     fn from(value: VpnProductEndpointError) -> Self {
         Self::Endpoint(value)
+    }
+}
+
+impl From<VpnClientPacketPumpStartError> for VpnProductProcessError {
+    fn from(value: VpnClientPacketPumpStartError) -> Self {
+        Self::ClientPacketPumpStart(value)
     }
 }
 
@@ -449,6 +492,235 @@ pub async fn run_vpn_server_product_process(
     }
 }
 
+struct ClientSupervisorStats {
+    endpoint_drained: bool,
+    established_path_count: usize,
+    completed_sessions: u64,
+    last_packet_bridge_stop_reason: Option<VpnPacketBridgeStopReason>,
+    startup_attempts: u64,
+    startup_failures: u64,
+    startup_millis: u64,
+    reconnect_attempts: u64,
+    reconnect_successes: u64,
+    reconnect_failures: u64,
+    offline_millis: u64,
+}
+
+impl ClientSupervisorStats {
+    const fn new() -> Self {
+        Self {
+            endpoint_drained: true,
+            established_path_count: 0,
+            completed_sessions: 0,
+            last_packet_bridge_stop_reason: None,
+            startup_attempts: 0,
+            startup_failures: 0,
+            startup_millis: 0,
+            reconnect_attempts: 0,
+            reconnect_successes: 0,
+            reconnect_failures: 0,
+            offline_millis: 0,
+        }
+    }
+
+    fn record_connection(&mut self, report: crate::VpnClientProductEndpointReport) {
+        self.endpoint_drained &= report.endpoint_drained;
+        self.established_path_count = report.established_path_count;
+        self.completed_sessions = self.completed_sessions.saturating_add(1);
+        self.last_packet_bridge_stop_reason = Some(report.connection.packet_bridge.stop_reason);
+    }
+
+    fn record_offline_duration(&mut self, duration: Duration) {
+        let millis = u64::try_from(duration.as_millis()).unwrap_or(u64::MAX);
+        self.offline_millis = self.offline_millis.saturating_add(millis);
+    }
+
+    fn record_startup_duration(&mut self, duration: Duration) {
+        self.startup_millis = u64::try_from(duration.as_millis()).unwrap_or(u64::MAX);
+    }
+
+    fn report(
+        &self,
+        signal: ProductSignal,
+        pump: VpnClientPacketPumpReport,
+    ) -> Result<VpnProductProcessReport, VpnProductProcessError> {
+        if pump.stop_reason != VpnClientPacketPumpStopReason::ShutdownRequested {
+            return Err(VpnProductProcessError::ClientShutdownIncomplete);
+        }
+        Ok(VpnProductProcessReport {
+            role: VpnProductProcessRole::Client,
+            stop_signal: map_stop_signal(signal)?,
+            endpoint_drained: self.endpoint_drained,
+            established_path_count: self.established_path_count,
+            completed_sessions: self.completed_sessions,
+            packet_bridge_stop_reason: self.last_packet_bridge_stop_reason,
+            identity_reloads: 0,
+            identity_reload_failures: 0,
+            startup_attempts: self.startup_attempts,
+            startup_failures: self.startup_failures,
+            startup_millis: self.startup_millis,
+            reconnect_attempts: self.reconnect_attempts,
+            reconnect_successes: self.reconnect_successes,
+            reconnect_failures: self.reconnect_failures,
+            offline_millis: self.offline_millis,
+            offline_dropped_packets: pump.metrics.offline_dropped_packets,
+            offline_dropped_bytes: pump.metrics.offline_dropped_bytes,
+        })
+    }
+}
+
+#[derive(Debug, Default)]
+struct VpnClientReconnectBackoff {
+    step: u32,
+}
+
+impl VpnClientReconnectBackoff {
+    fn next_delay(&mut self, minimum: Duration) -> Duration {
+        let mut sample = [0_u8; 8];
+        let random_sample = if SystemRandom::new().fill(&mut sample).is_ok() {
+            u64::from_ne_bytes(sample)
+        } else {
+            0
+        };
+        let delay = reconnect_delay_from_sample(self.step, random_sample).max(minimum);
+        self.step = self.step.saturating_add(1);
+        delay
+    }
+}
+
+fn reconnect_delay_from_sample(step: u32, sample: u64) -> Duration {
+    let multiplier = 1_u64.checked_shl(step.min(31)).unwrap_or(u64::MAX);
+    let base = VPN_CLIENT_RECONNECT_INITIAL_DELAY_MS
+        .saturating_mul(multiplier)
+        .min(VPN_CLIENT_RECONNECT_MAX_DELAY_MS);
+    let jitter_span = (base / 4).max(1);
+    let jitter = sample % jitter_span.saturating_add(1);
+    let delay = if base == VPN_CLIENT_RECONNECT_MAX_DELAY_MS {
+        base.saturating_sub(jitter)
+    } else {
+        base.saturating_add(jitter)
+            .min(VPN_CLIENT_RECONNECT_MAX_DELAY_MS)
+    };
+    Duration::from_millis(delay)
+}
+
+fn client_connection_is_retryable(report: &crate::VpnClientProductEndpointReport) -> bool {
+    matches!(
+        report.connection.packet_bridge.stop_reason,
+        VpnPacketBridgeStopReason::DatagramRuntime(
+            VpnDatagramRuntimeStopReason::ConnectionClosed
+                | VpnDatagramRuntimeStopReason::ConnectionFailed
+                | VpnDatagramRuntimeStopReason::DataPathStale
+                | VpnDatagramRuntimeStopReason::DatagramSendFailed
+                | VpnDatagramRuntimeStopReason::PacketIdExhausted
+        )
+    )
+}
+
+fn endpoint_retry_after(error: &VpnProductEndpointError) -> Duration {
+    match error {
+        VpnProductEndpointError::ProductConnection(
+            VpnProductConnectionStartError::ClientSession(VpnSessionError::Rejected(reject)),
+        ) => Duration::from_secs(u64::from(reject.retry_after_secs)),
+        _ => Duration::ZERO,
+    }
+}
+
+fn client_connect_error_is_retryable(error: &VpnProductEndpointError) -> bool {
+    match error {
+        VpnProductEndpointError::ClientBind(kind) => matches!(
+            kind,
+            io::ErrorKind::AddrInUse
+                | io::ErrorKind::AddrNotAvailable
+                | io::ErrorKind::ConnectionAborted
+                | io::ErrorKind::HostUnreachable
+                | io::ErrorKind::Interrupted
+                | io::ErrorKind::NetworkDown
+                | io::ErrorKind::NetworkUnreachable
+                | io::ErrorKind::TimedOut
+                | io::ErrorKind::WouldBlock
+        ),
+        VpnProductEndpointError::DnsLookup(kind) => !matches!(
+            kind,
+            io::ErrorKind::InvalidInput
+                | io::ErrorKind::InvalidData
+                | io::ErrorKind::PermissionDenied
+                | io::ErrorKind::Unsupported
+        ),
+        VpnProductEndpointError::DnsTimeout
+        | VpnProductEndpointError::NoCompatibleServerAddress
+        | VpnProductEndpointError::ConnectTimeout
+        | VpnProductEndpointError::HandshakeConfirmationFailed
+        | VpnProductEndpointError::HandshakeConfirmationTimeout
+        | VpnProductEndpointError::PathOpenTimeout => true,
+        VpnProductEndpointError::ConnectFailed(error) => matches!(
+            error,
+            VpnProductConnectFailure::TransportUnavailable
+                | VpnProductConnectFailure::PeerClosed
+                | VpnProductConnectFailure::Reset
+                | VpnProductConnectFailure::TimedOut
+        ),
+        VpnProductEndpointError::PathOpen(error) => matches!(
+            error,
+            VpnProductPathOpenError::RemoteCidsExhausted
+                | VpnProductPathOpenError::ValidationFailed
+        ),
+        VpnProductEndpointError::ProductConnection(
+            VpnProductConnectionStartError::ClientSession(error),
+        ) => client_session_start_error_is_retryable(error),
+        VpnProductEndpointError::Limits(_)
+        | VpnProductEndpointError::ServerBind(_)
+        | VpnProductEndpointError::LocalAddress(_)
+        | VpnProductEndpointError::ConnectStart(_)
+        | VpnProductEndpointError::MultipathNotNegotiated
+        | VpnProductEndpointError::BootstrapPathMissing
+        | VpnProductEndpointError::BootstrapPathClose
+        | VpnProductEndpointError::ProductConnection(_)
+        | VpnProductEndpointError::WorkerFailed => false,
+    }
+}
+
+fn client_session_start_error_is_retryable(error: &VpnSessionError) -> bool {
+    match error {
+        VpnSessionError::StreamOpenFailed
+        | VpnSessionError::StreamAcceptFailed
+        | VpnSessionError::ControlReadFailed
+        | VpnSessionError::ControlWriteFailed
+        | VpnSessionError::ControlFinishFailed
+        | VpnSessionError::ControlTimeout => true,
+        VpnSessionError::Rejected(reject) => !matches!(
+            reject.reason,
+            VpnRejectReason::UnsupportedVersion | VpnRejectReason::ProtocolViolation
+        ),
+        VpnSessionError::InvalidHandshakeTimeout
+        | VpnSessionError::AlpnNotNegotiated
+        | VpnSessionError::MultipathNotNegotiated
+        | VpnSessionError::DatagramNotNegotiated
+        | VpnSessionError::DatagramTooSmall
+        | VpnSessionError::PeerIdentityUnavailable
+        | VpnSessionError::InvalidControl(_)
+        | VpnSessionError::UnexpectedControlMessage
+        | VpnSessionError::InvalidServerResponse => false,
+    }
+}
+
+enum ClientConnectEvent {
+    Signal(ProductSignal),
+    Complete(Result<Box<crate::VpnClientProductEndpointRuntime>, VpnProductEndpointError>),
+}
+
+enum ClientActiveEvent {
+    Signal(ProductSignal),
+    PumpStopped(VpnClientPacketPumpReport),
+    ConnectionStopped(Box<crate::VpnClientProductEndpointReport>),
+}
+
+enum ClientReconnectWaitEvent {
+    Signal(ProductSignal),
+    PumpStopped(VpnClientPacketPumpReport),
+    Timer,
+}
+
 pub async fn run_vpn_client_product_process(
     config_path: impl AsRef<Path>,
 ) -> Result<VpnProductProcessReport, VpnProductProcessError> {
@@ -456,72 +728,279 @@ pub async fn run_vpn_client_product_process(
     let bootstrap = load_vpn_client_product_bootstrap(config_path.as_ref())?;
     let attached =
         attach_existing_vpn_tun(bootstrap.config().tun_name(), bootstrap.config().tun_mtu())?;
-    let startup = tokio::select! {
-        biased;
-        signal = signals.recv() => Err(signal?),
-        runtime = connect_vpn_client_product_endpoint(
-            &bootstrap,
-            attached.device(),
-            VpnProductEndpointLimits::default(),
-        ) => Ok(runtime),
-    };
-    let mut runtime = match startup {
-        Ok(runtime) => runtime?,
-        Err(signal) => {
-            let stopping = notify_systemd(STOPPING_NOTIFICATION);
-            drop(attached);
-            stopping?;
-            return finish_pre_ready_stop(VpnProductProcessRole::Client, signal);
+    let mut packet_pump =
+        start_vpn_client_packet_pump(attached.device().clone(), bootstrap.packet_bridge_config())?;
+    let mut stats = ClientSupervisorStats::new();
+    let startup_started = Instant::now();
+    let mut startup_backoff = VpnClientReconnectBackoff::default();
+    let mut retry_minimum = None;
+    let mut runtime = loop {
+        if let Some(minimum) = retry_minimum.take() {
+            let delay = startup_backoff.next_delay(minimum);
+            eprintln!("vpn_client_startup_waiting:{}", delay.as_millis());
+            let wait_event = tokio::select! {
+                biased;
+                signal = signals.recv() => ClientReconnectWaitEvent::Signal(signal?),
+                pump = packet_pump.join() => ClientReconnectWaitEvent::PumpStopped(pump),
+                _ = sleep(delay) => ClientReconnectWaitEvent::Timer,
+            };
+            match wait_event {
+                ClientReconnectWaitEvent::Signal(signal) => {
+                    stats.record_startup_duration(startup_started.elapsed());
+                    let stopping = notify_systemd(STOPPING_NOTIFICATION);
+                    packet_pump.request_shutdown();
+                    let pump_report = packet_pump.join().await;
+                    drop(attached);
+                    stopping?;
+                    return finish_clean_stop(stats.report(signal, pump_report)?);
+                }
+                ClientReconnectWaitEvent::PumpStopped(pump_report) => {
+                    stats.record_startup_duration(startup_started.elapsed());
+                    drop(attached);
+                    let _ = notify_systemd("STATUS=FlowWeave VPN client packet pump stopped");
+                    return Err(VpnProductProcessError::ClientPacketPumpStopped(
+                        pump_report.stop_reason,
+                    ));
+                }
+                ClientReconnectWaitEvent::Timer => {}
+            }
+        }
+
+        stats.startup_attempts = stats.startup_attempts.saturating_add(1);
+        let startup = tokio::select! {
+            biased;
+            signal = signals.recv() => ClientConnectEvent::Signal(signal?),
+            runtime = connect_vpn_client_product_endpoint_with_packet_pump(
+                &bootstrap,
+                attached.device(),
+                &packet_pump,
+                VpnProductEndpointLimits::default(),
+            ) => ClientConnectEvent::Complete(runtime.map(Box::new)),
+        };
+        match startup {
+            ClientConnectEvent::Complete(Ok(runtime)) => {
+                let mut runtime = *runtime;
+                if packet_pump.is_finished() {
+                    runtime.request_shutdown();
+                    let _ = runtime.join().await;
+                    let pump_report = packet_pump.join().await;
+                    stats.record_startup_duration(startup_started.elapsed());
+                    drop(attached);
+                    return Err(VpnProductProcessError::ClientPacketPumpStopped(
+                        pump_report.stop_reason,
+                    ));
+                }
+                stats.record_startup_duration(startup_started.elapsed());
+                break runtime;
+            }
+            ClientConnectEvent::Complete(Err(error)) => {
+                stats.startup_failures = stats.startup_failures.saturating_add(1);
+                if !client_connect_error_is_retryable(&error) {
+                    let _ = packet_pump.shutdown().await;
+                    drop(attached);
+                    return Err(VpnProductProcessError::Endpoint(error));
+                }
+                eprintln!("vpn_client_startup_failed:{error}");
+                let _ = notify_systemd(CLIENT_STARTING_STATUS);
+                retry_minimum = Some(endpoint_retry_after(&error));
+            }
+            ClientConnectEvent::Signal(signal) => {
+                stats.record_startup_duration(startup_started.elapsed());
+                let stopping = notify_systemd(STOPPING_NOTIFICATION);
+                packet_pump.request_shutdown();
+                let pump_report = packet_pump.join().await;
+                drop(attached);
+                stopping?;
+                return finish_clean_stop(stats.report(signal, pump_report)?);
+            }
         }
     };
     if let Some(signal) = signals.recv_pending().await? {
         let stopping = notify_systemd(STOPPING_NOTIFICATION);
         runtime.request_shutdown();
         let report = runtime.join().await;
+        if !client_connection_stopped_cleanly(&report) {
+            packet_pump.request_shutdown();
+            let _ = packet_pump.join().await;
+            drop(attached);
+            stopping?;
+            return Err(VpnProductProcessError::ClientShutdownIncomplete);
+        }
+        stats.record_connection(report);
+        packet_pump.request_shutdown();
+        let pump_report = packet_pump.join().await;
         drop(attached);
         stopping?;
-        return finish_client_stop(signal, report);
+        return finish_clean_stop(stats.report(signal, pump_report)?);
     }
     if let Err(error) = emit_ready(VpnProductProcessRole::Client) {
         runtime.request_shutdown();
         let _ = runtime.join().await;
+        packet_pump.request_shutdown();
+        let _ = packet_pump.join().await;
         return Err(error);
     }
 
-    tokio::select! {
-        biased;
-        signal = signals.recv() => {
-            let signal = signal?;
-            let stopping = notify_systemd(STOPPING_NOTIFICATION);
-            runtime.request_shutdown();
-            let report = runtime.join().await;
-            drop(attached);
-            stopping?;
-            finish_client_stop(signal, report)
+    loop {
+        let active_event = tokio::select! {
+            biased;
+            signal = signals.recv() => ClientActiveEvent::Signal(signal?),
+            pump = packet_pump.join() => ClientActiveEvent::PumpStopped(pump),
+            report = runtime.join() => ClientActiveEvent::ConnectionStopped(Box::new(report)),
+        };
+        match active_event {
+            ClientActiveEvent::Signal(signal) => {
+                let stopping = notify_systemd(STOPPING_NOTIFICATION);
+                runtime.request_shutdown();
+                let report = runtime.join().await;
+                if !client_connection_stopped_cleanly(&report) {
+                    packet_pump.request_shutdown();
+                    let _ = packet_pump.join().await;
+                    drop(attached);
+                    stopping?;
+                    return Err(VpnProductProcessError::ClientShutdownIncomplete);
+                }
+                stats.record_connection(report);
+                packet_pump.request_shutdown();
+                let pump_report = packet_pump.join().await;
+                drop(attached);
+                stopping?;
+                return finish_clean_stop(stats.report(signal, pump_report)?);
+            }
+            ClientActiveEvent::PumpStopped(pump_report) => {
+                runtime.request_shutdown();
+                let report = runtime.join().await;
+                stats.record_connection(report);
+                drop(attached);
+                let _ = notify_systemd("STATUS=FlowWeave VPN client packet pump stopped");
+                return Err(VpnProductProcessError::ClientPacketPumpStopped(
+                    pump_report.stop_reason,
+                ));
+            }
+            ClientActiveEvent::ConnectionStopped(report) => {
+                let report = *report;
+                if !client_connection_is_retryable(&report) {
+                    stats.record_connection(report);
+                    packet_pump.request_shutdown();
+                    let _ = packet_pump.join().await;
+                    drop(attached);
+                    let _ = notify_systemd("STATUS=FlowWeave VPN client stopped unexpectedly");
+                    return Err(VpnProductProcessError::UnexpectedClientStop);
+                }
+                eprintln!(
+                    "vpn_client_connection_lost:{:?}",
+                    report.connection.packet_bridge.stop_reason
+                );
+                stats.record_connection(report);
+                let _ = notify_systemd(CLIENT_RECONNECTING_STATUS);
+            }
         }
-        report = runtime.join() => {
-            let _ = report;
-            drop(attached);
-            let _ = notify_systemd("STATUS=FlowWeave VPN client stopped unexpectedly");
-            Err(VpnProductProcessError::UnexpectedClientStop)
+
+        let offline_started = Instant::now();
+        let mut backoff = VpnClientReconnectBackoff::default();
+        let mut minimum_delay = Duration::ZERO;
+        loop {
+            let delay = backoff.next_delay(std::mem::take(&mut minimum_delay));
+            eprintln!("vpn_client_reconnect_waiting:{}", delay.as_millis());
+            let wait_event = tokio::select! {
+                biased;
+                signal = signals.recv() => ClientReconnectWaitEvent::Signal(signal?),
+                pump = packet_pump.join() => ClientReconnectWaitEvent::PumpStopped(pump),
+                _ = sleep(delay) => ClientReconnectWaitEvent::Timer,
+            };
+            match wait_event {
+                ClientReconnectWaitEvent::Signal(signal) => {
+                    stats.record_offline_duration(offline_started.elapsed());
+                    let stopping = notify_systemd(STOPPING_NOTIFICATION);
+                    packet_pump.request_shutdown();
+                    let pump_report = packet_pump.join().await;
+                    drop(attached);
+                    stopping?;
+                    return finish_clean_stop(stats.report(signal, pump_report)?);
+                }
+                ClientReconnectWaitEvent::PumpStopped(pump_report) => {
+                    stats.record_offline_duration(offline_started.elapsed());
+                    drop(attached);
+                    let _ = notify_systemd("STATUS=FlowWeave VPN client packet pump stopped");
+                    return Err(VpnProductProcessError::ClientPacketPumpStopped(
+                        pump_report.stop_reason,
+                    ));
+                }
+                ClientReconnectWaitEvent::Timer => {}
+            }
+
+            stats.reconnect_attempts = stats.reconnect_attempts.saturating_add(1);
+            let connect_event = tokio::select! {
+                biased;
+                signal = signals.recv() => ClientConnectEvent::Signal(signal?),
+                runtime = connect_vpn_client_product_endpoint_with_packet_pump(
+                    &bootstrap,
+                    attached.device(),
+                    &packet_pump,
+                    VpnProductEndpointLimits::default(),
+                ) => ClientConnectEvent::Complete(runtime.map(Box::new)),
+            };
+            match connect_event {
+                ClientConnectEvent::Signal(signal) => {
+                    stats.record_offline_duration(offline_started.elapsed());
+                    let stopping = notify_systemd(STOPPING_NOTIFICATION);
+                    packet_pump.request_shutdown();
+                    let pump_report = packet_pump.join().await;
+                    drop(attached);
+                    stopping?;
+                    return finish_clean_stop(stats.report(signal, pump_report)?);
+                }
+                ClientConnectEvent::Complete(Ok(reconnected)) => {
+                    let reconnected = *reconnected;
+                    if packet_pump.is_finished() {
+                        let mut reconnected = reconnected;
+                        reconnected.request_shutdown();
+                        let report = reconnected.join().await;
+                        stats.record_connection(report);
+                        let pump_report = packet_pump.join().await;
+                        stats.record_offline_duration(offline_started.elapsed());
+                        drop(attached);
+                        return Err(VpnProductProcessError::ClientPacketPumpStopped(
+                            pump_report.stop_reason,
+                        ));
+                    }
+                    runtime = reconnected;
+                    stats.reconnect_successes = stats.reconnect_successes.saturating_add(1);
+                    stats.record_offline_duration(offline_started.elapsed());
+                    let metrics = packet_pump.metrics_snapshot();
+                    eprintln!(
+                        "vpn_client_reconnected:attempts={}:offline_dropped_packets={}:offline_dropped_bytes={}",
+                        stats.reconnect_attempts,
+                        metrics.offline_dropped_packets,
+                        metrics.offline_dropped_bytes
+                    );
+                    let _ = notify_systemd(CLIENT_RECONNECTED_STATUS);
+                    break;
+                }
+                ClientConnectEvent::Complete(Err(error)) => {
+                    stats.reconnect_failures = stats.reconnect_failures.saturating_add(1);
+                    if !client_connect_error_is_retryable(&error) {
+                        stats.record_offline_duration(offline_started.elapsed());
+                        packet_pump.request_shutdown();
+                        let _ = packet_pump.join().await;
+                        drop(attached);
+                        let _ = notify_systemd(CLIENT_RECONNECT_FAILED_STATUS);
+                        return Err(VpnProductProcessError::Endpoint(error));
+                    }
+                    minimum_delay = endpoint_retry_after(&error);
+                    eprintln!("vpn_client_reconnect_failed:{error}");
+                    if packet_pump.is_finished() {
+                        let pump_report = packet_pump.join().await;
+                        stats.record_offline_duration(offline_started.elapsed());
+                        drop(attached);
+                        return Err(VpnProductProcessError::ClientPacketPumpStopped(
+                            pump_report.stop_reason,
+                        ));
+                    }
+                }
+            }
         }
     }
-}
-
-fn finish_pre_ready_stop(
-    role: VpnProductProcessRole,
-    signal: ProductSignal,
-) -> Result<VpnProductProcessReport, VpnProductProcessError> {
-    finish_clean_stop(VpnProductProcessReport {
-        role,
-        stop_signal: map_stop_signal(signal)?,
-        endpoint_drained: true,
-        established_path_count: 0,
-        completed_sessions: 0,
-        packet_bridge_stop_reason: None,
-        identity_reloads: 0,
-        identity_reload_failures: 0,
-    })
 }
 
 fn finish_server_stop(
@@ -541,29 +1020,22 @@ fn finish_server_stop(
             .map(|connection| connection.packet_bridge.stop_reason),
         identity_reloads: reload_counters.succeeded,
         identity_reload_failures: reload_counters.failed,
+        startup_attempts: 0,
+        startup_failures: 0,
+        startup_millis: 0,
+        reconnect_attempts: 0,
+        reconnect_successes: 0,
+        reconnect_failures: 0,
+        offline_millis: 0,
+        offline_dropped_packets: 0,
+        offline_dropped_bytes: 0,
     })
 }
 
-fn finish_client_stop(
-    signal: ProductSignal,
-    report: crate::VpnClientProductEndpointReport,
-) -> Result<VpnProductProcessReport, VpnProductProcessError> {
-    if !report.endpoint_drained
-        || report.connection.packet_bridge.stop_reason
-            != VpnPacketBridgeStopReason::ShutdownRequested
-    {
-        return Err(VpnProductProcessError::ClientShutdownIncomplete);
-    }
-    finish_clean_stop(VpnProductProcessReport {
-        role: VpnProductProcessRole::Client,
-        stop_signal: map_stop_signal(signal)?,
-        endpoint_drained: report.endpoint_drained,
-        established_path_count: report.established_path_count,
-        completed_sessions: 1,
-        packet_bridge_stop_reason: Some(report.connection.packet_bridge.stop_reason),
-        identity_reloads: 0,
-        identity_reload_failures: 0,
-    })
+fn client_connection_stopped_cleanly(report: &crate::VpnClientProductEndpointReport) -> bool {
+    report.endpoint_drained
+        && report.connection.packet_bridge.stop_reason
+            == VpnPacketBridgeStopReason::ShutdownRequested
 }
 
 fn map_stop_signal(
@@ -717,6 +1189,10 @@ mod tests {
             STOPPING_NOTIFICATION,
             SERVER_RELOAD_SUCCEEDED_STATUS,
             SERVER_RELOAD_FAILED_STATUS,
+            CLIENT_STARTING_STATUS,
+            CLIENT_RECONNECTING_STATUS,
+            CLIENT_RECONNECTED_STATUS,
+            CLIENT_RECONNECT_FAILED_STATUS,
         ] {
             assert!(!message.contains("10."));
             assert!(!message.contains("fd"));
@@ -725,6 +1201,90 @@ mod tests {
         }
         assert_eq!(READY_LINE, "ready");
         assert_eq!(STOPPED_LINE, "stopped");
+    }
+
+    #[test]
+    fn reconnect_backoff_is_exponential_jittered_bounded_and_honors_server_minimum() {
+        assert_eq!(
+            reconnect_delay_from_sample(0, 0),
+            Duration::from_millis(250)
+        );
+        assert_eq!(
+            reconnect_delay_from_sample(0, 62),
+            Duration::from_millis(312)
+        );
+        assert_eq!(
+            reconnect_delay_from_sample(1, 0),
+            Duration::from_millis(500)
+        );
+        for step in 0..64 {
+            let delay = reconnect_delay_from_sample(step, u64::MAX - u64::from(step));
+            assert!(delay <= Duration::from_secs(30));
+            if step >= 7 {
+                assert!(delay >= Duration::from_millis(22_500));
+            }
+        }
+
+        let mut backoff = VpnClientReconnectBackoff::default();
+        assert_eq!(
+            backoff.next_delay(Duration::from_secs(45)),
+            Duration::from_secs(45)
+        );
+    }
+
+    #[test]
+    fn client_connect_retries_only_network_and_remote_recoverable_failures() {
+        for error in [
+            VpnProductEndpointError::ClientBind(io::ErrorKind::AddrNotAvailable),
+            VpnProductEndpointError::DnsLookup(io::ErrorKind::TimedOut),
+            VpnProductEndpointError::DnsTimeout,
+            VpnProductEndpointError::NoCompatibleServerAddress,
+            VpnProductEndpointError::ConnectFailed(VpnProductConnectFailure::PeerClosed),
+            VpnProductEndpointError::HandshakeConfirmationTimeout,
+            VpnProductEndpointError::PathOpen(VpnProductPathOpenError::ValidationFailed),
+            VpnProductEndpointError::ProductConnection(
+                VpnProductConnectionStartError::ClientSession(VpnSessionError::ControlTimeout),
+            ),
+        ] {
+            assert!(client_connect_error_is_retryable(&error), "{error}");
+        }
+
+        let retry_reject = VpnProductEndpointError::ProductConnection(
+            VpnProductConnectionStartError::ClientSession(VpnSessionError::Rejected(
+                crate::VpnReject {
+                    reason: VpnRejectReason::IdentityDisabled,
+                    retry_after_secs: 37,
+                },
+            )),
+        );
+        assert!(client_connect_error_is_retryable(&retry_reject));
+        assert_eq!(endpoint_retry_after(&retry_reject), Duration::from_secs(37));
+
+        for error in [
+            VpnProductEndpointError::ClientBind(io::ErrorKind::PermissionDenied),
+            VpnProductEndpointError::DnsLookup(io::ErrorKind::InvalidInput),
+            VpnProductEndpointError::ConnectStart(
+                crate::VpnProductConnectStartError::InvalidServerName,
+            ),
+            VpnProductEndpointError::ConnectFailed(VpnProductConnectFailure::VersionMismatch),
+            VpnProductEndpointError::ConnectFailed(VpnProductConnectFailure::CryptoValidation),
+            VpnProductEndpointError::MultipathNotNegotiated,
+            VpnProductEndpointError::PathOpen(VpnProductPathOpenError::InvalidRemoteAddress),
+            VpnProductEndpointError::ProductConnection(
+                VpnProductConnectionStartError::AssignedAddressMismatch,
+            ),
+            VpnProductEndpointError::ProductConnection(
+                VpnProductConnectionStartError::ClientSession(VpnSessionError::Rejected(
+                    crate::VpnReject {
+                        reason: VpnRejectReason::ProtocolViolation,
+                        retry_after_secs: 30,
+                    },
+                )),
+            ),
+            VpnProductEndpointError::WorkerFailed,
+        ] {
+            assert!(!client_connect_error_is_retryable(&error), "{error}");
+        }
     }
 
     #[test]

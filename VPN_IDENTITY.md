@@ -1,6 +1,6 @@
 # FlowWeave VPN 身份与轮换合同
 
-本文件描述 VPN 模式的身份地基，不替代 [deploy/README.md](deploy/README.md) 的受控试点步骤。仓库现已有非特权 VPN 数据进程、事务化 TUN/路由/NAT helper、Type=notify client/server 单元和同步服务端身份 reload，但 DNS、内部长期重连、完整身份增删工具、真实宿主安装验收与跨版本回退仍未完成。
+本文件描述 VPN 模式的身份地基，不替代 [deploy/README.md](deploy/README.md) 的受控试点步骤。仓库现已有非特权 VPN 数据进程、事务化 TUN/路由/NAT helper、Type=notify client/server 单元、同步服务端身份 reload，以及客户端首次 READY 前后都不缓存旧包的选择性内部重试；但 DNS、网络变化事件唤醒、完整身份增删工具、真实宿主安装验收与跨版本回退仍未完成。
 
 ## 信任链
 
@@ -105,7 +105,7 @@ openssl x509 -in client-cert.pem -outform DER |
 
 - 双指纹同时映射同一身份；增加轮换指纹保持现有会话，删除活动指纹会立即撤销当前代际；
 - 未知、禁用、错误客户端 CA 三类拒绝路径；
-- 重复身份、指纹、虚拟地址、非规范 CIDR和越界 limits；
+- 重复身份、指纹、虚拟地址、非规范 CIDR 和越界 limits；
 - 严格 JSON、重复/未知字段、受保护文件权限和失败重载保留旧状态；
 - 真实 loopback QUIC mTLS 上的 `HELLO/ACCEPT/REJECT`；三连接测试证明失败候选不扰动旧会话，成功候选收到 `ACCEPT` 后才替换；
 - 实际 MPQUIC、DATAGRAM 下限、ALPN、虚拟地址和会话代际检查；
@@ -119,4 +119,4 @@ openssl x509 -in client-cert.pem -outform DER |
 - IPv4/IPv6 严格头检查之后的上行源地址防伪、双向 ACL 与下行错投拒绝；
 - 身份文件失败重载保持活动会话，成功禁用重载原子撤销并关闭当前连接；产品级同步 reload 另验证了双指纹重叠保持真实 TUN 会话、删除活动指纹立即撤销、恢复原身份后新 mTLS 会话可重新建立。
 
-尚未完成完整身份增删/差异预览工具、客户端在线 TLS 身份切换、DNS 接管与回退、内部长期重连、长期多客户端资源攻击/故障注入、真实宿主安装/升级门控，以及 nightly + AddressSanitizer 门控。现有服务端同步 reload、TUN/路由/NAT 事务和 systemd 生命周期只把身份轮换接入受控试点，不能据此证明 VPN 已达到生产可部署标准。
+尚未完成完整身份增删/差异预览工具、客户端在线 TLS 身份切换、DNS 接管与回退、netlink 网络变化提前唤醒、长期多客户端资源攻击/故障注入、真实宿主安装/升级门控，以及 nightly + AddressSanitizer 门控。现有服务端同步 reload、READY 前后客户端内部重试、TUN/路由/NAT 事务和 systemd 生命周期只把身份轮换接入受控试点，不能据此证明 VPN 已达到生产可部署标准。

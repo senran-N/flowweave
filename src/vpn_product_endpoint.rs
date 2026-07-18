@@ -7,7 +7,10 @@ use std::{
     time::Duration,
 };
 
-use noq::{ConnectError, Connection, Endpoint, FourTuple, PathError, PathId, PathStatus};
+use noq::{
+    ConnectError, Connection, ConnectionError, Endpoint, FourTuple, PathError, PathId, PathStatus,
+    TransportErrorCode,
+};
 use tokio::{
     net::lookup_host,
     sync::watch,
@@ -15,6 +18,8 @@ use tokio::{
     time::{Instant, sleep, timeout, timeout_at},
 };
 
+use crate::vpn_packet_bridge::VpnClientPacketPump;
+use crate::vpn_product_runtime::start_vpn_client_product_connection_with_packet_pump;
 use crate::{
     VPN_MAX_CONTROL_HANDSHAKE_TIMEOUT, VpnClientProductBootstrap, VpnClientProductConnectionReport,
     VpnClientProductConnectionRuntime, VpnPacketDevice, VpnProductConnectionStartError,
@@ -146,6 +151,35 @@ pub enum VpnProductPathOpenError {
     InvalidRemoteAddress,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VpnProductConnectFailure {
+    VersionMismatch,
+    TransportUnavailable,
+    TransportProtocol,
+    CryptoValidation,
+    PeerClosed,
+    Reset,
+    TimedOut,
+    LocallyClosed,
+    CidsExhausted,
+}
+
+impl fmt::Display for VpnProductConnectFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::VersionMismatch => "version_mismatch",
+            Self::TransportUnavailable => "transport_unavailable",
+            Self::TransportProtocol => "transport_protocol",
+            Self::CryptoValidation => "crypto_validation",
+            Self::PeerClosed => "peer_closed",
+            Self::Reset => "reset",
+            Self::TimedOut => "timed_out",
+            Self::LocallyClosed => "locally_closed",
+            Self::CidsExhausted => "cids_exhausted",
+        })
+    }
+}
+
 #[derive(Debug)]
 pub enum VpnProductEndpointError {
     Limits(VpnProductEndpointLimitsError),
@@ -156,7 +190,7 @@ pub enum VpnProductEndpointError {
     DnsTimeout,
     NoCompatibleServerAddress,
     ConnectStart(VpnProductConnectStartError),
-    ConnectFailed,
+    ConnectFailed(VpnProductConnectFailure),
     ConnectTimeout,
     HandshakeConfirmationFailed,
     HandshakeConfirmationTimeout,
@@ -189,6 +223,9 @@ impl fmt::Display for VpnProductEndpointError {
             Self::PathOpen(error) => {
                 write!(formatter, "vpn_product_endpoint_path_open:{error:?}")
             }
+            Self::ConnectFailed(error) => {
+                write!(formatter, "vpn_product_endpoint_connect_failed:{error}")
+            }
             Self::ProductConnection(error) => {
                 write!(formatter, "vpn_product_endpoint_connection:{error}")
             }
@@ -197,7 +234,6 @@ impl fmt::Display for VpnProductEndpointError {
                 Self::NoCompatibleServerAddress => {
                     "vpn_product_endpoint_no_compatible_server_address"
                 }
-                Self::ConnectFailed => "vpn_product_endpoint_connect_failed",
                 Self::ConnectTimeout => "vpn_product_endpoint_connect_timeout",
                 Self::HandshakeConfirmationFailed => {
                     "vpn_product_endpoint_handshake_confirmation_failed"
@@ -216,6 +252,7 @@ impl fmt::Display for VpnProductEndpointError {
                 | Self::LocalAddress(_)
                 | Self::DnsLookup(_)
                 | Self::ConnectStart(_)
+                | Self::ConnectFailed(_)
                 | Self::PathOpen(_)
                 | Self::ProductConnection(_) => unreachable!(),
             }),
@@ -670,6 +707,24 @@ pub async fn connect_vpn_client_product_endpoint(
     device: &VpnPacketDevice,
     limits: VpnProductEndpointLimits,
 ) -> Result<VpnClientProductEndpointRuntime, VpnProductEndpointError> {
+    connect_vpn_client_product_endpoint_inner(bootstrap, device, None, limits).await
+}
+
+pub(crate) async fn connect_vpn_client_product_endpoint_with_packet_pump(
+    bootstrap: &VpnClientProductBootstrap,
+    device: &VpnPacketDevice,
+    packet_pump: &VpnClientPacketPump,
+    limits: VpnProductEndpointLimits,
+) -> Result<VpnClientProductEndpointRuntime, VpnProductEndpointError> {
+    connect_vpn_client_product_endpoint_inner(bootstrap, device, Some(packet_pump), limits).await
+}
+
+async fn connect_vpn_client_product_endpoint_inner(
+    bootstrap: &VpnClientProductBootstrap,
+    device: &VpnPacketDevice,
+    packet_pump: Option<&VpnClientPacketPump>,
+    limits: VpnProductEndpointLimits,
+) -> Result<VpnClientProductEndpointRuntime, VpnProductEndpointError> {
     validate_limits(limits)?;
     let addresses = resolve_server_addresses(bootstrap, limits).await?;
     let mut last_error = VpnProductEndpointError::NoCompatibleServerAddress;
@@ -677,14 +732,28 @@ pub async fn connect_vpn_client_product_endpoint(
     for server_addr in addresses {
         match connect_vpn_client_address(bootstrap, server_addr, limits).await {
             Ok((endpoint, connection, local_addr, established_path_count)) => {
-                let runtime = match start_vpn_client_product_connection(
-                    bootstrap,
-                    connection,
-                    device,
-                    limits.control_timeout,
-                )
-                .await
-                {
+                let start_result = match packet_pump {
+                    Some(packet_pump) => {
+                        start_vpn_client_product_connection_with_packet_pump(
+                            bootstrap,
+                            connection,
+                            device,
+                            limits.control_timeout,
+                            packet_pump,
+                        )
+                        .await
+                    }
+                    None => {
+                        start_vpn_client_product_connection(
+                            bootstrap,
+                            connection,
+                            device,
+                            limits.control_timeout,
+                        )
+                        .await
+                    }
+                };
+                let runtime = match start_result {
                     Ok(runtime) => runtime,
                     Err(error) => {
                         endpoint.close(
@@ -773,7 +842,7 @@ async fn connect_vpn_client_address(
         let connection = timeout_at(deadline, connecting)
             .await
             .map_err(|_| VpnProductEndpointError::ConnectTimeout)?
-            .map_err(|_| VpnProductEndpointError::ConnectFailed)?;
+            .map_err(|error| VpnProductEndpointError::ConnectFailed(map_connection_error(error)))?;
         timeout_at(deadline, connection.handshake_confirmed())
             .await
             .map_err(|_| VpnProductEndpointError::HandshakeConfirmationTimeout)?
@@ -865,6 +934,31 @@ fn map_connect_error(error: ConnectError) -> VpnProductConnectStartError {
         ConnectError::InvalidRemoteAddress(_) => VpnProductConnectStartError::InvalidRemoteAddress,
         ConnectError::NoDefaultClientConfig => VpnProductConnectStartError::MissingClientConfig,
         ConnectError::UnsupportedVersion => VpnProductConnectStartError::UnsupportedVersion,
+    }
+}
+
+fn map_connection_error(error: ConnectionError) -> VpnProductConnectFailure {
+    match error {
+        ConnectionError::VersionMismatch => VpnProductConnectFailure::VersionMismatch,
+        ConnectionError::TransportError(error) => {
+            let code = u64::from(error.code);
+            if error.crypto.is_some() || (0x100..0x200).contains(&code) {
+                VpnProductConnectFailure::CryptoValidation
+            } else if error.code == TransportErrorCode::CONNECTION_REFUSED
+                || error.code == TransportErrorCode::NO_VIABLE_PATH
+            {
+                VpnProductConnectFailure::TransportUnavailable
+            } else {
+                VpnProductConnectFailure::TransportProtocol
+            }
+        }
+        ConnectionError::ConnectionClosed(_) | ConnectionError::ApplicationClosed(_) => {
+            VpnProductConnectFailure::PeerClosed
+        }
+        ConnectionError::Reset => VpnProductConnectFailure::Reset,
+        ConnectionError::TimedOut => VpnProductConnectFailure::TimedOut,
+        ConnectionError::LocallyClosed => VpnProductConnectFailure::LocallyClosed,
+        ConnectionError::CidsExhausted => VpnProductConnectFailure::CidsExhausted,
     }
 }
 
@@ -1027,7 +1121,10 @@ mod tests {
         let busy_error = connect_vpn_client_product_endpoint(&client, &client_device, limits)
             .await
             .unwrap_err();
-        assert!(matches!(busy_error, VpnProductEndpointError::ConnectFailed));
+        assert!(matches!(
+            busy_error,
+            VpnProductEndpointError::ConnectFailed(VpnProductConnectFailure::PeerClosed)
+        ));
         let first_report = first.shutdown().await;
         assert_eq!(first_report.established_path_count, 2);
         assert!(first_report.endpoint_drained);
@@ -1155,7 +1252,10 @@ mod tests {
         let error = connect_vpn_client_product_endpoint(&client, &client_device, limits)
             .await
             .unwrap_err();
-        assert!(matches!(error, VpnProductEndpointError::ConnectFailed));
+        assert!(matches!(
+            error,
+            VpnProductEndpointError::ConnectFailed(VpnProductConnectFailure::CryptoValidation)
+        ));
         let report = server_runtime.shutdown().await.unwrap();
         assert_eq!(report.completed_sessions, 0);
         assert_eq!(report.runtime_start_failures, 0);

@@ -169,9 +169,12 @@ pub use vpn_network::{
 };
 #[cfg(target_os = "linux")]
 pub use vpn_packet_bridge::{
-    VpnPacketBridge, VpnPacketBridgeConfig, VpnPacketBridgeConfigError, VpnPacketBridgeMetrics,
+    VpnClientPacketPump, VpnClientPacketPumpAttachError, VpnClientPacketPumpReport,
+    VpnClientPacketPumpStartError, VpnClientPacketPumpStopReason, VpnPacketBridge,
+    VpnPacketBridgeConfig, VpnPacketBridgeConfigError, VpnPacketBridgeMetrics,
     VpnPacketBridgeMetricsSnapshot, VpnPacketBridgeReport, VpnPacketBridgeStartError,
-    VpnPacketBridgeStopReason, VpnPacketDevice, start_vpn_packet_bridge,
+    VpnPacketBridgeStopReason, VpnPacketDevice, start_vpn_client_packet_pump,
+    start_vpn_packet_bridge,
 };
 pub use vpn_product_config::{
     VPN_PRODUCT_CONFIG_MAX_BYTES, VPN_PRODUCT_CONFIG_VERSION, VPN_PRODUCT_MAX_EXPLICIT_PATHS,
@@ -185,11 +188,11 @@ pub use vpn_product_endpoint::{
     VPN_CLOSE_PRODUCT_ENDPOINT_START_FAILED, VPN_CLOSE_PRODUCT_ENDPOINT_STOPPED,
     VPN_PRODUCT_ENDPOINT_DEFAULT_CONNECT_ATTEMPTS, VPN_PRODUCT_ENDPOINT_DEFAULT_CONTROL_TIMEOUT,
     VPN_PRODUCT_ENDPOINT_DEFAULT_DRAIN_TIMEOUT, VPN_PRODUCT_ENDPOINT_DEFAULT_OPERATION_TIMEOUT,
-    VpnClientProductEndpointReport, VpnClientProductEndpointRuntime, VpnProductConnectStartError,
-    VpnProductEndpointError, VpnProductEndpointLimits, VpnProductEndpointLimitsError,
-    VpnProductPathOpenError, VpnServerProductEndpointReport, VpnServerProductEndpointRuntime,
-    VpnServerProductEndpointStopReason, connect_vpn_client_product_endpoint,
-    start_vpn_server_product_endpoint,
+    VpnClientProductEndpointReport, VpnClientProductEndpointRuntime, VpnProductConnectFailure,
+    VpnProductConnectStartError, VpnProductEndpointError, VpnProductEndpointLimits,
+    VpnProductEndpointLimitsError, VpnProductPathOpenError, VpnServerProductEndpointReport,
+    VpnServerProductEndpointRuntime, VpnServerProductEndpointStopReason,
+    connect_vpn_client_product_endpoint, start_vpn_server_product_endpoint,
 };
 #[cfg(target_os = "linux")]
 pub use vpn_product_process::{

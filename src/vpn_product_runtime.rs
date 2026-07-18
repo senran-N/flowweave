@@ -20,7 +20,10 @@ use noq::{
     },
 };
 
-use crate::vpn_packet_bridge::start_vpn_packet_bridge_with_completion_guard;
+use crate::vpn_packet_bridge::{
+    VpnClientPacketPump, start_vpn_packet_bridge_with_client_pump,
+    start_vpn_packet_bridge_with_completion_guard,
+};
 use crate::{
     MultipathScheduler, PtoRecovery, QuicCongestion, VPN_CAP_IPV4, VPN_CAP_IPV6,
     VPN_REQUIRED_CAPABILITIES, VPN_WIRE_VERSION_V1, VpnClientDataPathConfig,
@@ -702,6 +705,7 @@ pub async fn start_vpn_server_product_connection(
         VpnDatagramRole::Server,
         accept,
         device.clone(),
+        None,
         lease.clone(),
     ) {
         Ok(bridge) => bridge,
@@ -735,6 +739,40 @@ pub async fn start_vpn_client_product_connection(
     device: &VpnPacketDevice,
     handshake_timeout: Duration,
 ) -> Result<VpnClientProductConnectionRuntime, VpnProductConnectionStartError> {
+    start_vpn_client_product_connection_inner(
+        bootstrap,
+        connection,
+        device,
+        handshake_timeout,
+        None,
+    )
+    .await
+}
+
+pub(crate) async fn start_vpn_client_product_connection_with_packet_pump(
+    bootstrap: &VpnClientProductBootstrap,
+    connection: Connection,
+    device: &VpnPacketDevice,
+    handshake_timeout: Duration,
+    packet_pump: &VpnClientPacketPump,
+) -> Result<VpnClientProductConnectionRuntime, VpnProductConnectionStartError> {
+    start_vpn_client_product_connection_inner(
+        bootstrap,
+        connection,
+        device,
+        handshake_timeout,
+        Some(packet_pump),
+    )
+    .await
+}
+
+async fn start_vpn_client_product_connection_inner(
+    bootstrap: &VpnClientProductBootstrap,
+    connection: Connection,
+    device: &VpnPacketDevice,
+    handshake_timeout: Duration,
+    packet_pump: Option<&VpnClientPacketPump>,
+) -> Result<VpnClientProductConnectionRuntime, VpnProductConnectionStartError> {
     let Some(lease) = bootstrap.acquire_runtime() else {
         close_runtime_start_failed(&connection);
         return Err(VpnProductConnectionStartError::RuntimeAlreadyActive);
@@ -756,6 +794,7 @@ pub async fn start_vpn_client_product_connection(
         VpnDatagramRole::Client,
         accept,
         device.clone(),
+        packet_pump,
         lease.clone(),
     )
     .inspect_err(|_| close_runtime_start_failed(&connection))?;
@@ -775,6 +814,7 @@ fn start_product_packet_bridge(
     role: VpnDatagramRole,
     accept: crate::VpnAccept,
     device: VpnPacketDevice,
+    client_packet_pump: Option<&VpnClientPacketPump>,
     lease: VpnProductRuntimeLease,
 ) -> Result<VpnPacketBridge, VpnProductConnectionStartError> {
     let datagram_config = VpnDatagramRuntimeConfig::from_accept(role, accept)
@@ -783,8 +823,15 @@ fn start_product_packet_bridge(
         .map_err(VpnProductConnectionStartError::DatagramRuntime)?;
     let bridge_config = VpnPacketBridgeConfig::new(usize::from(accept.max_ip_packet_len))
         .map_err(VpnProductConnectionStartError::PacketBridgeConfig)?;
-    start_vpn_packet_bridge_with_completion_guard(device, runtime, bridge_config, lease)
-        .map_err(VpnProductConnectionStartError::PacketBridgeRuntime)
+    match client_packet_pump {
+        Some(pump) => {
+            start_vpn_packet_bridge_with_client_pump(device, runtime, bridge_config, pump, lease)
+        }
+        None => {
+            start_vpn_packet_bridge_with_completion_guard(device, runtime, bridge_config, lease)
+        }
+    }
+    .map_err(VpnProductConnectionStartError::PacketBridgeRuntime)
 }
 
 fn client_accept_addresses_match(
