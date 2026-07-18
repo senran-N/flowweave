@@ -109,4 +109,8 @@ cargo run --release --bin flowweave-proxy-observe -- \
 
 实验室结果不等于生产 SLA。仓库已有默认 60 秒的单机真实 TLS/MPQUIC soak、可配置 JSONL 阈值检查、共享令牌无重启轮换，以及带限速、应用字节预算和周期检查点的公网 workload/echo 部署入口；现已完成同一物理出口下“两张接口 + 两条源路由 + 两个 NAT”的 30 分钟真实公网双路径 soak。VPN 已完成逐客户端身份、活动代际、在线撤销、按身份分片的数据热路径、外层 `FWI1` 准入、真实重组、原子全局账本和双向 ACL；客户端会精确比对 `FWC1 ACCEPT` 中的四个隧道地址，并让协商后的最大 IP 包和 DATAGRAM 长度实际约束双方数据面。独立 `flowweave-vpn server|client` 现已把严格配置、TUN 附着、Endpoint、READY、systemd notify 和信号收敛组成非特权产品生命周期；隔离内核门控以无 capability、启用 `NoNewPrivileges` 的 UID 1000 串通真实 TUN 上的双栈 UDP、256 KiB TCP 半关闭、双栈大 ICMP、精确/超 MTU、连续代际、正常停止、外层失联非零退出和 `SIGKILL` 清理。两端 TUN、客户端 policy routes 与显式服务端 forwarding/NAT 都由独立 root helper 从同一严格配置和 identity registry 事务化派生；三 namespace 门控证明 IPv4 internet 端只看到服务端出口地址，IPv6 无 NAT 时保留客户端隧道源地址。专用门控还验证并发锁、配置/状态/nft 表达式漂移、模拟 `activating|deactivating` 崩溃恢复、sysctl 原值恢复、活动 fd 拒绝 cleanup、同名外部接口和既有 nft table 保护，以及 TUN/route/rule/nft 冲突完整回滚。Type=notify 安装单元和真实 user-systemd 生命周期门控现已进一步证明 READY 后才激活网络，并在启动失败、运行故障和正常停止后按 `deactivate → cleanup` 收敛；同步服务端身份 reload 又证明坏候选不扰动旧真实会话、双指纹重叠不掉线、活动指纹撤销立即关闭旧连接，并拒绝与既有 TUN/nft 计划不兼容的地址或 enabled 集合变化。上述实验都没有修改主网络空间，也尚未在真实宿主执行特权安装验收。DNS、客户端内部长期重连、客户端在线证书切换和多路径恢复仍未完成，因此当前 VPN 只适合带恢复通道的受控试点。两个独立运营商出口只保留为运营商级故障隔离声明边界；多小时/多天证据、跨版本升级、外部指标存储与告警投递仍待完成。C 组编码器目前也是实验入口，不是通用实时媒体协议。
 
-本仓库当前尚未声明开源许可证；在许可证确定前，不应把第三方许可证误认为 FlowWeave 自身的授权。
+## 许可证
+
+Copyright 2026 senran-N。
+
+FlowWeave 以 [Apache License 2.0](LICENSE) 开源。`third_party/` 中的第三方源码保留各自的许可证，来源、版本和修改说明见 [third_party/README.md](third_party/README.md)。

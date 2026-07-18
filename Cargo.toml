@@ -5,6 +5,7 @@ edition = "2024"
 rust-version = "1.88"
 publish = false
 description = "FlowWeave experimental multipath QUIC transport and fixed-target TCP proxy"
+license = "Apache-2.0"
 readme = "README.md"
 
 [features]
