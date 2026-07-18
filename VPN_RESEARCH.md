@@ -16,11 +16,11 @@
 | --- | --- | --- |
 | 数据面 | `FWI1`、真实重组、有界队列、双方 NoQ DATAGRAM、包设备桥接和真实 TUN 已在隔离三 namespace 中串通 UDP、TCP、双栈 ICMP、精确 MTU、连续代际、外层失联、READY 后 policy routing、IPv4 NAT 与 IPv6 无 NAT | 更完整故障矩阵和无全局队头阻塞 |
 | 身份 | mTLS、证书指纹、双证书轮换、禁用、在线撤销和同步服务端身份重载已完成；独立产品进程在 READY 前装配并交叉验证证书、私钥、CA 与身份预算 | 完整身份增删/差异预览工具、客户端在线 TLS 身份切换和长期多客户端攻击门控 |
-| 会话 | 单活动代际、成功后替换、地址漂移拒绝、启动失败回滚、进程级唯一 TUN reader、离线包丢弃计数，以及首次 READY 前后 250 ms～30 秒随机指数退避重连已完成；真实门控覆盖客户端先启动/服务端后出现、身份恢复、外层 link down/up 和服务端重启，systemd 启动截止会收敛始终未 READY 的激活 | 网络事件提前唤醒、NAT rebinding/原位路径重建专项门控和客户端在线 TLS 身份切换 |
+| 会话 | 单活动代际、成功后替换、地址漂移拒绝、启动失败回滚、进程级唯一 TUN reader、离线包丢弃计数、首次 READY 前后 250 ms～30 秒随机指数退避重连，以及非特权 netlink 恢复事件提前唤醒已完成；真实门控覆盖客户端先启动/服务端后出现、身份恢复、外层 link down/up、至少 8 秒退避的事件唤醒和服务端重启，systemd 启动截止会收敛始终未 READY 的激活 | NAT rebinding/原位路径重建专项门控和客户端在线 TLS 身份切换 |
 | 地址与策略 | 静态虚拟 IPv4/IPv6、源地址防伪、双向 ACL、每身份配额、客户端 `ACCEPT` 工厂、独立 TUN 路由表，以及只匹配启用身份精确地址的服务端 forwarding/NAT 已完成隔离验证 | 管理流量豁免策略和 DNS 接管 |
 | 权限 | 非 root、无可重新启用的 `CAP_NET_ADMIN`、`NoNewPrivileges` 数据进程只附着既有 TUN 的边界已实测；独立 root helper 已事务化准备/清理 TUN，并激活/撤销 client policy routes 与 server nft/sysctl；Type=notify 安装单元只让短命 `+` helper 获得 root | 真实宿主特权安装验收、发行版兼容和升级/回退权限审计 |
 | 运维 | fixed-tcp 首次安装/systemd/JSONL/健康门控；VPN 已有非特权产品命令、严格 READY/systemd notify、版本化网络事务、client/server 安装单元和失败恢复说明 | DNS、升级迁移、自动回退、配置检查和告警出口 |
-| 验证 | fixed-tcp soak、真实 mTLS/FWC1/DATAGRAM loopback，隔离真实 TUN 的 UDP/TCP/ICMP/MTU/`SIGKILL`，产品进程 READY/正常停止/离线停止，UID 外层逃生，IPv4 NAT/IPv6 无 NAT，身份 reload、原 PID 身份恢复、外层链路恢复、服务端重启，route/rule/nft/sysctl 冲突、漂移和崩溃恢复，以及真实 user-systemd 生命周期与同步 reload | 多路径切换、NAT rebinding、独立出口、多日和跨版本门控 |
+| 验证 | fixed-tcp soak、真实 mTLS/FWC1/DATAGRAM loopback，隔离真实 TUN 的 UDP/TCP/ICMP/MTU/`SIGKILL`，产品进程 READY/正常停止/离线停止，UID 外层逃生，IPv4 NAT/IPv6 无 NAT，身份 reload、原 PID 身份恢复、外层链路与 netlink 提前唤醒、服务端重启，route/rule/nft/sysctl 冲突、漂移和崩溃恢复，以及真实 user-systemd 生命周期与同步 reload | 多路径切换、NAT rebinding、独立出口、多日和跨版本门控 |
 
 因此不能复用 `FWX1` 冒充 VPN。VPN 使用独立 ALPN、独立配置类型和独立线协议；固定代理保持兼容。
 
@@ -143,7 +143,7 @@ body[body_len]
 
 ### 重连与离线行为
 
-客户端保持 TUN 存活并由内部 supervisor 重连：初始 250 ms、指数增长到 30 秒、加入随机抖动，网络恢复事件可提前唤醒。不得无限缓存离线流量：发送队列按包数和字节双重限制，满或断线时丢弃并增加稳定指标。重连成功后不重放旧 IP 包。
+客户端保持 TUN 存活并由内部 supervisor 重连：初始 250 ms、指数增长到 30 秒、加入随机抖动。非特权 `NETLINK_ROUTE` 监听只把 link 可用、地址/路由新增或事件丢失当作“值得重新验证”的提示；至少保留 250 ms 防抖且不得绕过服务端更长 retry-after。监听创建、读取或解析失败时记录脱敏计数并停用监听，原定时器继续保证进展。不得无限缓存离线流量：发送队列按包数和字节双重限制，满或断线时丢弃并增加稳定指标。重连成功后不重放旧 IP 包。
 
 服务端地址重新解析、证书验证、全部配置路径验证和会话建立都必须重新执行。不得在失败时关闭 TLS 校验、静默退化到单路径后仍报告多路径已配置，或切换到未授权服务器。
 
@@ -441,7 +441,19 @@ M2.3 第二小步固定为“首次 READY 前的选择性内部重试与 systemd
 - `scripts/run_vpn_tun_lab.sh` 先启动真实非特权客户端，在服务端进程不存在时确认至少一次 `vpn_client_startup_failed` 且没有 `ready`；随后启动服务端，同一客户端 PID 重新完成 DNS、TLS 1.3 mTLS、MPQUIC 全路径、`FWC1`、DATAGRAM 和 packet-pump attachment，只输出一次 `ready`，之后双栈流量、路由/NAT、身份恢复和后续重连矩阵继续全部通过。
 - `scripts/run_vpn_systemd_lab.sh` 的真实 user-systemd 临时 unit 新增 READY 前超时场景：启动截止发送 SIGTERM 后数据进程先记录停止，随后严格执行 `deactivate → cleanup`；正常、立即失败、activate 失败、运行中异常退出和 reload 成败矩阵继续通过。
 
-仍未完成：netlink 网络变化提前唤醒、已连接 QUIC 的原位路径增删/NAT rebinding 专项观测、客户端 SIGHUP 重新读取证书/私钥并安全切换、长期静默与多客户端故障矩阵。前两小步只关闭“首次和后续连接能否安全重建、旧包是否重放、systemd 启动怎样收敛”的基础合同，不等于 M2.3 完成。
+M2.3 第三小步固定为“网络恢复事件提前唤醒，但完整重连合同不变”：
+
+- 客户端以非特权 `AF_NETLINK/NETLINK_ROUTE` socket 订阅 link、IPv4/IPv6 address 和 route 组，不启动 `ip monitor` 子进程，也不要求 `CAP_NET_ADMIN`。接收缓冲固定为 64 KiB；multipart `nlmsghdr` 长度、4 字节对齐和 link/address/route 最小 UAPI 头都严格校验。只有同时为 administratively up 且有 carrier 的 `RTM_NEWLINK`、`RTM_NEWADDR`、`RTM_NEWROUTE` 或事件丢失提示可唤醒，删除/down 事件只排空。
+- 在线主循环持续消费恢复事件，避免 READY 后 route activation 变成未来的陈旧提示。离线等待为事件保留至少 250 ms 防抖；服务端 `retry_after_secs` 比它更长时继续作为不可绕过下限。事件只结束当前等待，随后仍从头解析 DNS、创建 Endpoint、执行标准 TLS 名称/证书校验、建立全部显式路径并完成 `FWC1`；任何一步失败继续进入下一阶退避。
+- socket 创建或后续接收/解析失败不会使 VPN 失效：进程记录 `network_event_monitor_failures` 并禁用本轮监听，原随机定时器仍可恢复服务端重启、身份恢复和没有内核网络变化的故障。进程报告另累计 `network_event_wakeups`，journal 使用不含接口名、地址或身份的稳定 `vpn_client_retry_network_event:<startup|reconnect>:<kind>`。
+
+第三小步实现证据：
+
+- 5 项确定性解析测试覆盖 operational link、down/delete 忽略、IPv4/IPv6 共用的 address/route 新增、overrun、multipart 对齐、截断/伪造长度拒绝和稳定脱敏事件名；退避测试锁定 250 ms 事件防抖及 37/45 秒服务端下限。根项目非忽略门禁现为 `230/230`。
+- `scripts/run_vpn_tun_lab.sh` 让真实非特权客户端在 `fwclient0` down 后保持原 PID 和 route，等待 `vpn_client_reconnect_waiting` 增长到至少 8 秒才把 veth 置 up；客户端必须先输出真实 `vpn_client_retry_network_event:reconnect:link_available`，随后原 PID 完成严格 mTLS/MPQUIC/FWC1、恢复双栈流量。若只靠定时器到期或监听权限不足，本门控会失败。
+- 同一纵切随后停止/重启服务端并在第二次离线时 SIGTERM 客户端，证明没有 netlink 变化时定时器兜底和有界停止语义均未回归；全部网络对象仍只存在于一次性 namespace。
+
+仍未完成：已连接 QUIC 的原位路径增删/NAT rebinding 专项观测、客户端 SIGHUP 重新读取证书/私钥并安全切换、长期静默与多客户端故障矩阵。前三小步关闭了“首次和后续连接能否安全重建、旧包是否重放、等待能否由真实网络恢复安全缩短、systemd 启动怎样收敛”的基础合同，仍不等于 M2.3 完成。
 
 ### M2.4：运维产品化
 

@@ -25,6 +25,7 @@ use tokio::{
     time::{Instant, sleep, timeout},
 };
 
+use crate::vpn_network_event::{VpnNetworkEventMonitor, VpnNetworkRecoveryEvent};
 use crate::vpn_packet_bridge::{
     VpnClientPacketPumpReport, VpnClientPacketPumpStartError, VpnClientPacketPumpStopReason,
     start_vpn_client_packet_pump,
@@ -87,6 +88,8 @@ pub struct VpnProductProcessReport {
     pub reconnect_attempts: u64,
     pub reconnect_successes: u64,
     pub reconnect_failures: u64,
+    pub network_event_wakeups: u64,
+    pub network_event_monitor_failures: u64,
     pub offline_millis: u64,
     pub offline_dropped_packets: u64,
     pub offline_dropped_bytes: u64,
@@ -503,6 +506,8 @@ struct ClientSupervisorStats {
     reconnect_attempts: u64,
     reconnect_successes: u64,
     reconnect_failures: u64,
+    network_event_wakeups: u64,
+    network_event_monitor_failures: u64,
     offline_millis: u64,
 }
 
@@ -519,6 +524,8 @@ impl ClientSupervisorStats {
             reconnect_attempts: 0,
             reconnect_successes: 0,
             reconnect_failures: 0,
+            network_event_wakeups: 0,
+            network_event_monitor_failures: 0,
             offline_millis: 0,
         }
     }
@@ -562,6 +569,8 @@ impl ClientSupervisorStats {
             reconnect_attempts: self.reconnect_attempts,
             reconnect_successes: self.reconnect_successes,
             reconnect_failures: self.reconnect_failures,
+            network_event_wakeups: self.network_event_wakeups,
+            network_event_monitor_failures: self.network_event_monitor_failures,
             offline_millis: self.offline_millis,
             offline_dropped_packets: pump.metrics.offline_dropped_packets,
             offline_dropped_bytes: pump.metrics.offline_dropped_bytes,
@@ -574,17 +583,33 @@ struct VpnClientReconnectBackoff {
     step: u32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct VpnClientRetrySchedule {
+    timer_delay: Duration,
+    network_event_delay: Duration,
+}
+
 impl VpnClientReconnectBackoff {
-    fn next_delay(&mut self, minimum: Duration) -> Duration {
+    fn next_schedule(&mut self, minimum: Duration) -> VpnClientRetrySchedule {
         let mut sample = [0_u8; 8];
         let random_sample = if SystemRandom::new().fill(&mut sample).is_ok() {
             u64::from_ne_bytes(sample)
         } else {
             0
         };
-        let delay = reconnect_delay_from_sample(self.step, random_sample).max(minimum);
+        let randomized_delay = reconnect_delay_from_sample(self.step, random_sample);
         self.step = self.step.saturating_add(1);
-        delay
+        reconnect_schedule(randomized_delay, minimum)
+    }
+}
+
+fn reconnect_schedule(randomized_delay: Duration, minimum: Duration) -> VpnClientRetrySchedule {
+    VpnClientRetrySchedule {
+        timer_delay: randomized_delay.max(minimum),
+        // A changing link must not create a tight retry loop and must never bypass a server
+        // retry-after. The ordinary timer remains the fallback if no event arrives.
+        network_event_delay: Duration::from_millis(VPN_CLIENT_RECONNECT_INITIAL_DELAY_MS)
+            .max(minimum),
     }
 }
 
@@ -713,12 +738,84 @@ enum ClientActiveEvent {
     Signal(ProductSignal),
     PumpStopped(VpnClientPacketPumpReport),
     ConnectionStopped(Box<crate::VpnClientProductEndpointReport>),
+    NetworkEvent(io::Result<VpnNetworkRecoveryEvent>),
 }
 
 enum ClientReconnectWaitEvent {
     Signal(ProductSignal),
     PumpStopped(VpnClientPacketPumpReport),
     Timer,
+    NetworkEvent(VpnNetworkRecoveryEvent),
+}
+
+async fn wait_for_client_retry(
+    signals: &mut ProductSignals,
+    packet_pump: &mut crate::VpnClientPacketPump,
+    network_event_monitor: &mut Option<VpnNetworkEventMonitor>,
+    stats: &mut ClientSupervisorStats,
+    schedule: VpnClientRetrySchedule,
+) -> Result<ClientReconnectWaitEvent, VpnProductProcessError> {
+    let timer = sleep(schedule.timer_delay);
+    tokio::pin!(timer);
+    loop {
+        let event = tokio::select! {
+            biased;
+            signal = signals.recv() => ClientReconnectWaitEvent::Signal(signal?),
+            pump = packet_pump.join() => ClientReconnectWaitEvent::PumpStopped(pump),
+            _ = &mut timer => ClientReconnectWaitEvent::Timer,
+            event = wait_for_network_recovery_event(
+                network_event_monitor,
+                schedule.network_event_delay,
+            ) => match event {
+                Ok(event) => ClientReconnectWaitEvent::NetworkEvent(event),
+                Err(error) => {
+                    stats.network_event_monitor_failures =
+                        stats.network_event_monitor_failures.saturating_add(1);
+                    eprintln!("vpn_client_network_event_monitor_failed:{:?}", error.kind());
+                    *network_event_monitor = None;
+                    continue;
+                }
+            },
+        };
+        if matches!(event, ClientReconnectWaitEvent::NetworkEvent(_)) {
+            stats.network_event_wakeups = stats.network_event_wakeups.saturating_add(1);
+        }
+        return Ok(event);
+    }
+}
+
+async fn wait_for_network_recovery_event(
+    monitor: &mut Option<VpnNetworkEventMonitor>,
+    minimum_delay: Duration,
+) -> io::Result<VpnNetworkRecoveryEvent> {
+    if !minimum_delay.is_zero() {
+        sleep(minimum_delay).await;
+    }
+    wait_for_network_event(monitor).await
+}
+
+async fn wait_for_network_event(
+    monitor: &mut Option<VpnNetworkEventMonitor>,
+) -> io::Result<VpnNetworkRecoveryEvent> {
+    match monitor {
+        Some(monitor) => monitor.wait_for_recovery_event().await,
+        None => std::future::pending().await,
+    }
+}
+
+fn discard_pending_network_events(
+    monitor: &mut Option<VpnNetworkEventMonitor>,
+    stats: &mut ClientSupervisorStats,
+) {
+    let error = monitor
+        .as_mut()
+        .and_then(|monitor| monitor.discard_pending().err());
+    if let Some(error) = error {
+        stats.network_event_monitor_failures =
+            stats.network_event_monitor_failures.saturating_add(1);
+        eprintln!("vpn_client_network_event_monitor_failed:{:?}", error.kind());
+        *monitor = None;
+    }
 }
 
 pub async fn run_vpn_client_product_process(
@@ -731,19 +828,36 @@ pub async fn run_vpn_client_product_process(
     let mut packet_pump =
         start_vpn_client_packet_pump(attached.device().clone(), bootstrap.packet_bridge_config())?;
     let mut stats = ClientSupervisorStats::new();
+    let mut network_event_monitor = match VpnNetworkEventMonitor::start() {
+        Ok(monitor) => Some(monitor),
+        Err(error) => {
+            stats.network_event_monitor_failures =
+                stats.network_event_monitor_failures.saturating_add(1);
+            eprintln!(
+                "vpn_client_network_event_monitor_unavailable:{:?}",
+                error.kind()
+            );
+            None
+        }
+    };
     let startup_started = Instant::now();
     let mut startup_backoff = VpnClientReconnectBackoff::default();
     let mut retry_minimum = None;
     let mut runtime = loop {
         if let Some(minimum) = retry_minimum.take() {
-            let delay = startup_backoff.next_delay(minimum);
-            eprintln!("vpn_client_startup_waiting:{}", delay.as_millis());
-            let wait_event = tokio::select! {
-                biased;
-                signal = signals.recv() => ClientReconnectWaitEvent::Signal(signal?),
-                pump = packet_pump.join() => ClientReconnectWaitEvent::PumpStopped(pump),
-                _ = sleep(delay) => ClientReconnectWaitEvent::Timer,
-            };
+            let schedule = startup_backoff.next_schedule(minimum);
+            eprintln!(
+                "vpn_client_startup_waiting:{}",
+                schedule.timer_delay.as_millis()
+            );
+            let wait_event = wait_for_client_retry(
+                &mut signals,
+                &mut packet_pump,
+                &mut network_event_monitor,
+                &mut stats,
+                schedule,
+            )
+            .await?;
             match wait_event {
                 ClientReconnectWaitEvent::Signal(signal) => {
                     stats.record_startup_duration(startup_started.elapsed());
@@ -763,6 +877,9 @@ pub async fn run_vpn_client_product_process(
                     ));
                 }
                 ClientReconnectWaitEvent::Timer => {}
+                ClientReconnectWaitEvent::NetworkEvent(event) => {
+                    eprintln!("vpn_client_retry_network_event:startup:{event}");
+                }
             }
         }
 
@@ -791,6 +908,7 @@ pub async fn run_vpn_client_product_process(
                     ));
                 }
                 stats.record_startup_duration(startup_started.elapsed());
+                discard_pending_network_events(&mut network_event_monitor, &mut stats);
                 break runtime;
             }
             ClientConnectEvent::Complete(Err(error)) => {
@@ -847,6 +965,9 @@ pub async fn run_vpn_client_product_process(
             signal = signals.recv() => ClientActiveEvent::Signal(signal?),
             pump = packet_pump.join() => ClientActiveEvent::PumpStopped(pump),
             report = runtime.join() => ClientActiveEvent::ConnectionStopped(Box::new(report)),
+            event = wait_for_network_event(&mut network_event_monitor) => {
+                ClientActiveEvent::NetworkEvent(event)
+            }
         };
         match active_event {
             ClientActiveEvent::Signal(signal) => {
@@ -894,20 +1015,33 @@ pub async fn run_vpn_client_product_process(
                 stats.record_connection(report);
                 let _ = notify_systemd(CLIENT_RECONNECTING_STATUS);
             }
+            ClientActiveEvent::NetworkEvent(Ok(_)) => continue,
+            ClientActiveEvent::NetworkEvent(Err(error)) => {
+                stats.network_event_monitor_failures =
+                    stats.network_event_monitor_failures.saturating_add(1);
+                eprintln!("vpn_client_network_event_monitor_failed:{:?}", error.kind());
+                network_event_monitor = None;
+                continue;
+            }
         }
 
         let offline_started = Instant::now();
         let mut backoff = VpnClientReconnectBackoff::default();
         let mut minimum_delay = Duration::ZERO;
         loop {
-            let delay = backoff.next_delay(std::mem::take(&mut minimum_delay));
-            eprintln!("vpn_client_reconnect_waiting:{}", delay.as_millis());
-            let wait_event = tokio::select! {
-                biased;
-                signal = signals.recv() => ClientReconnectWaitEvent::Signal(signal?),
-                pump = packet_pump.join() => ClientReconnectWaitEvent::PumpStopped(pump),
-                _ = sleep(delay) => ClientReconnectWaitEvent::Timer,
-            };
+            let schedule = backoff.next_schedule(std::mem::take(&mut minimum_delay));
+            eprintln!(
+                "vpn_client_reconnect_waiting:{}",
+                schedule.timer_delay.as_millis()
+            );
+            let wait_event = wait_for_client_retry(
+                &mut signals,
+                &mut packet_pump,
+                &mut network_event_monitor,
+                &mut stats,
+                schedule,
+            )
+            .await?;
             match wait_event {
                 ClientReconnectWaitEvent::Signal(signal) => {
                     stats.record_offline_duration(offline_started.elapsed());
@@ -927,6 +1061,9 @@ pub async fn run_vpn_client_product_process(
                     ));
                 }
                 ClientReconnectWaitEvent::Timer => {}
+                ClientReconnectWaitEvent::NetworkEvent(event) => {
+                    eprintln!("vpn_client_retry_network_event:reconnect:{event}");
+                }
             }
 
             stats.reconnect_attempts = stats.reconnect_attempts.saturating_add(1);
@@ -967,6 +1104,7 @@ pub async fn run_vpn_client_product_process(
                     runtime = reconnected;
                     stats.reconnect_successes = stats.reconnect_successes.saturating_add(1);
                     stats.record_offline_duration(offline_started.elapsed());
+                    discard_pending_network_events(&mut network_event_monitor, &mut stats);
                     let metrics = packet_pump.metrics_snapshot();
                     eprintln!(
                         "vpn_client_reconnected:attempts={}:offline_dropped_packets={}:offline_dropped_bytes={}",
@@ -1026,6 +1164,8 @@ fn finish_server_stop(
         reconnect_attempts: 0,
         reconnect_successes: 0,
         reconnect_failures: 0,
+        network_event_wakeups: 0,
+        network_event_monitor_failures: 0,
         offline_millis: 0,
         offline_dropped_packets: 0,
         offline_dropped_bytes: 0,
@@ -1227,8 +1367,25 @@ mod tests {
 
         let mut backoff = VpnClientReconnectBackoff::default();
         assert_eq!(
-            backoff.next_delay(Duration::from_secs(45)),
-            Duration::from_secs(45)
+            backoff.next_schedule(Duration::from_secs(45)),
+            VpnClientRetrySchedule {
+                timer_delay: Duration::from_secs(45),
+                network_event_delay: Duration::from_secs(45),
+            }
+        );
+        assert_eq!(
+            reconnect_schedule(Duration::from_secs(30), Duration::ZERO),
+            VpnClientRetrySchedule {
+                timer_delay: Duration::from_secs(30),
+                network_event_delay: Duration::from_millis(250),
+            }
+        );
+        assert_eq!(
+            reconnect_schedule(Duration::from_secs(30), Duration::from_secs(37)),
+            VpnClientRetrySchedule {
+                timer_delay: Duration::from_secs(37),
+                network_event_delay: Duration::from_secs(37),
+            }
         );
     }
 

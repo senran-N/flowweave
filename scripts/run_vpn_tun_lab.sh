@@ -328,6 +328,38 @@ unshare \
             return 1
         }
 
+        wait_for_log_numeric_suffix_at_least() {
+            expected_prefix=$1
+            minimum_value=$2
+            process_pid=$3
+            process_log=$4
+            description=$5
+            value_attempts=0
+            while [ "$value_attempts" -lt 1200 ]; do
+                latest_value=$(
+                    grep -F "$expected_prefix" "$process_log" 2>/dev/null |
+                        tail -n 1 |
+                        cut -d: -f2
+                )
+                case "$latest_value" in
+                    ""|*[!0-9]*) ;;
+                    *)
+                        if [ "$latest_value" -ge "$minimum_value" ]; then
+                            return 0
+                        fi
+                        ;;
+                esac
+                if ! kill -0 "$process_pid" 2>/dev/null; then
+                    break
+                fi
+                value_attempts=$((value_attempts + 1))
+                sleep 0.05
+            done
+            cat "$process_log" >&2 || true
+            echo "$description 未在固定截止内输出不小于 $minimum_value 的 $expected_prefix" >&2
+            return 1
+        }
+
         wait_for_process_exit() {
             process_pid=$1
             process_log=$2
@@ -1004,7 +1036,24 @@ unshare \
             exit 1
         fi
 
+        wait_for_log_numeric_suffix_at_least \
+            vpn_client_reconnect_waiting: \
+            8000 \
+            "$client_pid" \
+            "$3/product-fault.client.log" \
+            "netlink 提前唤醒门控 VPN 产品客户端"
+        if grep -Fq vpn_client_retry_network_event:reconnect: "$3/product-fault.client.log"; then
+            cat "$3/product-fault.client.log" >&2 || true
+            echo "外层仍 down 时客户端错误消费了陈旧或负向 netlink 事件" >&2
+            exit 1
+        fi
         ip netns exec fwclient ip link set fwclient0 up
+        wait_for_log_prefix_count \
+            vpn_client_retry_network_event:reconnect:link_available \
+            1 \
+            "$client_pid" \
+            "$3/product-fault.client.log" \
+            "外层 link-up netlink 事件"
         wait_for_log_prefix_count \
             vpn_client_reconnected: \
             1 \

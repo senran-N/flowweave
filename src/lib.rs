@@ -45,6 +45,8 @@ mod vpn_identity_config;
 #[cfg(target_os = "linux")]
 mod vpn_network;
 #[cfg(target_os = "linux")]
+mod vpn_network_event;
+#[cfg(target_os = "linux")]
 mod vpn_packet_bridge;
 mod vpn_product_config;
 #[cfg(target_os = "linux")]
