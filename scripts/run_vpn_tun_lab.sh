@@ -256,6 +256,7 @@ unshare \
                 kill "$server_pid" 2>/dev/null || true
                 wait "$server_pid" 2>/dev/null || true
             fi
+            ip netns del fwnat 2>/dev/null || true
             ip netns del fwinternet 2>/dev/null || true
             ip netns del fwclient 2>/dev/null || true
             ip netns del fwserver 2>/dev/null || true
@@ -408,6 +409,23 @@ unshare \
                 echo "$description 应精确输出一次 $expected_line，实际为 $line_count 次" >&2
                 return 1
             fi
+        }
+
+        log_field() {
+            log_line=$1
+            field_name=$2
+            printf "%s\n" "$log_line" |
+                tr ":" "\n" |
+                sed -n "s/^${field_name}=//p" |
+                head -n 1
+        }
+
+        nat_mapping_packets() {
+            mapping_port=$1
+            ip netns exec fwnat \
+                nft -nn list chain ip flowweave_rebind postrouting |
+                sed -n "s/.*counter packets \([0-9][0-9]*\) bytes [0-9][0-9]* snat to 198\\.18\\.0\\.2:${mapping_port}.*/\1/p" |
+                head -n 1
         }
 
         (
@@ -658,6 +676,58 @@ unshare \
         fi
         require_log_line_once stopped "$3/product-startup.client.log" "启动中止的 VPN 产品客户端"
 
+        ip netns add fwnat
+        ip link add fwclient1 type veth peer name fwnat0
+        ip link set fwclient1 netns fwclient
+        ip link set fwnat0 netns fwnat
+        ip link add fwnat1 type veth peer name fwserver2
+        ip link set fwnat1 netns fwnat
+        ip link set fwserver2 netns fwserver
+
+        ip netns exec fwclient ip addr add 203.0.113.2/30 dev fwclient1
+        ip netns exec fwclient ip link set fwclient1 up
+        ip netns exec fwclient ip route add table 102 192.0.2.1/32 \
+            via 203.0.113.1 dev fwclient1 src 203.0.113.2
+        ip netns exec fwclient ip rule add priority 100 \
+            from 203.0.113.2/32 lookup 102
+        ip netns exec fwclient sh -c \
+            "echo 0 > /proc/sys/net/ipv4/conf/fwclient1/rp_filter"
+
+        ip netns exec fwnat ip link set lo up
+        ip netns exec fwnat ip addr add 203.0.113.1/30 dev fwnat0
+        ip netns exec fwnat ip link set fwnat0 up
+        ip netns exec fwnat ip addr add 198.18.0.2/30 dev fwnat1
+        ip netns exec fwnat ip link set fwnat1 up
+        ip netns exec fwnat ip route add 192.0.2.1/32 \
+            via 198.18.0.1 dev fwnat1
+        ip netns exec fwnat sh -c \
+            "echo 1 > /proc/sys/net/ipv4/ip_forward; echo 0 > /proc/sys/net/ipv4/conf/all/rp_filter"
+        ip netns exec fwnat nft add table ip flowweave_rebind
+        ip netns exec fwnat nft add chain ip flowweave_rebind postrouting \
+            "{ type nat hook postrouting priority srcnat; policy accept; }"
+        ip netns exec fwnat nft add chain ip flowweave_rebind forward \
+            "{ type filter hook forward priority filter; policy accept; }"
+        ip netns exec fwnat nft add rule ip flowweave_rebind forward \
+            iifname fwnat0 udp dport 4433 counter
+        ip netns exec fwnat nft add rule ip flowweave_rebind forward \
+            iifname fwnat1 udp sport 4433 counter
+        ip netns exec fwnat nft add rule ip flowweave_rebind postrouting \
+            ip saddr 203.0.113.2 udp dport 4433 counter \
+            snat to 198.18.0.2:40000
+
+        ip netns exec fwserver ip addr add 198.18.0.1/30 dev fwserver2
+        ip netns exec fwserver ip link set fwserver2 up
+
+        install -o 0 -g 0 -m 0600 \
+            "$3/vpn-client.json" \
+            "$3/vpn-client.single-path.json"
+        jq ".additional_local_ips = [\"203.0.113.2\"]" \
+            "$3/vpn-client.single-path.json" \
+            >"$3/vpn-client.multipath.json"
+        install -o 0 -g 1000 -m 0640 \
+            "$3/vpn-client.multipath.json" \
+            "$3/vpn-client.json"
+
         ip netns exec fwclient \
             setpriv \
                 --no-new-privs \
@@ -777,6 +847,11 @@ unshare \
         if [ "$forwarding_client_status" -ne 0 ]; then
             cat "$3/forwarding.client.log" >&2 || true
             cat "$3/forwarding.internet.log" >&2 || true
+            cat "$3/product.client.log" >&2 || true
+            cat "$3/product.server.log" >&2 || true
+            ip netns exec fwclient ip -4 rule show >&2 || true
+            ip netns exec fwclient ip -4 route show table 102 >&2 || true
+            ip netns exec fwnat nft -nn list ruleset >&2 || true
             exit "$forwarding_client_status"
         fi
         if ! wait "$internet_pid"; then
@@ -790,6 +865,173 @@ unshare \
             ping -4 -n -c 3 -s 1300 -W 2 -w 8 10.77.0.1
         ip netns exec fwclient \
             ping -6 -n -c 3 -s 1300 -W 2 -w 8 fd77::1
+
+        active_connection_line=$(grep -F "vpn_client_connection_active:" \
+            "$3/product.client.log" | head -n 1)
+        active_connection_id=$(log_field "$active_connection_line" connection_stable_id)
+        active_session_generation=$(log_field "$active_connection_line" session_generation)
+        configured_path_count=$(log_field "$active_connection_line" configured_paths)
+        if [ -z "$active_connection_id" ] \
+            || [ -z "$active_session_generation" ] \
+            || [ "$configured_path_count" -ne 2 ]; then
+            cat "$3/product.client.log" >&2 || true
+            echo "双 outer-path 客户端缺少严格的连接、会话或路径快照" >&2
+            exit 1
+        fi
+        initial_verified_paths=$(
+            grep -F "vpn_client_path_active:connection_stable_id=${active_connection_id}:session_generation=${active_session_generation}:socket_generation=0:" \
+                "$3/product.client.log" |
+                grep -Fc ":active=true:explicit_source_verified=true"
+        )
+        if [ "$initial_verified_paths" -ne 2 ]; then
+            cat "$3/product.client.log" >&2 || true
+            echo "双 outer-path 初始快照未证明两条显式源路径" >&2
+            exit 1
+        fi
+
+        initial_nat_packets=$(nat_mapping_packets 40000)
+        case "$initial_nat_packets" in
+            ""|*[!0-9]*)
+                cat "$3/product.client.log" >&2 || true
+                ip netns exec fwnat nft -nn list ruleset >&2 || true
+                echo "无法读取初始 NAT 映射计数" >&2
+                exit 1
+                ;;
+        esac
+        if [ "$initial_nat_packets" -lt 1 ]; then
+            cat "$3/product.client.log" >&2 || true
+            ip netns exec fwnat nft -nn list ruleset >&2 || true
+            echo "第二条 QUIC 路径未穿过真实 SNAT 映射 40000" >&2
+            exit 1
+        fi
+
+        successful_rebinds_before=$(grep -Fc \
+            "vpn_client_network_paths_rebound:" "$3/product.client.log" || true)
+        connection_losses_before=$(grep -Fc \
+            "vpn_client_connection_lost:" "$3/product.client.log" || true)
+        reconnects_before=$(grep -Fc \
+            "vpn_client_reconnected:" "$3/product.client.log" || true)
+        ip netns exec fwclient ip link set fwclient1 down
+        ip netns exec fwclient \
+            ping -4 -n -c 2 -s 1300 -W 2 -w 6 10.77.0.1 >/dev/null
+
+        ip netns exec fwnat nft flush chain ip flowweave_rebind postrouting
+        ip netns exec fwnat nft add rule ip flowweave_rebind postrouting \
+            ip saddr 203.0.113.2 udp dport 4433 counter \
+            snat to 198.18.0.2:40001
+        ip netns exec fwclient ip link set fwclient1 up
+        ip netns exec fwclient ip route replace table 102 192.0.2.1/32 \
+            via 203.0.113.1 dev fwclient1 src 203.0.113.2
+        next_rebind_count=$((successful_rebinds_before + 1))
+        if ! wait_for_log_prefix_count \
+            vpn_client_network_paths_rebound: \
+            "$next_rebind_count" \
+            "$client_pid" \
+            "$3/product.client.log" \
+            "link-up 后同连接路径增删与 NAT rebinding"; then
+            ip netns exec fwnat nft -nn list ruleset >&2 || true
+            ip netns exec fwclient ip -4 route get 192.0.2.1 \
+                from 203.0.113.2 uid 1000 >&2 || true
+            exit 1
+        fi
+
+        rebind_line=$(grep -F "vpn_client_network_paths_rebound:" \
+            "$3/product.client.log" | tail -n 1)
+        rebind_event=$(log_field "$rebind_line" event)
+        rebound_connection_id=$(log_field "$rebind_line" connection_stable_id)
+        rebound_session_generation=$(log_field "$rebind_line" session_generation)
+        rebound_socket_generation=$(log_field "$rebind_line" socket_generation)
+        rebound_replacements=$(log_field "$rebind_line" replacements)
+        if [ "$rebind_event" != link_available ] \
+            || [ "$rebound_connection_id" != "$active_connection_id" ] \
+            || [ "$rebound_session_generation" != "$active_session_generation" ] \
+            || [ "$rebound_replacements" -ne 2 ]; then
+            cat "$3/product.client.log" >&2 || true
+            echo "路径恢复未保持同一 QUIC connection/FWC1 generation 或未替换两条路径" >&2
+            exit 1
+        fi
+
+        grep -F "vpn_client_path_replaced:event=link_available:connection_stable_id=${active_connection_id}:session_generation=${active_session_generation}:socket_generation=${rebound_socket_generation}:" \
+            "$3/product.client.log" \
+            >"$3/path-rebind.replacements" || true
+        replacement_count=$(wc -l <"$3/path-rebind.replacements" | tr -d " ")
+        if [ "$replacement_count" -ne 2 ]; then
+            cat "$3/product.client.log" >&2 || true
+            echo "link-up 原位恢复没有为两个配置槽位产生精确替换报告" >&2
+            exit 1
+        fi
+        while IFS= read -r replacement_line; do
+            replacement_slot=$(log_field "$replacement_line" slot)
+            old_path_id=$(log_field "$replacement_line" old_path_id)
+            new_path_id=$(log_field "$replacement_line" new_path_id)
+            old_path_abandoned=$(log_field "$replacement_line" old_path_abandoned)
+            explicit_source_verified=$(log_field "$replacement_line" explicit_source_verified)
+            previous_path_id=$(
+                grep -F "vpn_client_path_replaced:" "$3/product.client.log" |
+                    grep -F ":slot=${replacement_slot}:" |
+                    grep -v ":socket_generation=${rebound_socket_generation}:" |
+                    tail -n 1 || true
+            )
+            if [ -n "$previous_path_id" ]; then
+                previous_path_id=$(log_field "$previous_path_id" new_path_id)
+            else
+                previous_path_line=$(
+                    grep -F "vpn_client_path_active:connection_stable_id=${active_connection_id}:session_generation=${active_session_generation}:socket_generation=0:slot=${replacement_slot}:" \
+                        "$3/product.client.log" |
+                        tail -n 1
+                )
+                previous_path_id=$(log_field "$previous_path_line" path_id)
+            fi
+            if [ -z "$replacement_slot" ] \
+                || [ -z "$old_path_id" ] \
+                || [ -z "$new_path_id" ] \
+                || [ "$old_path_id" = "$new_path_id" ] \
+                || [ "$old_path_id" != "$previous_path_id" ] \
+                || [ "$old_path_abandoned" != true ] \
+                || [ "$explicit_source_verified" != true ]; then
+                cat "$3/product.client.log" >&2 || true
+                echo "PathId 连续性、旧路径 Abandoned 或显式源 IP 校验失败" >&2
+                exit 1
+            fi
+        done <"$3/path-rebind.replacements"
+
+        rebound_nat_packets=
+        nat_counter_attempts=0
+        while [ "$nat_counter_attempts" -lt 200 ]; do
+            rebound_nat_packets=$(nat_mapping_packets 40001)
+            case "$rebound_nat_packets" in
+                ""|*[!0-9]*) ;;
+                *)
+                    if [ "$rebound_nat_packets" -ge 1 ]; then
+                        break
+                    fi
+                    ;;
+            esac
+            nat_counter_attempts=$((nat_counter_attempts + 1))
+            sleep 0.05
+        done
+        case "$rebound_nat_packets" in
+            ""|*[!0-9]*|0)
+                cat "$3/product.client.log" >&2 || true
+                ip netns exec fwnat nft -nn list ruleset >&2 || true
+                echo "新 QUIC 路径未命中真实 SNAT rebinding 映射 40001" >&2
+                exit 1
+                ;;
+        esac
+
+        ip netns exec fwclient \
+            ping -4 -n -c 2 -s 1300 -W 2 -w 6 10.77.0.1 >/dev/null
+        ip netns exec fwclient \
+            ping -6 -n -c 2 -s 1300 -W 2 -w 6 fd77::1 >/dev/null
+        test "$(grep -Fc "vpn_client_connection_lost:" \
+            "$3/product.client.log" || true)" = "$connection_losses_before"
+        test "$(grep -Fc "vpn_client_reconnected:" \
+            "$3/product.client.log" || true)" = "$reconnects_before"
+        kill -0 "$client_pid"
+        ip netns exec fwnat nft flush chain ip flowweave_rebind postrouting
+        ip netns exec fwnat nft add rule ip flowweave_rebind postrouting \
+            ip saddr 203.0.113.2 udp dport 4433 counter \
+            snat to 198.18.0.2
 
         install -o 0 -g 0 -m 0600 \
             "$3/vpn-identities.json" \
@@ -959,6 +1201,16 @@ unshare \
         test "$(
             ip netns exec fwserver cat /proc/sys/net/ipv6/conf/all/forwarding
         )" = 0
+
+        install -o 0 -g 1000 -m 0640 \
+            "$3/vpn-client.single-path.json" \
+            "$3/vpn-client.json"
+        ip netns exec fwclient ip rule del priority 100 \
+            from 203.0.113.2/32 lookup 102
+        ip netns exec fwclient ip route flush table 102
+        ip netns exec fwclient ip link del fwclient1
+        ip netns exec fwnat ip link del fwnat1
+        ip netns del fwnat
 
         ip netns exec fwserver \
             setpriv \

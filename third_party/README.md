@@ -2,7 +2,7 @@
 
 ## v0.1.0-lab 冻结复核
 
-2026-07-13 使用本机 Cargo registry 中已通过校验的 1.0.1 发布包重新比较：`noq-1.0.1.crate` SHA-256 为 `4bf95190af1bd4a00a10e8255ca0c8ddd9e9a9f5e79151d7a7eb6d56aff5dc89`，`noq-proto-1.0.1.crate` 为 `aa6c890013591e709a3e45dd53501351b7e27e7ff3c7e9fc3dce43e300e7e9d3`。排除 Cargo 缓存标记和构建目录后，高层 NoQ 只有下文记录的 5 个文件不同；NoQ Proto 只有下文记录的 23 个文件不同，并额外包含已记录的 `declared_epoch_sensor.rs`。没有发现未登记的 vendor 漂移。
+2026-07-13 使用本机 Cargo registry 中已通过校验的 1.0.1 发布包重新比较：`noq-1.0.1.crate` SHA-256 为 `4bf95190af1bd4a00a10e8255ca0c8ddd9e9a9f5e79151d7a7eb6d56aff5dc89`，`noq-proto-1.0.1.crate` 为 `aa6c890013591e709a3e45dd53501351b7e27e7ff3c7e9fc3dce43e300e7e9d3`。排除 Cargo 缓存标记和构建目录后，高层 NoQ 只有下文记录的 6 个文件不同；NoQ Proto 有下文记录的 23 个偏离路径，其中包含新增的 `declared_epoch_sensor.rs`。没有发现未登记的 vendor 漂移。
 
 ## NoQ
 
@@ -18,8 +18,9 @@
 
 - `Cargo.toml`：让 vendor 的高层 crate 明确使用相邻的 `third_party/noq-proto`，避免高层 API 与底层定向 DATAGRAM 能力版本错位。
 - `Cargo.lock`：随上述本地 path patch 去掉 `noq-proto` 的 registry source/checksum，其他锁定依赖不变；这是 Cargo 对本地源码替换的机械结果。
-- `src/connection.rs`：增加 `Connection::send_datagram_on_path`、`Connection::send_datagram_on_path_wait`、`Connection::send_datagram_on_path_separate`、`Connection::send_datagram_on_path_separate_wait`、`SendDatagramOnPath` 与 `SendDatagramOnPathError`。同步与异步入口都保留普通 DATAGRAM 的禁用、过大和背压语义，并把不可用目标路径单独报告为 `PathUnavailable`。`separate` 入口只要求该应用 DATAGRAM 不与另一应用 DATAGRAM 共用 QUIC 包；ACK/控制帧仍可共包，且不绕过目标路径 cwnd、pacing、MTU、反放大或发送缓冲。
-- `src/lib.rs`：公开导出定向 DATAGRAM 的 future 和错误类型。
+- `src/connection.rs`：增加 `Connection::send_datagram_on_path`、`Connection::send_datagram_on_path_wait`、`Connection::send_datagram_on_path_separate`、`Connection::send_datagram_on_path_separate_wait`、`SendDatagramOnPath` 与 `SendDatagramOnPathError`。同步与异步入口都保留普通 DATAGRAM 的禁用、过大和背压语义，并把不可用目标路径单独报告为 `PathUnavailable`。`separate` 入口只要求该应用 DATAGRAM 不与另一应用 DATAGRAM 共用 QUIC 包；ACK/控制帧仍可共包，且不绕过目标路径 cwnd、pacing、MTU、反放大或发送缓冲。另让内部 rebind 事件区分“只更新 UDP sender”和“同时执行通用 network change”；默认 `Endpoint::rebind` 语义不变。
+- `src/endpoint.rs`：增加 `Endpoint::rebind_preserving_paths`。它原子换用新 UDP socket 并更新所有连接 sender，但不调用会清空路径显式 `local_ip` 的通用 `handle_network_change(None)`；仅供产品层随后逐条 ping、迁移或替换全部路径，错误时仍保留旧 socket。
+- `src/lib.rs`：公开导出定向 DATAGRAM 的 future 和错误类型；内部 `ConnectionEvent::Rebind` 另携带是否执行通用 network-change 的布尔合同。
 - `src/tests.rs`：用真实异步 Endpoint 建立两条路径，证明相同负载分别从主路与 Backup 路各发送一份，并证明路径关闭后高层 API 返回正确错误。
 
 ### TLS 安全边界
@@ -54,7 +55,7 @@ third_party/noq-proto 最初来自本机 Cargo 已校验的官方发布包。
 - `src/connection/declared_epoch_sensor.rs`：增加默认关闭的 B 组诊断传感器。只有应用显式声明一次固定 250 ms cohort 组成的 backlogged epoch 时，才按原发送路径记录首次 STREAM 字节及其及时/迟到 ACK；它不改变调度、拥塞控制或产品代理默认配置。
 - `src/connection/mod.rs`：在逐路径 Data PTO、路径 abandoned 或一个完整 PTO 没有新 ACK 进展时，把仍在途的 STREAM 范围加入全局重传队列一次。ACK 进展截止不被后续发包推迟，触发后原路径只探活、普通数据让给已验证备用路；探针确认后才恢复调度。恢复候选还可在实际承载 STREAM 恢复数据的备用路请求一次立即反馈，让该路带回其他路径累计 PATH_ACK；独立的新候选会在接收端暂时把这条已验证恢复路提升为 Available、其他路降为 Backup，使 `MAX_STREAM_DATA` 等全连接反馈不再被故障优先路取走；非首选路的恢复探针到达后恢复交接前状态，避免一次误判永久改写 PATH_STATUS。标准 LossDetection、路径空闲和 3 PTO 清场保持不变。另记录恢复与反馈路径，并修复 GSO 小分段越界问题。C 组接线还区分路径专属的 ACK-eliciting、拥塞受控数据，使显式定向 DATAGRAM 只在目标路径满足 cwnd、pacing、MTU 和反放大条件时构包；构包循环同时执行可选的应用 DATAGRAM 前后包边界。
 - `src/connection/packet_builder.rs`：在包真正发送并登记后启动 ACK 进展纪元；后续包只登记在途状态，不移动既有恢复截止。另保留 GSO 小分段收尾修复。
-- `src/connection/paths.rs`：保存跨路径恢复探针包号边界、ACK 进展纪元起点和 O(1) 在途 STREAM 帧计数；这些都不进入线协议，也不发送公开 `PATH_STATUS`。
+- `src/connection/paths.rs`：保存跨路径恢复探针包号边界、ACK 进展纪元起点和 O(1) 在途 STREAM 帧计数；这些都不进入线协议，也不发送公开 `PATH_STATUS`。另把既有 `PathId::as_u32` 设为公开只读 accessor，供产品层输出不含地址的稳定路径观测。
 - `src/connection/qlog.rs`：给独立 ACK 进展恢复定时器提供可识别的 qlog 名称。
 - `src/connection/send_buffer.rs`：区分首次与重传数据；重复、重叠和乱序 ACK 只计算新确认字节，并取消已经无用的待发重复范围；另只读暴露累计确认前沿、最低待重传 offset 和待重传字节。
 - `src/connection/spaces.rs`：逐路径判断本路径待发 ACK，让 Backup 路径可以发送 ACK-only 包，同时不把其他开放路径的 ACK 错当成本路径工作；有界逃生会为下一次累计确认保存唯一指定的返回路径，发送或失效后立即清理。另把目标路径待发 DATAGRAM 计入该路径的可发送工作，未指定 DATAGRAM 仍只服从普通数据调度。

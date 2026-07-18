@@ -57,6 +57,8 @@ const CLIENT_RECONNECTING_STATUS: &str = "STATUS=FlowWeave VPN client reconnecti
 const CLIENT_RECONNECTED_STATUS: &str = "STATUS=FlowWeave VPN client reconnected";
 const CLIENT_RECONNECT_FAILED_STATUS: &str =
     "STATUS=FlowWeave VPN client reconnect failed permanently";
+const VPN_CLIENT_ACTIVE_NETWORK_SETTLE_DELAY: Duration = Duration::from_millis(250);
+const VPN_CLIENT_ACTIVE_NETWORK_EVENT_COALESCE_DELAY: Duration = Duration::from_secs(5);
 const VPN_CLIENT_RECONNECT_INITIAL_DELAY_MS: u64 = 250;
 const VPN_CLIENT_RECONNECT_MAX_DELAY_MS: u64 = 30_000;
 
@@ -90,6 +92,9 @@ pub struct VpnProductProcessReport {
     pub reconnect_failures: u64,
     pub network_event_wakeups: u64,
     pub network_event_monitor_failures: u64,
+    pub network_path_rebinds: u64,
+    pub network_path_replacements: u64,
+    pub network_path_rebind_failures: u64,
     pub offline_millis: u64,
     pub offline_dropped_packets: u64,
     pub offline_dropped_bytes: u64,
@@ -508,6 +513,9 @@ struct ClientSupervisorStats {
     reconnect_failures: u64,
     network_event_wakeups: u64,
     network_event_monitor_failures: u64,
+    network_path_rebinds: u64,
+    network_path_replacements: u64,
+    network_path_rebind_failures: u64,
     offline_millis: u64,
 }
 
@@ -526,6 +534,9 @@ impl ClientSupervisorStats {
             reconnect_failures: 0,
             network_event_wakeups: 0,
             network_event_monitor_failures: 0,
+            network_path_rebinds: 0,
+            network_path_replacements: 0,
+            network_path_rebind_failures: 0,
             offline_millis: 0,
         }
     }
@@ -571,6 +582,9 @@ impl ClientSupervisorStats {
             reconnect_failures: self.reconnect_failures,
             network_event_wakeups: self.network_event_wakeups,
             network_event_monitor_failures: self.network_event_monitor_failures,
+            network_path_rebinds: self.network_path_rebinds,
+            network_path_replacements: self.network_path_replacements,
+            network_path_rebind_failures: self.network_path_rebind_failures,
             offline_millis: self.offline_millis,
             offline_dropped_packets: pump.metrics.offline_dropped_packets,
             offline_dropped_bytes: pump.metrics.offline_dropped_bytes,
@@ -818,6 +832,90 @@ fn discard_pending_network_events(
     }
 }
 
+fn emit_client_path_snapshot(runtime: &crate::VpnClientProductEndpointRuntime) {
+    let (Some(connection_stable_id), Some(session_generation)) =
+        (runtime.connection_stable_id(), runtime.session_generation())
+    else {
+        return;
+    };
+    let paths = runtime.configured_path_snapshots();
+    eprintln!(
+        "vpn_client_connection_active:connection_stable_id={connection_stable_id}:session_generation={session_generation}:socket_generation={}:configured_paths={}",
+        runtime.socket_generation(),
+        paths.len()
+    );
+    for path in paths {
+        eprintln!(
+            "vpn_client_path_active:connection_stable_id={connection_stable_id}:session_generation={session_generation}:socket_generation={}:slot={}:path_id={}:active={}:explicit_source_verified={}",
+            runtime.socket_generation(),
+            path.slot,
+            path.path_id,
+            path.active,
+            path.explicit_source_verified
+        );
+    }
+}
+
+async fn rebind_client_network_paths(
+    runtime: &mut crate::VpnClientProductEndpointRuntime,
+    stats: &mut ClientSupervisorStats,
+    event: VpnNetworkRecoveryEvent,
+) -> bool {
+    let previous_paths = runtime.configured_path_snapshots();
+    match runtime.rebind_network_paths().await {
+        Ok(report) => {
+            stats.network_path_rebinds = stats.network_path_rebinds.saturating_add(1);
+            stats.network_path_replacements = stats
+                .network_path_replacements
+                .saturating_add(u64::try_from(report.replacements.len()).unwrap_or(u64::MAX));
+            for replacement in &report.replacements {
+                eprintln!(
+                    "vpn_client_path_replaced:event={event}:connection_stable_id={}:session_generation={}:socket_generation={}:slot={}:old_path_id={}:new_path_id={}:old_path_abandoned={}:explicit_source_verified={}",
+                    report.connection_stable_id,
+                    report.session_generation,
+                    report.socket_generation,
+                    replacement.slot,
+                    replacement.old_path_id,
+                    replacement.new_path_id,
+                    replacement.old_path_abandoned,
+                    replacement.explicit_source_verified
+                );
+            }
+            eprintln!(
+                "vpn_client_network_paths_rebound:event={event}:connection_stable_id={}:session_generation={}:socket_generation={}:replacements={}:implicit_path_pinged={}",
+                report.connection_stable_id,
+                report.session_generation,
+                report.socket_generation,
+                report.replacements.len(),
+                report.implicit_path_pinged
+            );
+            true
+        }
+        Err(error) => {
+            let current_paths = runtime.configured_path_snapshots();
+            let partial_replacements = previous_paths
+                .iter()
+                .filter(|previous| {
+                    current_paths.iter().any(|current| {
+                        current.slot == previous.slot && current.path_id != previous.path_id
+                    })
+                })
+                .count();
+            stats.network_path_replacements = stats
+                .network_path_replacements
+                .saturating_add(u64::try_from(partial_replacements).unwrap_or(u64::MAX));
+            stats.network_path_rebind_failures =
+                stats.network_path_rebind_failures.saturating_add(1);
+            eprintln!(
+                "vpn_client_network_paths_rebind_failed:event={event}:socket_generation={}:partial_replacements={partial_replacements}:error={error}",
+                runtime.socket_generation(),
+            );
+            emit_client_path_snapshot(runtime);
+            false
+        }
+    }
+}
+
 pub async fn run_vpn_client_product_process(
     config_path: impl AsRef<Path>,
 ) -> Result<VpnProductProcessReport, VpnProductProcessError> {
@@ -951,6 +1049,7 @@ pub async fn run_vpn_client_product_process(
         stopping?;
         return finish_clean_stop(stats.report(signal, pump_report)?);
     }
+    emit_client_path_snapshot(&runtime);
     if let Err(error) = emit_ready(VpnProductProcessRole::Client) {
         runtime.request_shutdown();
         let _ = runtime.join().await;
@@ -959,6 +1058,7 @@ pub async fn run_vpn_client_product_process(
         return Err(error);
     }
 
+    let mut last_network_path_rebind = None;
     loop {
         let active_event = tokio::select! {
             biased;
@@ -1015,7 +1115,27 @@ pub async fn run_vpn_client_product_process(
                 stats.record_connection(report);
                 let _ = notify_systemd(CLIENT_RECONNECTING_STATUS);
             }
-            ClientActiveEvent::NetworkEvent(Ok(_)) => continue,
+            ClientActiveEvent::NetworkEvent(Ok(event)) => {
+                if event == VpnNetworkRecoveryEvent::RouteAdded {
+                    discard_pending_network_events(&mut network_event_monitor, &mut stats);
+                    eprintln!("vpn_client_network_event_observed:online:{event}");
+                    continue;
+                }
+                if last_network_path_rebind.is_some_and(|last: Instant| {
+                    last.elapsed() < VPN_CLIENT_ACTIVE_NETWORK_EVENT_COALESCE_DELAY
+                }) {
+                    discard_pending_network_events(&mut network_event_monitor, &mut stats);
+                    eprintln!("vpn_client_network_event_coalesced:online:{event}");
+                    continue;
+                }
+                sleep(VPN_CLIENT_ACTIVE_NETWORK_SETTLE_DELAY).await;
+                discard_pending_network_events(&mut network_event_monitor, &mut stats);
+                if rebind_client_network_paths(&mut runtime, &mut stats, event).await {
+                    last_network_path_rebind = Some(Instant::now());
+                }
+                discard_pending_network_events(&mut network_event_monitor, &mut stats);
+                continue;
+            }
             ClientActiveEvent::NetworkEvent(Err(error)) => {
                 stats.network_event_monitor_failures =
                     stats.network_event_monitor_failures.saturating_add(1);
@@ -1102,9 +1222,11 @@ pub async fn run_vpn_client_product_process(
                         ));
                     }
                     runtime = reconnected;
+                    last_network_path_rebind = None;
                     stats.reconnect_successes = stats.reconnect_successes.saturating_add(1);
                     stats.record_offline_duration(offline_started.elapsed());
                     discard_pending_network_events(&mut network_event_monitor, &mut stats);
+                    emit_client_path_snapshot(&runtime);
                     let metrics = packet_pump.metrics_snapshot();
                     eprintln!(
                         "vpn_client_reconnected:attempts={}:offline_dropped_packets={}:offline_dropped_bytes={}",
@@ -1166,6 +1288,9 @@ fn finish_server_stop(
         reconnect_failures: 0,
         network_event_wakeups: 0,
         network_event_monitor_failures: 0,
+        network_path_rebinds: 0,
+        network_path_replacements: 0,
+        network_path_rebind_failures: 0,
         offline_millis: 0,
         offline_dropped_packets: 0,
         offline_dropped_bytes: 0,

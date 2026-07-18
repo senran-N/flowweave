@@ -271,6 +271,19 @@ impl Endpoint {
         self.rebind_abstract(self.runtime.wrap_udp_socket(socket)?)
     }
 
+    /// Switch to a new UDP socket without automatically changing any connection paths.
+    ///
+    /// This is intended for multipath applications that need to replace explicitly-bound paths
+    /// themselves. The connection driver starts using `socket`, but does not run its generic
+    /// network-change handling, which would otherwise clear every path's local IP address.
+    /// Callers must promptly ping, migrate, or replace every active path after this succeeds.
+    ///
+    /// On error, the old UDP socket is retained.
+    #[cfg(not(wasm_browser))]
+    pub fn rebind_preserving_paths(&self, socket: std::net::UdpSocket) -> io::Result<()> {
+        self.rebind_abstract_inner(self.runtime.wrap_udp_socket(socket)?, false)
+    }
+
     /// Switch to a new UDP socket
     ///
     /// Allows the endpoint's address to be updated live, affecting all active connections. Incoming
@@ -278,6 +291,14 @@ impl Endpoint {
     ///
     /// On error, the old UDP socket is retained.
     pub fn rebind_abstract(&self, socket: Box<dyn AsyncUdpSocket>) -> io::Result<()> {
+        self.rebind_abstract_inner(socket, true)
+    }
+
+    fn rebind_abstract_inner(
+        &self,
+        socket: Box<dyn AsyncUdpSocket>,
+        network_change: bool,
+    ) -> io::Result<()> {
         let addr = socket.local_addr()?;
         let mut inner = self.inner.state.lock().unwrap();
         inner.prev_socket = Some(mem::replace(&mut inner.socket, socket));
@@ -286,7 +307,10 @@ impl Endpoint {
         // Update connection socket references
         for sender in inner.recv_state.connections.senders.values() {
             // Ignoring errors from dropped connections
-            let _ = sender.send(ConnectionEvent::Rebind(inner.socket.create_sender()));
+            let _ = sender.send(ConnectionEvent::Rebind {
+                sender: inner.socket.create_sender(),
+                network_change,
+            });
         }
         if let Some(driver) = inner.driver.take() {
             // Ensure the driver can register for wake-ups from the new socket

@@ -108,7 +108,10 @@ enum ConnectionEvent {
         reason: bytes::Bytes,
     },
     Proto(proto::ConnectionEvent),
-    Rebind(Pin<Box<dyn UdpSender>>),
+    Rebind {
+        sender: Pin<Box<dyn UdpSender>>,
+        network_change: bool,
+    },
     LocalAddressChanged(Option<Arc<dyn NetworkChangeHint + Sync + Send>>),
 }
 

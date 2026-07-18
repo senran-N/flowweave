@@ -557,6 +557,15 @@ impl VpnClientProductConnectionRuntime {
         self.accept
     }
 
+    /// A transport-local identifier that remains fixed for this QUIC connection's lifetime.
+    pub fn connection_stable_id(&self) -> usize {
+        self.connection.stable_id()
+    }
+
+    pub(crate) const fn transport_connection(&self) -> &Connection {
+        &self.connection
+    }
+
     pub fn packet_bridge_metrics(&self) -> VpnPacketBridgeMetricsSnapshot {
         self.bridge
             .as_ref()
@@ -942,7 +951,7 @@ fn build_server_bootstrap(
         .ok_or(VpnProductBootstrapError::TransportConfiguration)?;
     configure_product_transport(
         transport,
-        u32::try_from(crate::VPN_PRODUCT_MAX_EXPLICIT_PATHS + 1)
+        u32::try_from(crate::VPN_PRODUCT_MAX_EXPLICIT_PATHS + 2)
             .map_err(|_| VpnProductBootstrapError::TransportConfiguration)?,
         1,
     );
@@ -1056,9 +1065,11 @@ fn client_transient_path_count(
     additional_count: usize,
 ) -> Result<u32, VpnProductBootstrapError> {
     let replace_bootstrap_path = has_primary && additional_count != 0;
+    let has_explicit_path = has_primary || additional_count != 0;
     let transient_paths = additional_count
         .checked_add(1)
         .and_then(|count| count.checked_add(usize::from(replace_bootstrap_path)))
+        .and_then(|count| count.checked_add(usize::from(has_explicit_path)))
         .ok_or(VpnProductBootstrapError::TransportConfiguration)?;
     u32::try_from(transient_paths).map_err(|_| VpnProductBootstrapError::TransportConfiguration)
 }
@@ -1315,9 +1326,9 @@ pub(crate) mod tests {
     #[test]
     fn client_path_limit_counts_bootstrap_and_temporary_replacement() {
         assert_eq!(client_transient_path_count(false, 0).unwrap(), 1);
-        assert_eq!(client_transient_path_count(true, 0).unwrap(), 1);
-        assert_eq!(client_transient_path_count(false, 2).unwrap(), 3);
-        assert_eq!(client_transient_path_count(true, 2).unwrap(), 4);
+        assert_eq!(client_transient_path_count(true, 0).unwrap(), 2);
+        assert_eq!(client_transient_path_count(false, 2).unwrap(), 4);
+        assert_eq!(client_transient_path_count(true, 2).unwrap(), 5);
     }
 
     #[test]

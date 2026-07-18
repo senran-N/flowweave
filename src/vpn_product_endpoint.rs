@@ -2,14 +2,14 @@ use std::{
     collections::HashSet,
     error::Error,
     fmt, io,
-    net::{IpAddr, Ipv4Addr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket as StdUdpSocket},
     sync::Arc,
     time::Duration,
 };
 
 use noq::{
-    ConnectError, Connection, ConnectionError, Endpoint, FourTuple, PathError, PathId, PathStatus,
-    TransportErrorCode,
+    ClosePathError, ConnectError, Connection, ConnectionError, Endpoint, FourTuple, Path,
+    PathError, PathEvent, PathId, PathStatus, TransportErrorCode,
 };
 use tokio::{
     net::lookup_host,
@@ -17,6 +17,7 @@ use tokio::{
     task::JoinHandle,
     time::{Instant, sleep, timeout, timeout_at},
 };
+use tokio_stream::StreamExt;
 
 use crate::vpn_packet_bridge::VpnClientPacketPump;
 use crate::vpn_product_runtime::start_vpn_client_product_connection_with_packet_pump;
@@ -604,12 +605,122 @@ pub struct VpnClientProductEndpointReport {
     pub connection: VpnClientProductConnectionReport,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VpnClientProductPathSnapshot {
+    pub slot: usize,
+    pub path_id: u32,
+    pub active: bool,
+    pub explicit_source_verified: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VpnClientProductPathReplacement {
+    pub slot: usize,
+    pub old_path_id: u32,
+    pub new_path_id: u32,
+    pub old_path_abandoned: bool,
+    pub explicit_source_verified: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VpnClientProductPathRebindReport {
+    pub connection_stable_id: usize,
+    pub session_generation: u64,
+    pub socket_generation: u64,
+    pub implicit_path_pinged: bool,
+    pub replacements: Vec<VpnClientProductPathReplacement>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VpnClientProductPathRebindError {
+    ConnectionUnavailable,
+    SocketBind(io::ErrorKind),
+    SocketConfigure(io::ErrorKind),
+    SocketRebind(io::ErrorKind),
+    LocalAddress(io::ErrorKind),
+    ImplicitPathMissing,
+    ImplicitPathPing,
+    PathOpen {
+        slot: usize,
+        error: VpnProductPathOpenError,
+    },
+    PathOpenTimeout {
+        slot: usize,
+    },
+    PathInspect,
+    ExplicitSourceMismatch,
+    PathClose,
+    PathEventLagged,
+    PathEventClosed,
+    PathAbandonTimeout,
+}
+
+impl fmt::Display for VpnClientProductPathRebindError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::SocketBind(kind) => write!(formatter, "vpn_client_path_rebind_bind:{kind:?}"),
+            Self::SocketConfigure(kind) => {
+                write!(
+                    formatter,
+                    "vpn_client_path_rebind_socket_configure:{kind:?}"
+                )
+            }
+            Self::SocketRebind(kind) => {
+                write!(formatter, "vpn_client_path_rebind_socket:{kind:?}")
+            }
+            Self::LocalAddress(kind) => {
+                write!(formatter, "vpn_client_path_rebind_local_address:{kind:?}")
+            }
+            Self::PathOpen { slot, error } => {
+                write!(
+                    formatter,
+                    "vpn_client_path_rebind_path_open:{slot}:{error:?}"
+                )
+            }
+            Self::PathOpenTimeout { slot } => {
+                write!(formatter, "vpn_client_path_rebind_path_open_timeout:{slot}")
+            }
+            other => formatter.write_str(match other {
+                Self::ConnectionUnavailable => "vpn_client_path_rebind_connection_unavailable",
+                Self::ImplicitPathMissing => "vpn_client_path_rebind_implicit_path_missing",
+                Self::ImplicitPathPing => "vpn_client_path_rebind_implicit_path_ping",
+                Self::PathInspect => "vpn_client_path_rebind_path_inspect",
+                Self::ExplicitSourceMismatch => "vpn_client_path_rebind_explicit_source_mismatch",
+                Self::PathClose => "vpn_client_path_rebind_path_close",
+                Self::PathEventLagged => "vpn_client_path_rebind_path_event_lagged",
+                Self::PathEventClosed => "vpn_client_path_rebind_path_event_closed",
+                Self::PathAbandonTimeout => "vpn_client_path_rebind_path_abandon_timeout",
+                Self::SocketBind(_)
+                | Self::SocketConfigure(_)
+                | Self::SocketRebind(_)
+                | Self::LocalAddress(_)
+                | Self::PathOpen { .. }
+                | Self::PathOpenTimeout { .. } => unreachable!(),
+            }),
+        }
+    }
+}
+
+impl Error for VpnClientProductPathRebindError {}
+
+#[derive(Debug, Clone, Copy)]
+struct VpnClientConfiguredPath {
+    local_ip: IpAddr,
+    path_id: PathId,
+}
+
 pub struct VpnClientProductEndpointRuntime {
     endpoint: Endpoint,
     connection: Option<VpnClientProductConnectionRuntime>,
     connection_report: Option<VpnClientProductConnectionReport>,
     local_addr: SocketAddr,
+    bind_ip: IpAddr,
+    server_addr: SocketAddr,
+    configured_paths: Vec<VpnClientConfiguredPath>,
+    implicit_path: Option<PathId>,
+    socket_generation: u64,
     established_path_count: usize,
+    operation_timeout: Duration,
     drain_timeout: Duration,
 }
 
@@ -620,6 +731,168 @@ impl VpnClientProductEndpointRuntime {
 
     pub const fn established_path_count(&self) -> usize {
         self.established_path_count
+    }
+
+    pub fn connection_stable_id(&self) -> Option<usize> {
+        self.connection
+            .as_ref()
+            .map(VpnClientProductConnectionRuntime::connection_stable_id)
+    }
+
+    pub fn session_generation(&self) -> Option<u64> {
+        self.connection
+            .as_ref()
+            .map(|connection| connection.accept().session_generation)
+    }
+
+    pub const fn socket_generation(&self) -> u64 {
+        self.socket_generation
+    }
+
+    pub fn configured_path_snapshots(&self) -> Vec<VpnClientProductPathSnapshot> {
+        let Some(connection) = self.connection.as_ref() else {
+            return Vec::new();
+        };
+        let connection = connection.transport_connection();
+        self.configured_paths
+            .iter()
+            .enumerate()
+            .map(|(slot, configured)| {
+                let path = connection.path(configured.path_id);
+                let explicit_source_verified = path.as_ref().is_some_and(|path| {
+                    path.network_path()
+                        .is_ok_and(|path| path.local_ip() == Some(configured.local_ip))
+                }) || (configured.path_id == PathId::ZERO
+                    && self.bind_ip == configured.local_ip
+                    && self.local_addr.ip() == configured.local_ip);
+                VpnClientProductPathSnapshot {
+                    slot,
+                    path_id: configured.path_id.as_u32(),
+                    active: path.is_some(),
+                    explicit_source_verified,
+                }
+            })
+            .collect()
+    }
+
+    /// Rebind the endpoint socket and replace every configured explicit path in place.
+    ///
+    /// Each replacement is validated with its configured source IP before the old path is closed.
+    /// The QUIC connection and FWC1 session remain unchanged throughout the operation.
+    pub async fn rebind_network_paths(
+        &mut self,
+    ) -> Result<VpnClientProductPathRebindReport, VpnClientProductPathRebindError> {
+        let connection_runtime = self
+            .connection
+            .as_ref()
+            .ok_or(VpnClientProductPathRebindError::ConnectionUnavailable)?;
+        let connection_stable_id = connection_runtime.connection_stable_id();
+        let session_generation = connection_runtime.accept().session_generation;
+        let connection = connection_runtime.transport_connection().clone();
+
+        let socket = StdUdpSocket::bind(SocketAddr::new(self.bind_ip, 0))
+            .map_err(|error| VpnClientProductPathRebindError::SocketBind(error.kind()))?;
+        socket
+            .set_nonblocking(true)
+            .map_err(|error| VpnClientProductPathRebindError::SocketConfigure(error.kind()))?;
+        let rebind_result = if self.configured_paths.is_empty() {
+            // With no explicit source contract, retain NoQ's standard network-change handling so
+            // the operating system can select and migrate the implicit path.
+            self.endpoint.rebind(socket)
+        } else {
+            self.endpoint.rebind_preserving_paths(socket)
+        };
+        rebind_result
+            .map_err(|error| VpnClientProductPathRebindError::SocketRebind(error.kind()))?;
+        self.local_addr = self
+            .endpoint
+            .local_addr()
+            .map_err(|error| VpnClientProductPathRebindError::LocalAddress(error.kind()))?;
+        self.socket_generation = self.socket_generation.saturating_add(1);
+
+        let implicit_path_pinged = match self.implicit_path {
+            Some(path_id) => {
+                let path = connection
+                    .path(path_id)
+                    .ok_or(VpnClientProductPathRebindError::ImplicitPathMissing)?;
+                path.ping()
+                    .map_err(|_| VpnClientProductPathRebindError::ImplicitPathPing)?;
+                true
+            }
+            None => false,
+        };
+
+        for configured in &self.configured_paths {
+            if let Some(path) = connection.path(configured.path_id) {
+                let _ = path.ping();
+            }
+        }
+
+        let deadline = Instant::now() + self.operation_timeout;
+        let mut replacements = Vec::with_capacity(self.configured_paths.len());
+        for slot in 0..self.configured_paths.len() {
+            let configured = self.configured_paths[slot];
+            let new_path =
+                open_configured_path(&connection, self.server_addr, configured.local_ip, deadline)
+                    .await
+                    .map_err(|error| map_path_rebind_open_error(slot, error))?;
+            let new_path_id = new_path.id();
+            let network_path = match new_path.network_path() {
+                Ok(network_path) => network_path,
+                Err(_) => {
+                    let _ = new_path.close();
+                    return Err(VpnClientProductPathRebindError::PathInspect);
+                }
+            };
+            let explicit_source_verified = network_path.local_ip() == Some(configured.local_ip);
+            if !explicit_source_verified {
+                let _ = new_path.close();
+                return Err(VpnClientProductPathRebindError::ExplicitSourceMismatch);
+            }
+
+            let mut path_events = connection.path_events();
+            let old_path_abandoned = match connection.path(configured.path_id) {
+                Some(old_path) => match old_path.close() {
+                    Ok(()) => {
+                        if let Err(error) =
+                            wait_for_path_abandoned(&mut path_events, configured.path_id, deadline)
+                                .await
+                        {
+                            let _ = new_path.close();
+                            return Err(error);
+                        }
+                        true
+                    }
+                    Err(ClosePathError::ClosedPath) => true,
+                    Err(ClosePathError::MultipathNotNegotiated | ClosePathError::LastOpenPath) => {
+                        let _ = new_path.close();
+                        return Err(VpnClientProductPathRebindError::PathClose);
+                    }
+                },
+                None => true,
+            };
+            self.configured_paths[slot].path_id = new_path_id;
+            replacements.push(VpnClientProductPathReplacement {
+                slot,
+                old_path_id: configured.path_id.as_u32(),
+                new_path_id: new_path_id.as_u32(),
+                old_path_abandoned,
+                explicit_source_verified,
+            });
+        }
+
+        if connection.stable_id() != connection_stable_id
+            || self.session_generation() != Some(session_generation)
+        {
+            return Err(VpnClientProductPathRebindError::ConnectionUnavailable);
+        }
+        Ok(VpnClientProductPathRebindReport {
+            connection_stable_id,
+            session_generation,
+            socket_generation: self.socket_generation,
+            implicit_path_pinged,
+            replacements,
+        })
     }
 
     pub fn accept(&self) -> crate::VpnAccept {
@@ -690,7 +963,9 @@ impl fmt::Debug for VpnClientProductEndpointRuntime {
         formatter
             .debug_struct("VpnClientProductEndpointRuntime")
             .field("local_addr", &"[redacted]")
+            .field("socket_generation", &self.socket_generation)
             .field("established_path_count", &self.established_path_count)
+            .field("configured_path_count", &self.configured_paths.len())
             .field("accept", &"[redacted]")
             .finish_non_exhaustive()
     }
@@ -700,6 +975,17 @@ impl Drop for VpnClientProductEndpointRuntime {
     fn drop(&mut self) {
         self.request_shutdown();
     }
+}
+
+struct VpnClientConnectedTransport {
+    endpoint: Endpoint,
+    connection: Connection,
+    local_addr: SocketAddr,
+    bind_ip: IpAddr,
+    server_addr: SocketAddr,
+    configured_paths: Vec<VpnClientConfiguredPath>,
+    implicit_path: Option<PathId>,
+    established_path_count: usize,
 }
 
 pub async fn connect_vpn_client_product_endpoint(
@@ -731,7 +1017,17 @@ async fn connect_vpn_client_product_endpoint_inner(
 
     for server_addr in addresses {
         match connect_vpn_client_address(bootstrap, server_addr, limits).await {
-            Ok((endpoint, connection, local_addr, established_path_count)) => {
+            Ok(transport) => {
+                let VpnClientConnectedTransport {
+                    endpoint,
+                    connection,
+                    local_addr,
+                    bind_ip,
+                    server_addr,
+                    configured_paths,
+                    implicit_path,
+                    established_path_count,
+                } = transport;
                 let start_result = match packet_pump {
                     Some(packet_pump) => {
                         start_vpn_client_product_connection_with_packet_pump(
@@ -769,7 +1065,13 @@ async fn connect_vpn_client_product_endpoint_inner(
                     connection: Some(runtime),
                     connection_report: None,
                     local_addr,
+                    bind_ip,
+                    server_addr,
+                    configured_paths,
+                    implicit_path,
+                    socket_generation: 0,
                     established_path_count,
+                    operation_timeout: limits.operation_timeout,
                     drain_timeout: limits.drain_timeout,
                 });
             }
@@ -816,7 +1118,7 @@ async fn connect_vpn_client_address(
     bootstrap: &VpnClientProductBootstrap,
     server_addr: SocketAddr,
     limits: VpnProductEndpointLimits,
-) -> Result<(Endpoint, Connection, SocketAddr, usize), VpnProductEndpointError> {
+) -> Result<VpnClientConnectedTransport, VpnProductEndpointError> {
     let replace_bootstrap_path = bootstrap.config().primary_local_ip().is_some()
         && !bootstrap.config().additional_local_ips().is_empty();
     let bind_ip = if replace_bootstrap_path {
@@ -851,15 +1153,32 @@ async fn connect_vpn_client_address(
             return Err(VpnProductEndpointError::MultipathNotNegotiated);
         }
 
-        let configured_paths = bootstrap
+        let explicit_local_ips = bootstrap
             .config()
             .primary_local_ip()
-            .filter(|_| replace_bootstrap_path)
             .into_iter()
             .chain(bootstrap.config().additional_local_ips().iter().copied())
             .collect::<Vec<_>>();
-        for local_ip in &configured_paths {
-            open_configured_path(&connection, server_addr, *local_ip, deadline).await?;
+        let mut configured_paths = Vec::with_capacity(explicit_local_ips.len());
+        if let Some(primary) = bootstrap.config().primary_local_ip()
+            && !replace_bootstrap_path
+        {
+            configured_paths.push(VpnClientConfiguredPath {
+                local_ip: primary,
+                path_id: PathId::ZERO,
+            });
+        }
+        let paths_to_open = if replace_bootstrap_path {
+            explicit_local_ips.as_slice()
+        } else {
+            bootstrap.config().additional_local_ips()
+        };
+        for local_ip in paths_to_open {
+            let path = open_configured_path(&connection, server_addr, *local_ip, deadline).await?;
+            configured_paths.push(VpnClientConfiguredPath {
+                local_ip: *local_ip,
+                path_id: path.id(),
+            });
         }
         if replace_bootstrap_path {
             connection
@@ -868,18 +1187,33 @@ async fn connect_vpn_client_address(
                 .close()
                 .map_err(|_| VpnProductEndpointError::BootstrapPathClose)?;
         }
-        let established_path_count = if replace_bootstrap_path {
-            configured_paths.len()
-        } else {
-            configured_paths.len().saturating_add(1)
-        };
-        Ok((connection, established_path_count))
+        let implicit_path = bootstrap
+            .config()
+            .primary_local_ip()
+            .is_none()
+            .then_some(PathId::ZERO);
+        let established_path_count = configured_paths.len() + usize::from(implicit_path.is_some());
+        Ok((
+            connection,
+            configured_paths,
+            implicit_path,
+            established_path_count,
+        ))
     }
     .await;
 
     match result {
-        Ok((connection, established_path_count)) => {
-            Ok((endpoint, connection, local_addr, established_path_count))
+        Ok((connection, configured_paths, implicit_path, established_path_count)) => {
+            Ok(VpnClientConnectedTransport {
+                endpoint,
+                connection,
+                local_addr,
+                bind_ip,
+                server_addr,
+                configured_paths,
+                implicit_path,
+                established_path_count,
+            })
         }
         Err(error) => {
             endpoint.close(
@@ -897,15 +1231,17 @@ async fn open_configured_path(
     server_addr: SocketAddr,
     local_ip: IpAddr,
     deadline: Instant,
-) -> Result<(), VpnProductEndpointError> {
+) -> Result<Path, VpnProductEndpointError> {
     loop {
         let open = connection.open_path(
             FourTuple::new(server_addr, Some(local_ip)),
             PathStatus::Available,
         );
         match timeout_at(deadline, open).await {
-            Ok(Ok(_)) => return Ok(()),
-            Ok(Err(PathError::RemoteCidsExhausted)) if Instant::now() < deadline => {
+            Ok(Ok(path)) => return Ok(path),
+            Ok(Err(PathError::RemoteCidsExhausted | PathError::MaxPathIdReached))
+                if Instant::now() < deadline =>
+            {
                 sleep(PATH_CID_RETRY_INTERVAL).await;
             }
             Ok(Err(error)) => {
@@ -913,6 +1249,37 @@ async fn open_configured_path(
             }
             Err(_) => return Err(VpnProductEndpointError::PathOpenTimeout),
         }
+    }
+}
+
+async fn wait_for_path_abandoned(
+    events: &mut noq::PathEvents,
+    expected: PathId,
+    deadline: Instant,
+) -> Result<(), VpnClientProductPathRebindError> {
+    loop {
+        match timeout_at(deadline, events.next()).await {
+            Ok(Some(Ok(PathEvent::Abandoned { id, .. }))) if id == expected => return Ok(()),
+            Ok(Some(Ok(_))) => {}
+            Ok(Some(Err(_))) => return Err(VpnClientProductPathRebindError::PathEventLagged),
+            Ok(None) => return Err(VpnClientProductPathRebindError::PathEventClosed),
+            Err(_) => return Err(VpnClientProductPathRebindError::PathAbandonTimeout),
+        }
+    }
+}
+
+fn map_path_rebind_open_error(
+    slot: usize,
+    error: VpnProductEndpointError,
+) -> VpnClientProductPathRebindError {
+    match error {
+        VpnProductEndpointError::PathOpen(error) => {
+            VpnClientProductPathRebindError::PathOpen { slot, error }
+        }
+        VpnProductEndpointError::PathOpenTimeout => {
+            VpnClientProductPathRebindError::PathOpenTimeout { slot }
+        }
+        _ => unreachable!("configured path helper only returns path-open errors"),
     }
 }
 
@@ -1065,7 +1432,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn endpoint_rejects_then_reuses_packet_devices_for_two_generations() {
+    async fn endpoint_rejects_then_reuses_packet_devices_across_path_configurations() {
         let _network_test_guard = crate::LOCAL_NETWORK_TEST_LOCK.lock().await;
         let deployment = runtime_tests::TestDeployment::new();
         let server_addr = reserve_udp_address();
@@ -1106,10 +1473,19 @@ mod tests {
             .reload_from_path(&deployment.path.join("vpn-identities.json"))
             .unwrap();
 
-        let first = connect_vpn_client_product_endpoint(&client, &client_device, limits)
+        let mut first = connect_vpn_client_product_endpoint(&client, &client_device, limits)
             .await
             .unwrap();
         assert_eq!(first.established_path_count(), 2);
+        let connection_stable_id = first.connection_stable_id().unwrap();
+        let session_generation = first.session_generation().unwrap();
+        let initial_paths = first.configured_path_snapshots();
+        assert_eq!(initial_paths.len(), 2);
+        assert!(
+            initial_paths
+                .iter()
+                .all(|path| path.active && path.explicit_source_verified)
+        );
         let uplink = runtime_tests::ipv4_packet(1280, "10.77.0.2", "198.51.100.8", 0x61);
         client_tun.send(&uplink).await.unwrap();
         let mut buffer = vec![0_u8; 1600];
@@ -1118,6 +1494,37 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(&buffer[..received], uplink.as_slice());
+        let rebind = first.rebind_network_paths().await.unwrap();
+        assert_eq!(rebind.connection_stable_id, connection_stable_id);
+        assert_eq!(rebind.session_generation, session_generation);
+        assert_eq!(rebind.socket_generation, 1);
+        assert!(!rebind.implicit_path_pinged);
+        assert_eq!(rebind.replacements.len(), 2);
+        assert!(rebind.replacements.iter().all(|replacement| {
+            replacement.old_path_abandoned
+                && replacement.explicit_source_verified
+                && replacement.old_path_id != replacement.new_path_id
+        }));
+        let rebound_paths = first.configured_path_snapshots();
+        assert_eq!(rebound_paths.len(), initial_paths.len());
+        assert!(
+            rebound_paths
+                .iter()
+                .all(|path| path.active && path.explicit_source_verified)
+        );
+        for (initial, rebound) in initial_paths.iter().zip(&rebound_paths) {
+            assert_eq!(initial.slot, rebound.slot);
+            assert_ne!(initial.path_id, rebound.path_id);
+        }
+        assert_eq!(first.connection_stable_id(), Some(connection_stable_id));
+        assert_eq!(first.session_generation(), Some(session_generation));
+        let rebound_uplink = runtime_tests::ipv4_packet(1280, "10.77.0.2", "198.51.100.9", 0x62);
+        client_tun.send(&rebound_uplink).await.unwrap();
+        let received = timeout(Duration::from_secs(2), server_tun.recv(&mut buffer))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&buffer[..received], rebound_uplink.as_slice());
         let busy_error = connect_vpn_client_product_endpoint(&client, &client_device, limits)
             .await
             .unwrap_err();
@@ -1130,10 +1537,46 @@ mod tests {
         assert!(first_report.endpoint_drained);
         wait_for_session_release(&server).await;
 
-        let second = connect_vpn_client_product_endpoint(&client, &client_device, limits)
-            .await
-            .unwrap();
-        assert_eq!(second.established_path_count(), 2);
+        configure_endpoint(
+            &deployment,
+            server_addr,
+            &format!("localhost:{}", server_addr.port()),
+            Some("127.0.0.1"),
+            &[],
+        );
+        let primary_only_client =
+            crate::load_vpn_client_product_bootstrap(&deployment.client_config).unwrap();
+        let mut second =
+            connect_vpn_client_product_endpoint(&primary_only_client, &client_device, limits)
+                .await
+                .unwrap();
+        assert_eq!(second.established_path_count(), 1);
+        let second_connection_stable_id = second.connection_stable_id().unwrap();
+        let second_session_generation = second.session_generation().unwrap();
+        let primary_path = second.configured_path_snapshots();
+        assert_eq!(primary_path.len(), 1);
+        assert_eq!(primary_path[0].path_id, PathId::ZERO.as_u32());
+        assert!(primary_path[0].active && primary_path[0].explicit_source_verified);
+        let primary_rebind = second.rebind_network_paths().await.unwrap();
+        assert_eq!(
+            primary_rebind.connection_stable_id,
+            second_connection_stable_id
+        );
+        assert_eq!(primary_rebind.session_generation, second_session_generation);
+        assert_eq!(primary_rebind.replacements.len(), 1);
+        assert_eq!(
+            primary_rebind.replacements[0].old_path_id,
+            PathId::ZERO.as_u32()
+        );
+        assert!(
+            primary_rebind.replacements[0].old_path_abandoned
+                && primary_rebind.replacements[0].explicit_source_verified
+        );
+        assert_eq!(
+            second.connection_stable_id(),
+            Some(second_connection_stable_id)
+        );
+        assert_eq!(second.session_generation(), Some(second_session_generation));
         let downlink = runtime_tests::ipv6_packet(1500, "2001:db8::8", "fd77::2", 0x72);
         server_tun.send(&downlink).await.unwrap();
         let received = timeout(Duration::from_secs(2), client_tun.recv(&mut buffer))
@@ -1145,6 +1588,42 @@ mod tests {
         assert!(second_report.endpoint_drained);
         wait_for_session_release(&server).await;
 
+        configure_endpoint(
+            &deployment,
+            server_addr,
+            &server_addr.to_string(),
+            None,
+            &[],
+        );
+        let implicit_client =
+            crate::load_vpn_client_product_bootstrap(&deployment.client_config).unwrap();
+        let mut third =
+            connect_vpn_client_product_endpoint(&implicit_client, &client_device, limits)
+                .await
+                .unwrap();
+        assert_eq!(third.established_path_count(), 1);
+        assert!(third.configured_path_snapshots().is_empty());
+        let third_connection_stable_id = third.connection_stable_id().unwrap();
+        let third_session_generation = third.session_generation().unwrap();
+        let implicit_rebind = third.rebind_network_paths().await.unwrap();
+        assert_eq!(
+            implicit_rebind.connection_stable_id,
+            third_connection_stable_id
+        );
+        assert_eq!(implicit_rebind.session_generation, third_session_generation);
+        assert!(implicit_rebind.implicit_path_pinged);
+        assert!(implicit_rebind.replacements.is_empty());
+        let implicit_uplink = runtime_tests::ipv4_packet(1280, "10.77.0.2", "198.51.100.10", 0x63);
+        client_tun.send(&implicit_uplink).await.unwrap();
+        let received = timeout(Duration::from_secs(2), server_tun.recv(&mut buffer))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&buffer[..received], implicit_uplink.as_slice());
+        let third_report = third.shutdown().await;
+        assert!(third_report.endpoint_drained);
+        wait_for_session_release(&server).await;
+
         let server_report = server_runtime.shutdown().await.unwrap();
         assert_eq!(
             server_report.stop_reason,
@@ -1152,7 +1631,7 @@ mod tests {
         );
         assert_eq!(server_report.session_rejections, 1);
         assert_eq!(server_report.busy_refusals, 1);
-        assert_eq!(server_report.completed_sessions, 2);
+        assert_eq!(server_report.completed_sessions, 3);
         assert_eq!(server_report.runtime_start_failures, 0);
         assert_eq!(server_report.worker_failures, 0);
         assert_eq!(server_report.forced_session_shutdowns, 0);

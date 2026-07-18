@@ -16,11 +16,11 @@
 | --- | --- | --- |
 | 数据面 | `FWI1`、真实重组、有界队列、双方 NoQ DATAGRAM、包设备桥接和真实 TUN 已在隔离三 namespace 中串通 UDP、TCP、双栈 ICMP、精确 MTU、连续代际、外层失联、READY 后 policy routing、IPv4 NAT 与 IPv6 无 NAT | 更完整故障矩阵和无全局队头阻塞 |
 | 身份 | mTLS、证书指纹、双证书轮换、禁用、在线撤销和同步服务端身份重载已完成；独立产品进程在 READY 前装配并交叉验证证书、私钥、CA 与身份预算 | 完整身份增删/差异预览工具、客户端在线 TLS 身份切换和长期多客户端攻击门控 |
-| 会话 | 单活动代际、成功后替换、地址漂移拒绝、启动失败回滚、进程级唯一 TUN reader、离线包丢弃计数、首次 READY 前后 250 ms～30 秒随机指数退避重连，以及非特权 netlink 恢复事件提前唤醒已完成；真实门控覆盖客户端先启动/服务端后出现、身份恢复、外层 link down/up、至少 8 秒退避的事件唤醒和服务端重启，systemd 启动截止会收敛始终未 READY 的激活 | NAT rebinding/原位路径重建专项门控和客户端在线 TLS 身份切换 |
+| 会话 | 单活动代际、成功后替换、地址漂移拒绝、启动失败回滚、进程级唯一 TUN reader、离线包丢弃计数、首次 READY 前后 250 ms～30 秒随机指数退避重连、非特权 netlink 提前唤醒，以及同一已连接 QUIC 内的显式路径原位替换已完成；真实门控覆盖客户端先启动/服务端后出现、身份恢复、单链 down/up、至少 8 秒退避的事件唤醒、服务端重启，并用独立 NAT router 证明 SNAT mapping rebinding 时 stable ID 与 `FWC1` generation 不变 | 客户端在线 TLS 身份切换、长期静默与多客户端切换矩阵 |
 | 地址与策略 | 静态虚拟 IPv4/IPv6、源地址防伪、双向 ACL、每身份配额、客户端 `ACCEPT` 工厂、独立 TUN 路由表，以及只匹配启用身份精确地址的服务端 forwarding/NAT 已完成隔离验证 | 管理流量豁免策略和 DNS 接管 |
 | 权限 | 非 root、无可重新启用的 `CAP_NET_ADMIN`、`NoNewPrivileges` 数据进程只附着既有 TUN 的边界已实测；独立 root helper 已事务化准备/清理 TUN，并激活/撤销 client policy routes 与 server nft/sysctl；Type=notify 安装单元只让短命 `+` helper 获得 root | 真实宿主特权安装验收、发行版兼容和升级/回退权限审计 |
 | 运维 | fixed-tcp 首次安装/systemd/JSONL/健康门控；VPN 已有非特权产品命令、严格 READY/systemd notify、版本化网络事务、client/server 安装单元和失败恢复说明 | DNS、升级迁移、自动回退、配置检查和告警出口 |
-| 验证 | fixed-tcp soak、真实 mTLS/FWC1/DATAGRAM loopback，隔离真实 TUN 的 UDP/TCP/ICMP/MTU/`SIGKILL`，产品进程 READY/正常停止/离线停止，UID 外层逃生，IPv4 NAT/IPv6 无 NAT，身份 reload、原 PID 身份恢复、外层链路与 netlink 提前唤醒、服务端重启，route/rule/nft/sysctl 冲突、漂移和崩溃恢复，以及真实 user-systemd 生命周期与同步 reload | 多路径切换、NAT rebinding、独立出口、多日和跨版本门控 |
+| 验证 | fixed-tcp soak、真实 mTLS/FWC1/DATAGRAM loopback，隔离真实 TUN 的 UDP/TCP/ICMP/MTU/`SIGKILL`，产品进程 READY/正常停止/离线停止，UID 外层逃生，IPv4 NAT/IPv6 无 NAT，身份 reload、原 PID 身份恢复、完整重连、netlink 提前唤醒，以及双 outer-path 的 PathId 增删、显式源 IP 保持和固定 SNAT 40000→40001 原位恢复，另有 route/rule/nft/sysctl 冲突、漂移、崩溃恢复和真实 user-systemd 生命周期 | 独立运营商出口、多客户端、多日和跨版本门控 |
 
 因此不能复用 `FWX1` 冒充 VPN。VPN 使用独立 ALPN、独立配置类型和独立线协议；固定代理保持兼容。
 
@@ -144,6 +144,8 @@ body[body_len]
 ### 重连与离线行为
 
 客户端保持 TUN 存活并由内部 supervisor 重连：初始 250 ms、指数增长到 30 秒、加入随机抖动。非特权 `NETLINK_ROUTE` 监听只把 link 可用、地址/路由新增或事件丢失当作“值得重新验证”的提示；至少保留 250 ms 防抖且不得绕过服务端更长 retry-after。监听创建、读取或解析失败时记录脱敏计数并停用监听，原定时器继续保证进展。不得无限缓存离线流量：发送队列按包数和字节双重限制，满或断线时丢弃并增加稳定指标。重连成功后不重放旧 IP 包。
+
+连接仍在线时不把每个 netlink 通知都升级为整连接重建。普通 route 新增只排空并记录；link/address 恢复或事件丢失先等待 250 ms，让地址与策略路由完成提交，再换用新的 UDP socket。产品层维护“显式配置槽位 → PathId”，逐槽位打开绑定原配置源 IP 的新路径，验证成功后才关闭旧路径并等待 `Abandoned` 事件；同一成功波次后 5 秒内的 DAD/address 通知会被合并。任何报告都只含 stable ID、session generation、slot、PathId、布尔校验与计数，不记录本地、远端或 NAT 地址。
 
 服务端地址重新解析、证书验证、全部配置路径验证和会话建立都必须重新执行。不得在失败时关闭 TLS 校验、静默退化到单路径后仍报告多路径已配置，或切换到未授权服务器。
 
@@ -453,7 +455,21 @@ M2.3 第三小步固定为“网络恢复事件提前唤醒，但完整重连合
 - `scripts/run_vpn_tun_lab.sh` 让真实非特权客户端在 `fwclient0` down 后保持原 PID 和 route，等待 `vpn_client_reconnect_waiting` 增长到至少 8 秒才把 veth 置 up；客户端必须先输出真实 `vpn_client_retry_network_event:reconnect:link_available`，随后原 PID 完成严格 mTLS/MPQUIC/FWC1、恢复双栈流量。若只靠定时器到期或监听权限不足，本门控会失败。
 - 同一纵切随后停止/重启服务端并在第二次离线时 SIGTERM 客户端，证明没有 netlink 变化时定时器兜底和有界停止语义均未回归；全部网络对象仍只存在于一次性 namespace。
 
-仍未完成：已连接 QUIC 的原位路径增删/NAT rebinding 专项观测、客户端 SIGHUP 重新读取证书/私钥并安全切换、长期静默与多客户端故障矩阵。前三小步关闭了“首次和后续连接能否安全重建、旧包是否重放、等待能否由真实网络恢复安全缩短、systemd 启动怎样收敛”的基础合同，仍不等于 M2.3 完成。
+M2.3 第四小步固定为“已连接 QUIC 的显式路径原位替换与真实 NAT mapping rebinding”，不得用整个 Endpoint 或 `FWC1` 代际重建代替：
+
+- NoQ 通用 `handle_network_change(None)` 会清空所有路径的 `local_ip`，不满足产品的显式多出口合同。本步增加仅切换 UDP sender、由调用方负责迁移的 `Endpoint::rebind_preserving_paths`；产品运行对象持有配置槽位、远端地址和当前 PathId，不能调用无提示的通用替换路径。
+- 每次操作先绑定同地址族的新 UDP socket；对无显式源的引导路径只发送探活，对每个显式槽位逐条 `open_path(FourTuple { local_ip: Some(configured) })`。新路径必须完成远端验证且读回的 `local_ip` 与配置精确一致，之后才关闭旧 PathId 并等待其 `PathEvent::Abandoned`。多槽位串行“先开后关”，客户端和服务端传输参数分别预留 bootstrap transient 与一个运行期 spare，不能一次把所有候选同时打开。
+- 公开观测只暴露 connection stable ID、服务端签发的非零 session generation、socket generation、配置槽位、旧/新 PathId、旧路径是否 abandoned 和显式源是否验证；进程报告累计 `network_path_rebinds`、`network_path_replacements`、`network_path_rebind_failures`。成功前后 stable ID/generation 必须相同，且日志中不得出现 `vpn_client_connection_lost` 或 `vpn_client_reconnected`。
+- 在线 route 新增不触发 rebind；link/address/overrun 先经过 250 ms settle。一次成功后以 5 秒合并同一 link-up 产生的 DAD/address 波次，防止连续更换 socket；若首次操作失败则不进入长冷却，让后续真正补齐地址的事件仍有机会重试。FlowWeave 仍不创建 outer 地址或源路由，管理员必须让配置路径在 settle 窗内真实可达。
+
+第四小步实现证据：
+
+- 真实 loopback 产品纵切在两条显式路径已经传输 TUN 包后调用同一运行对象 rebind；两个新 PathId 均保留显式源，两个旧 PathId 均收到 `Abandoned`，connection stable ID 与 `FWC1` generation 不变，随后同一 TUN/QUIC 会话继续传包。后续代际又分别验证 primary-only 的 `PathId 0 → 新 PathId` 产品替换，以及部署样例“无显式源”继续走 NoQ 标准 OS 源地址迁移，三种配置都在 rebind 后继续传输。路径容量单元测试另锁定无显式路径、primary-only、additional-only 和 primary+additional 的 bootstrap/spare 预算。
+- `scripts/run_vpn_tun_lab.sh` 在原 client/server/internet 之外临时创建独立 `fwnat` namespace。第二条 outer path 使用 `203.0.113.2` 显式源和 source-policy route，经真实 IPv4 forwarding/conntrack 固定 SNAT 到 `198.18.0.2:40000`；脚本确认初始 nft 包计数后删除该 link 与源路由，把映射改为 `:40001`，再恢复 link/route。
+- link-up 后同一个非特权客户端 PID 输出两条严格 replacement：原两个 PathId 分别成为对应槽位的新 PathId，旧路径均为 `Abandoned`、显式源均验证；汇总中的 stable ID 和 session generation 与 READY 时快照相等。新 40001 SNAT 规则必须有真实包计数，IPv4/IPv6 TUN 流量继续往返，并且本阶段前后 `connection_lost`/`reconnected` 计数不变。随后恢复可分配端口的 SNAT 规则，脚本原有的身份撤销/恢复、整连接重连、单链失联唤醒与 cleanup 矩阵继续全部通过。
+- 门控不依赖 `conntrack` 或抓包工具，也没有把 `Endpoint::rebind` 本身冒充 NAT：独立 router 的 nft 固定端口规则与计数证明外层映射真实从 40000 变为 40001；stable ID/generation/PathId 日志证明恢复发生在原 QUIC/FWC1 会话内。
+
+仍未完成：客户端 SIGHUP 重新读取证书/私钥并安全切换、长期静默、多客户端并发切换与独立运营商故障矩阵。前四小步关闭了“首次和后续连接能否安全重建、旧包是否重放、等待能否由真实网络恢复安全缩短、已连接会话能否保持显式源完成真实 NAT rebinding、systemd 启动怎样收敛”的基础合同，仍不等于 M2.3 完成。
 
 ### M2.4：运维产品化
 

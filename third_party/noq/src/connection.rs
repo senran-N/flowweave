@@ -1746,9 +1746,14 @@ impl State {
     ) -> Result<(), ConnectionError> {
         loop {
             match self.conn_events.poll_recv(cx) {
-                Poll::Ready(Some(ConnectionEvent::Rebind(sender))) => {
+                Poll::Ready(Some(ConnectionEvent::Rebind {
+                    sender,
+                    network_change,
+                })) => {
                     self.sender = sender;
-                    self.inner.handle_network_change(None, self.runtime.now());
+                    if network_change {
+                        self.inner.handle_network_change(None, self.runtime.now());
+                    }
                 }
                 Poll::Ready(Some(ConnectionEvent::LocalAddressChanged(hint))) => {
                     self.inner

@@ -80,8 +80,8 @@ impl PathId {
         self.saturating_add(Self(1))
     }
 
-    /// Get the underlying u32
-    pub(crate) fn as_u32(&self) -> u32 {
+    /// Get the underlying `u32` value.
+    pub const fn as_u32(&self) -> u32 {
         self.0
     }
 }

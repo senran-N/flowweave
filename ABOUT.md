@@ -87,6 +87,6 @@ Most importantly, we learned to treat complexity as something that must be earne
 
 ## What’s Next
 
-The client now uses unprivileged Linux network events to shorten reconnect backoff while retaining timer fallback and full TLS/session revalidation. The next steps are dedicated in-place path and NAT-rebinding tests, online client certificate rotation, DNS integration, multi-client stress testing, real-host installation validation, and longer trials across genuinely independent network providers.
+The client now uses unprivileged Linux network events both to shorten offline reconnect backoff and to refresh explicit paths inside an already-connected QUIC session. A rootless namespace gate removes and restores a second outer path, changes a real SNAT mapping from one fixed port to another, and verifies that the client PID, QUIC stable ID, and VPN session generation remain unchanged while old path IDs are abandoned and dual-stack tunnel traffic continues. The next steps are online client certificate rotation, DNS integration, multi-client stress testing, real-host installation validation, and longer trials across genuinely independent network providers.
 
 The long-term vision remains simple: make several imperfect networks feel like one resilient connection.
