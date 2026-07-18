@@ -1,6 +1,6 @@
 # FlowWeave VPN 身份与轮换合同
 
-本文件描述 VPN 模式的身份地基，不替代 [deploy/README.md](deploy/README.md) 的受控试点步骤。仓库现已有非特权 VPN 数据进程、事务化 TUN/路由/NAT helper、Type=notify client/server 单元、同步服务端身份 reload，以及客户端首次 READY 前后都不缓存旧包的选择性内部重试；但 DNS、网络变化事件唤醒、完整身份增删工具、真实宿主安装验收与跨版本回退仍未完成。
+本文件描述 VPN 模式的身份地基，不替代 [deploy/README.md](deploy/README.md) 的受控试点步骤。仓库现已有非特权 VPN 数据进程、事务化 TUN/路由/NAT helper、Type=notify client/server 单元、同步服务端身份 reload、同步客户端 TLS 凭据 reload，以及客户端首次 READY 前后都不缓存旧包的选择性内部重试和非特权网络恢复事件唤醒；但 DNS、完整身份增删工具、真实宿主安装验收与跨版本回退仍未完成。
 
 ## 信任链
 
@@ -67,7 +67,11 @@ openssl x509 -in client-cert.pem -outform DER |
 
 正式服务端使用 `systemctl reload flowweave-vpn-server.service` 通过 owner-only Unix socket 同步提交候选，不使用无法等待完成的异步 `kill -HUP`。reload 会重新执行文件权限、严格 JSON、身份冲突、逐身份 limits 和服务端全局重组预算检查。明确的 `vpn_server_reload_rejected` 表示候选未提交，旧内存注册表与健康会话保持不变；connect/I/O/timeout/invalid-response 表示交付结果不确定，因为提交可能发生在响应丢失前，必须结合脱敏 journal 并重试同一候选。磁盘候选不会自动回退，管理员必须取得一次明确成功的 reload 后才能安全重启服务。
 
-在线 reload 还必须保持 root 网络事务兼容：服务端地址和全部客户端虚拟地址集合不得变化；启用 forwarding 时，enabled 身份地址集合也不得变化。证书指纹、ACL 和 limits 可在线修改；地址增删/迁移以及会改变 nft 精确源地址集合的 enable/disable 必须受控重启。删除当前证书指纹但保留同身份的新指纹不会改变网络集合，因此可以在线立即撤销旧会话。客户端尚未实现在线证书/私钥切换，轮换中切到新证书需要一次受控客户端重启。
+服务端在线 reload 还必须保持 root 网络事务兼容：服务端地址和全部客户端虚拟地址集合不得变化；启用 forwarding 时，enabled 身份地址集合也不得变化。证书指纹、ACL 和 limits 可在线修改；地址增删/迁移以及会改变 nft 精确源地址集合的 enable/disable 必须受控重启。删除当前证书指纹但保留同身份的新指纹不会改变网络集合，因此可以在线立即撤销旧会话。
+
+正式客户端使用 `systemctl reload flowweave-vpn-client.service`，通过自己的 owner-only Unix socket 调用 `flowweave-vpn reload-client`。每次请求重新严格解析同一路径的 client product config，并要求规范化后的配置与内存配置完全相同；服务端名称/CA 路径、TUN、地址、ACL、limits、outer path 或任何其他配置变化都返回明确拒绝并要求受控重启。只有现有三个路径所指向的服务端 CA、客户端叶证书和 PKCS#8 私钥内容可变化。候选会重新执行普通文件、大小、私钥权限、CA 解析和证书/私钥匹配校验；任一失败都不替换内存 bootstrap、不关闭旧健康会话。内容完全相同时幂等成功且不重连。
+
+有效且内容变化的候选在响应成功前提交到内存，然后客户端有界关闭旧 QUIC 代际，并在同一 PID、同一唯一 TUN packet pump、同一配额/指标对象和同一 policy-route 事务内立即建立新的 TLS/MPQUIC/`FWC1` 代际。同步成功只证明本地候选已提交，不把远端授权冒充为完成：必须再看到脱敏的 `vpn_client_credentials_active` 并验证真实流量，才证明服务端接受了新指纹。如果服务端尚未登记候选，客户端保持离线重试和 reload socket 可用；管理员可修正文件并再次 reload，而旧 TUN 包继续立即丢弃、不在新代际重放。直接 SIGHUP 调用同一本地候选函数，但正式、可判定结果的运维合同以同步控制命令为准。
 
 增加第二指纹本身不关闭使用旧指纹的健康会话。删除当前会话使用的指纹、禁用/删除身份，或修改该身份的虚拟地址、ACL、资源 limits 时，协调器会先原子撤销其“当前代际”资格，再使用稳定应用关闭码关闭连接。新候选只有在真实 mTLS、`FWC1 ACCEPT` 写入成功且提交时仍符合最新身份文件后，才替换旧代际；任何握手、版本、身份或提交竞态失败都不能踢掉健康旧连接。
 
@@ -117,6 +121,6 @@ openssl x509 -in client-cert.pem -outform DER |
 - 客户端工厂会验证 `ACCEPT`、地址族、本地 ACL 和全局资源上限，并直接绑定服务端分配地址、会话代际和协商包长；重复 ACL、缺失地址族和非法资源值全部失败关闭；两个同时存活的重连代际已验证共享同一包速率桶和全局未完成包预算；
 - 一条真实组合链路已经串通 mTLS、`FWC1`、受管服务端会话、客户端工厂和双方 DATAGRAM 运行器，完成分片 IPv4 上行、IPv6 下行、协商包长超限拒绝；服务端关闭和成功代际替换都会使旧运行器退出；
 - IPv4/IPv6 严格头检查之后的上行源地址防伪、双向 ACL 与下行错投拒绝；
-- 身份文件失败重载保持活动会话，成功禁用重载原子撤销并关闭当前连接；产品级同步 reload 另验证了双指纹重叠保持真实 TUN 会话、删除活动指纹立即撤销、恢复原身份后新 mTLS 会话可重新建立。
+- 身份文件失败重载保持活动会话，成功禁用重载原子撤销并关闭当前连接；产品级同步 reload 另验证了双指纹重叠保持真实 TUN 会话、客户端同 PID 切换到第二张真实证书、删除旧指纹后旧证书新会话明确 `unauthorized`、离线 reload 新证书恢复，以及删除活动新指纹后的撤销/恢复。
 
-尚未完成完整身份增删/差异预览工具、客户端在线 TLS 身份切换、DNS 接管与回退、长期多客户端资源攻击/故障注入、真实宿主安装/升级门控，以及 nightly + AddressSanitizer 门控。客户端现已用非特权 netlink 恢复提示提前唤醒重连，但提示仍会重新执行严格 TLS/身份与 `FWC1`，不会把网络可用误当成授权成功。现有服务端同步 reload、READY 前后客户端内部重试、TUN/路由/NAT 事务和 systemd 生命周期只把身份轮换接入受控试点，不能据此证明 VPN 已达到生产可部署标准。
+尚未完成完整身份增删/差异预览工具、DNS 接管与回退、长期多客户端资源攻击/并发轮换故障注入、真实宿主安装/升级门控，以及 nightly + AddressSanitizer 门控。客户端的凭据 reload 和非特权 netlink 提示都必须重新执行严格 TLS/身份与 `FWC1`，不会把本地提交或网络可用误当成远端授权成功。现有双端同步 reload、READY 前后客户端内部重试、TUN/路由/NAT 事务和 systemd 生命周期只把身份轮换接入受控试点，不能据此证明 VPN 已达到生产可部署标准。

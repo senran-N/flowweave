@@ -172,6 +172,20 @@ unshare \
                     "$state_directory/reload-control/server.sock"
         }
 
+        run_client_reload() {
+            ip netns exec fwclient \
+                setpriv \
+                    --no-new-privs \
+                    --bounding-set=-all \
+                    --inh-caps=-all \
+                    --ambient-caps=-all \
+                    --reuid=1000 \
+                    --regid=1000 \
+                    --clear-groups \
+                    "$product_binary" reload-client \
+                    "$state_directory/reload-control/client.sock"
+        }
+
         install_identity_candidate() {
             candidate=$1
             install -o 0 -g 1000 -m 0640 \
@@ -180,6 +194,21 @@ unshare \
             mv -f \
                 "$state_directory/.vpn-identities.next" \
                 "$state_directory/vpn-identities.json"
+        }
+
+        install_client_credentials() {
+            certificate=$1
+            private_key=$2
+            install -o 1000 -g 1000 -m 0600 \
+                "$certificate" \
+                "$state_directory/.client.cert.next"
+            install -o 1000 -g 1000 -m 0600 \
+                "$private_key" \
+                "$state_directory/.client.key.next"
+            mv -f "$state_directory/.client.cert.next" \
+                "$state_directory/client.cert.der"
+            mv -f "$state_directory/.client.key.next" \
+                "$state_directory/client.key.der"
         }
 
         ip netns add fwserver
@@ -644,7 +673,9 @@ unshare \
                 --reuid=1000 \
                 --regid=1000 \
                 --clear-groups \
-                "$5" client "$3/vpn-client.json" \
+                env \
+                    FLOWWEAVE_VPN_CLIENT_RELOAD_SOCKET="$3/reload-control/client.sock" \
+                    "$5" client "$3/vpn-client.json" \
             >"$3/product-startup.client.log" 2>&1 &
         client_pid=$!
         sleep 0.2
@@ -737,7 +768,9 @@ unshare \
                 --reuid=1000 \
                 --regid=1000 \
                 --clear-groups \
-                "$5" client "$3/vpn-client.json" \
+                env \
+                    FLOWWEAVE_VPN_CLIENT_RELOAD_SOCKET="$3/reload-control/client.sock" \
+                    "$5" client "$3/vpn-client.json" \
             >"$3/product.client.log" 2>&1 &
         client_pid=$!
         wait_for_log_prefix_count \
@@ -1036,6 +1069,12 @@ unshare \
         install -o 0 -g 0 -m 0600 \
             "$3/vpn-identities.json" \
             "$3/vpn-identities.original.json"
+        install -o 1000 -g 1000 -m 0600 \
+            "$3/client.cert.der" \
+            "$3/client-original.cert.der"
+        install -o 1000 -g 1000 -m 0600 \
+            "$3/client.key.der" \
+            "$3/client-original.key.der"
         printf "%s" "{invalid-json" >"$3/vpn-identities.invalid.json"
         install_identity_candidate "$3/vpn-identities.invalid.json"
         if run_product_reload >"$3/reload-invalid.log" 2>&1; then
@@ -1076,7 +1115,37 @@ unshare \
         ip netns exec fwclient \
             ping -6 -n -c 1 -s 1300 -W 2 -w 5 fd77::1 >/dev/null
 
-        replacement_fingerprint=2222222222222222222222222222222222222222222222222222222222222222
+        install_client_credentials \
+            "$3/client-next.cert.der" \
+            "$3/client-original.key.der"
+        if run_client_reload >"$3/client-reload-invalid.log" 2>&1; then
+            echo "证书/私钥不匹配的客户端 reload 意外成功" >&2
+            exit 1
+        fi
+        grep -Fqx vpn_client_reload_rejected "$3/client-reload-invalid.log"
+        kill -0 "$client_pid"
+        test "$(grep -Fc "vpn_client_connection_lost:" \
+            "$3/product.client.log" || true)" = "$connection_losses_before"
+        ip netns exec fwclient \
+            ping -4 -n -c 1 -s 1300 -W 2 -w 5 10.77.0.1 >/dev/null
+        install_client_credentials \
+            "$3/client-original.cert.der" \
+            "$3/client-original.key.der"
+        run_client_reload
+
+        replacement_fingerprint=$(
+            sha256sum "$3/client-next.cert.der" | awk "{print \$1}"
+        )
+        case "$replacement_fingerprint" in
+            ""|*[!0-9a-f]*)
+                echo "无法生成新客户端叶证书的严格 SHA-256 指纹" >&2
+                exit 1
+                ;;
+        esac
+        if [ "${#replacement_fingerprint}" -ne 64 ]; then
+            echo "新客户端叶证书的 SHA-256 指纹长度错误" >&2
+            exit 1
+        fi
         jq \
             --arg replacement "$replacement_fingerprint" \
             ".identities[0].fingerprints += [\$replacement]" \
@@ -1089,6 +1158,45 @@ unshare \
         ip netns exec fwclient \
             ping -4 -n -c 1 -s 1300 -W 2 -w 5 10.77.0.1 >/dev/null
 
+        install_client_credentials \
+            "$3/client-next.cert.der" \
+            "$3/client-next.key.der"
+        run_client_reload
+        wait_for_log_prefix_count \
+            vpn_client_credentials_active:credential_generation=1: \
+            1 \
+            "$client_pid" \
+            "$3/product.client.log" \
+            "客户端在线 TLS 凭据切换"
+        wait_for_log_prefix_count \
+            vpn_client_reconnected: \
+            $((reconnects_before + 1)) \
+            "$client_pid" \
+            "$3/product.client.log" \
+            "新客户端证书的真实 mTLS/FWC1 代际"
+        credential_connection_line=$(grep -F \
+            "vpn_client_connection_active:" "$3/product.client.log" | tail -n 1)
+        credential_connection_id=$(log_field \
+            "$credential_connection_line" connection_stable_id)
+        credential_session_generation=$(log_field \
+            "$credential_connection_line" session_generation)
+        if [ -z "$credential_connection_id" ] \
+            || [ -z "$credential_session_generation" ] \
+            || [ "$credential_connection_id" = "$active_connection_id" ] \
+            || [ "$credential_session_generation" -le "$active_session_generation" ]; then
+            cat "$3/product.client.log" >&2 || true
+            echo "客户端凭据切换未产生严格的新 QUIC/FWC1 代际" >&2
+            exit 1
+        fi
+        test "$(grep -Fc "vpn_client_connection_lost:" \
+            "$3/product.client.log" || true)" = "$connection_losses_before"
+        require_log_line_once ready "$3/product.client.log" "客户端在线凭据切换"
+        kill -0 "$client_pid"
+        ip netns exec fwclient \
+            ping -4 -n -c 1 -s 1300 -W 2 -w 5 10.77.0.1 >/dev/null
+        ip netns exec fwclient \
+            ping -6 -n -c 1 -s 1300 -W 2 -w 5 fd77::1 >/dev/null
+
         jq \
             --arg replacement "$replacement_fingerprint" \
             ".identities[0].fingerprints = [\$replacement]" \
@@ -1096,9 +1204,57 @@ unshare \
             >"$3/vpn-identities-revoked.json"
         install_identity_candidate "$3/vpn-identities-revoked.json"
         run_product_reload
+        test "$(grep -Fc "vpn_client_connection_lost:" \
+            "$3/product.client.log" || true)" = "$connection_losses_before"
+        kill -0 "$client_pid"
+        ip netns exec fwclient \
+            ping -4 -n -c 1 -s 1300 -W 2 -w 5 10.77.0.1 >/dev/null
+
+        install_client_credentials \
+            "$3/client-original.cert.der" \
+            "$3/client-original.key.der"
+        run_client_reload
+        wait_for_log_prefix_count \
+            vpn_client_reconnect_failed:vpn_product_endpoint_connection:vpn_product_connection_client_session:vpn_session_rejected:2:0 \
+            1 \
+            "$client_pid" \
+            "$3/product.client.log" \
+            "已撤销旧客户端证书的新 FWC1 会话"
+        kill -0 "$client_pid"
+        if ip netns exec fwclient \
+            ping -4 -n -c 1 -s 1300 -W 1 -w 2 10.77.0.1 >/dev/null 2>&1; then
+            echo "旧客户端证书撤销后的离线流量意外成功" >&2
+            exit 1
+        fi
+
+        install_client_credentials \
+            "$3/client-next.cert.der" \
+            "$3/client-next.key.der"
+        run_client_reload
+        wait_for_log_prefix_count \
+            vpn_client_credentials_active:credential_generation=3: \
+            1 \
+            "$client_pid" \
+            "$3/product.client.log" \
+            "离线客户端恢复新证书"
+        test "$(grep -Fc "vpn_client_credentials_active:" \
+            "$3/product.client.log" || true)" = 2
+        wait_for_log_prefix_count \
+            vpn_client_reconnected: \
+            $((reconnects_before + 2)) \
+            "$client_pid" \
+            "$3/product.client.log" \
+            "离线 reload 恢复的新客户端证书"
+        require_log_line_once ready "$3/product.client.log" "客户端离线凭据恢复"
+        kill -0 "$client_pid"
+        ip netns exec fwclient \
+            ping -4 -n -c 1 -s 1300 -W 2 -w 5 10.77.0.1 >/dev/null
+
+        install_identity_candidate "$3/vpn-identities.original.json"
+        run_product_reload
         wait_for_log_prefix_count \
             vpn_client_connection_lost: \
-            1 \
+            $((connection_losses_before + 1)) \
             "$client_pid" \
             "$3/product.client.log" \
             "身份指纹在线撤销后的 VPN 产品客户端"
@@ -1116,15 +1272,15 @@ unshare \
         fi
         kill -0 "$server_pid"
 
-        install_identity_candidate "$3/vpn-identities.original.json"
+        install_identity_candidate "$3/vpn-identities-revoked.json"
         run_product_reload
         wait_for_log_prefix_count \
             vpn_client_reconnected: \
-            1 \
+            $((reconnects_before + 3)) \
             "$client_pid" \
             "$3/product.client.log" \
             "身份恢复后的 VPN 产品客户端"
-        reconnect_line=$(grep -F "vpn_client_reconnected:" "$3/product.client.log" | head -n 1)
+        reconnect_line=$(grep -F "vpn_client_reconnected:" "$3/product.client.log" | tail -n 1)
         offline_dropped_packets=$(
             printf "%s\n" "$reconnect_line" |
                 sed -n "s/.*offline_dropped_packets=\([0-9][0-9]*\).*/\1/p"

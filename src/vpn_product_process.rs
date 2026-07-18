@@ -32,11 +32,12 @@ use crate::vpn_packet_bridge::{
 };
 use crate::vpn_product_endpoint::connect_vpn_client_product_endpoint_with_packet_pump;
 use crate::{
-    VpnDatagramRuntimeStopReason, VpnPacketBridgeStopReason, VpnProductBootstrapError,
-    VpnProductConnectFailure, VpnProductConnectionStartError, VpnProductEndpointError,
-    VpnProductEndpointLimits, VpnProductPathOpenError, VpnRejectReason, VpnServerProductBootstrap,
-    VpnServerProductEndpointStopReason, VpnSessionError, VpnTunAttachError,
-    attach_existing_vpn_tun, load_vpn_client_product_bootstrap, load_vpn_server_product_bootstrap,
+    VpnClientProductBootstrap, VpnDatagramRuntimeStopReason, VpnPacketBridgeStopReason,
+    VpnProductBootstrapError, VpnProductConnectFailure, VpnProductConnectionStartError,
+    VpnProductEndpointError, VpnProductEndpointLimits, VpnProductPathOpenError, VpnRejectReason,
+    VpnServerProductBootstrap, VpnServerProductEndpointStopReason, VpnSessionError,
+    VpnTunAttachError, attach_existing_vpn_tun, load_vpn_client_product_bootstrap,
+    load_vpn_client_product_bootstrap_for_reload, load_vpn_server_product_bootstrap,
     start_vpn_server_product_endpoint,
 };
 
@@ -46,12 +47,18 @@ const SERVER_READY_NOTIFICATION: &str = "READY=1\nSTATUS=FlowWeave VPN server re
 const CLIENT_READY_NOTIFICATION: &str = "READY=1\nSTATUS=FlowWeave VPN client ready";
 const STOPPING_NOTIFICATION: &str = "STOPPING=1\nSTATUS=FlowWeave VPN stopping";
 const SERVER_RELOAD_SOCKET_ENV: &str = "FLOWWEAVE_VPN_SERVER_RELOAD_SOCKET";
+const CLIENT_RELOAD_SOCKET_ENV: &str = "FLOWWEAVE_VPN_CLIENT_RELOAD_SOCKET";
 const SERVER_RELOAD_REQUEST: &[u8; 4] = b"FWR1";
+const CLIENT_RELOAD_REQUEST: &[u8; 4] = b"FWR2";
 const SERVER_RELOAD_RESPONSE_OK: u8 = 0;
 const SERVER_RELOAD_RESPONSE_REJECTED: u8 = 1;
 const SERVER_RELOAD_IO_TIMEOUT: Duration = Duration::from_secs(2);
 const SERVER_RELOAD_SUCCEEDED_STATUS: &str = "STATUS=FlowWeave VPN identities reloaded";
 const SERVER_RELOAD_FAILED_STATUS: &str = "STATUS=FlowWeave VPN identity reload rejected";
+const CLIENT_RELOAD_SUCCEEDED_STATUS: &str = "STATUS=FlowWeave VPN client credentials reloaded";
+const CLIENT_RELOAD_FAILED_STATUS: &str = "STATUS=FlowWeave VPN client credential reload rejected";
+const CLIENT_CREDENTIAL_RECONNECTING_STATUS: &str =
+    "STATUS=FlowWeave VPN client activating reloaded credentials";
 const CLIENT_STARTING_STATUS: &str = "STATUS=FlowWeave VPN client waiting for initial connection";
 const CLIENT_RECONNECTING_STATUS: &str = "STATUS=FlowWeave VPN client reconnecting";
 const CLIENT_RECONNECTED_STATUS: &str = "STATUS=FlowWeave VPN client reconnected";
@@ -84,6 +91,10 @@ pub struct VpnProductProcessReport {
     pub packet_bridge_stop_reason: Option<VpnPacketBridgeStopReason>,
     pub identity_reloads: u64,
     pub identity_reload_failures: u64,
+    pub credential_generation: u64,
+    pub credential_reloads: u64,
+    pub credential_reload_failures: u64,
+    pub credential_activations: u64,
     pub startup_attempts: u64,
     pub startup_failures: u64,
     pub startup_millis: u64,
@@ -201,6 +212,34 @@ impl fmt::Display for VpnServerReloadRequestError {
 
 impl Error for VpnServerReloadRequestError {}
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VpnClientReloadRequestError {
+    SocketInvalid,
+    Connect(io::ErrorKind),
+    Io(io::ErrorKind),
+    Timeout,
+    Rejected,
+    InvalidResponse,
+}
+
+impl fmt::Display for VpnClientReloadRequestError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Connect(kind) => write!(formatter, "vpn_client_reload_connect:{kind:?}"),
+            Self::Io(kind) => write!(formatter, "vpn_client_reload_io:{kind:?}"),
+            other => formatter.write_str(match other {
+                Self::SocketInvalid => "vpn_client_reload_socket_invalid",
+                Self::Timeout => "vpn_client_reload_timeout",
+                Self::Rejected => "vpn_client_reload_rejected",
+                Self::InvalidResponse => "vpn_client_reload_invalid_response",
+                Self::Connect(_) | Self::Io(_) => unreachable!(),
+            }),
+        }
+    }
+}
+
+impl Error for VpnClientReloadRequestError {}
+
 impl Error for VpnProductProcessError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
@@ -237,16 +276,16 @@ impl From<VpnClientPacketPumpStartError> for VpnProductProcessError {
     }
 }
 
-struct VpnServerReloadControl {
+struct VpnReloadControl {
     listener: UnixListener,
     path: PathBuf,
     device: u64,
     inode: u64,
 }
 
-impl VpnServerReloadControl {
-    fn bind_from_environment() -> Result<Option<Self>, VpnProductProcessError> {
-        let Some(path) = env::var_os(SERVER_RELOAD_SOCKET_ENV).map(PathBuf::from) else {
+impl VpnReloadControl {
+    fn bind_from_environment(variable: &str) -> Result<Option<Self>, VpnProductProcessError> {
+        let Some(path) = env::var_os(variable).map(PathBuf::from) else {
             return Ok(None);
         };
         Self::bind(&path).map(Some)
@@ -303,7 +342,7 @@ impl VpnServerReloadControl {
     }
 }
 
-impl Drop for VpnServerReloadControl {
+impl Drop for VpnReloadControl {
     fn drop(&mut self) {
         let Ok(metadata) = fs::symlink_metadata(&self.path) else {
             return;
@@ -362,8 +401,40 @@ pub async fn request_vpn_server_identity_reload(
     }
 }
 
+pub async fn request_vpn_client_credential_reload(
+    socket_path: impl AsRef<Path>,
+) -> Result<(), VpnClientReloadRequestError> {
+    let socket_path = socket_path.as_ref();
+    validate_reload_socket_path(socket_path)
+        .map_err(|()| VpnClientReloadRequestError::SocketInvalid)?;
+    let mut stream = timeout(SERVER_RELOAD_IO_TIMEOUT, UnixStream::connect(socket_path))
+        .await
+        .map_err(|_| VpnClientReloadRequestError::Timeout)?
+        .map_err(|error| VpnClientReloadRequestError::Connect(error.kind()))?;
+    let (response, trailing_response_bytes) = timeout(SERVER_RELOAD_IO_TIMEOUT, async {
+        stream.write_all(CLIENT_RELOAD_REQUEST).await?;
+        stream.shutdown().await?;
+        let mut response = [0_u8; 1];
+        stream.read_exact(&mut response).await?;
+        let mut trailing = [0_u8; 1];
+        let trailing_response_bytes = stream.read(&mut trailing).await?;
+        Ok::<(u8, usize), io::Error>((response[0], trailing_response_bytes))
+    })
+    .await
+    .map_err(|_| VpnClientReloadRequestError::Timeout)?
+    .map_err(|error| VpnClientReloadRequestError::Io(error.kind()))?;
+    if trailing_response_bytes != 0 {
+        return Err(VpnClientReloadRequestError::InvalidResponse);
+    }
+    match response {
+        SERVER_RELOAD_RESPONSE_OK => Ok(()),
+        SERVER_RELOAD_RESPONSE_REJECTED => Err(VpnClientReloadRequestError::Rejected),
+        _ => Err(VpnClientReloadRequestError::InvalidResponse),
+    }
+}
+
 async fn accept_reload_request(
-    control: Option<&VpnServerReloadControl>,
+    control: Option<&VpnReloadControl>,
 ) -> Result<UnixStream, VpnProductProcessError> {
     match control {
         Some(control) => control.accept().await,
@@ -437,7 +508,7 @@ pub async fn run_vpn_server_product_process(
 ) -> Result<VpnProductProcessReport, VpnProductProcessError> {
     let mut signals = ProductSignals::new()?;
     let bootstrap = Arc::new(load_vpn_server_product_bootstrap(config_path.as_ref())?);
-    let reload_control = VpnServerReloadControl::bind_from_environment()?;
+    let reload_control = VpnReloadControl::bind_from_environment(SERVER_RELOAD_SOCKET_ENV)?;
     let mut reload_counters = ServerReloadCounters::default();
     let attached =
         attach_existing_vpn_tun(bootstrap.config().tun_name(), bootstrap.config().tun_mtu())?;
@@ -505,6 +576,10 @@ struct ClientSupervisorStats {
     established_path_count: usize,
     completed_sessions: u64,
     last_packet_bridge_stop_reason: Option<VpnPacketBridgeStopReason>,
+    credential_generation: u64,
+    credential_reloads: u64,
+    credential_reload_failures: u64,
+    credential_activations: u64,
     startup_attempts: u64,
     startup_failures: u64,
     startup_millis: u64,
@@ -526,6 +601,10 @@ impl ClientSupervisorStats {
             established_path_count: 0,
             completed_sessions: 0,
             last_packet_bridge_stop_reason: None,
+            credential_generation: 0,
+            credential_reloads: 0,
+            credential_reload_failures: 0,
+            credential_activations: 0,
             startup_attempts: 0,
             startup_failures: 0,
             startup_millis: 0,
@@ -574,6 +653,10 @@ impl ClientSupervisorStats {
             packet_bridge_stop_reason: self.last_packet_bridge_stop_reason,
             identity_reloads: 0,
             identity_reload_failures: 0,
+            credential_generation: self.credential_generation,
+            credential_reloads: self.credential_reloads,
+            credential_reload_failures: self.credential_reload_failures,
+            credential_activations: self.credential_activations,
             startup_attempts: self.startup_attempts,
             startup_failures: self.startup_failures,
             startup_millis: self.startup_millis,
@@ -590,6 +673,97 @@ impl ClientSupervisorStats {
             offline_dropped_bytes: pump.metrics.offline_dropped_bytes,
         })
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClientCredentialReloadOutcome {
+    Rejected,
+    Unchanged,
+    Changed,
+}
+
+fn reload_client_credentials(
+    config_path: &Path,
+    bootstrap: &mut VpnClientProductBootstrap,
+    stats: &mut ClientSupervisorStats,
+) -> ClientCredentialReloadOutcome {
+    match load_vpn_client_product_bootstrap_for_reload(config_path, bootstrap) {
+        Ok(candidate) => {
+            let changed = candidate.credential_revision() != bootstrap.credential_revision();
+            if changed {
+                *bootstrap = candidate;
+                stats.credential_generation = stats.credential_generation.saturating_add(1);
+            }
+            stats.credential_reloads = stats.credential_reloads.saturating_add(1);
+            let _ = notify_systemd(CLIENT_RELOAD_SUCCEEDED_STATUS);
+            eprintln!(
+                "vpn_client_credentials_reloaded:credential_generation={}:changed={changed}",
+                stats.credential_generation
+            );
+            if changed {
+                ClientCredentialReloadOutcome::Changed
+            } else {
+                ClientCredentialReloadOutcome::Unchanged
+            }
+        }
+        Err(error) => {
+            stats.credential_reload_failures = stats.credential_reload_failures.saturating_add(1);
+            let _ = notify_systemd(CLIENT_RELOAD_FAILED_STATUS);
+            eprintln!("vpn_client_credentials_reload_failed:{error}");
+            ClientCredentialReloadOutcome::Rejected
+        }
+    }
+}
+
+async fn handle_client_reload_request(
+    mut stream: UnixStream,
+    config_path: &Path,
+    bootstrap: &mut VpnClientProductBootstrap,
+    stats: &mut ClientSupervisorStats,
+) -> ClientCredentialReloadOutcome {
+    let request = timeout(SERVER_RELOAD_IO_TIMEOUT, async {
+        let mut request = [0_u8; CLIENT_RELOAD_REQUEST.len()];
+        stream.read_exact(&mut request).await?;
+        let mut trailing = [0_u8; 1];
+        let trailing_request_bytes = stream.read(&mut trailing).await?;
+        Ok::<([u8; CLIENT_RELOAD_REQUEST.len()], usize), io::Error>((
+            request,
+            trailing_request_bytes,
+        ))
+    })
+    .await;
+    let outcome = match request {
+        Ok(Ok((request, 0))) if &request == CLIENT_RELOAD_REQUEST => {
+            reload_client_credentials(config_path, bootstrap, stats)
+        }
+        Ok(Ok(_)) | Ok(Err(_)) | Err(_) => ClientCredentialReloadOutcome::Rejected,
+    };
+    let response = if outcome == ClientCredentialReloadOutcome::Rejected {
+        SERVER_RELOAD_RESPONSE_REJECTED
+    } else {
+        SERVER_RELOAD_RESPONSE_OK
+    };
+    let _ = timeout(SERVER_RELOAD_IO_TIMEOUT, stream.write_all(&[response])).await;
+    outcome
+}
+
+fn complete_client_credential_activation(
+    runtime: &crate::VpnClientProductEndpointRuntime,
+    stats: &mut ClientSupervisorStats,
+) {
+    stats.credential_activations = stats.credential_activations.saturating_add(1);
+    eprintln!(
+        "vpn_client_credentials_active:credential_generation={}:connection_stable_id={}:session_generation={}",
+        stats.credential_generation,
+        runtime.connection_stable_id().unwrap_or_default(),
+        runtime.session_generation().unwrap_or_default()
+    );
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClientReconnectCause {
+    ConnectionLoss,
+    CredentialReload,
 }
 
 #[derive(Debug, Default)]
@@ -745,11 +919,14 @@ fn client_session_start_error_is_retryable(error: &VpnSessionError) -> bool {
 
 enum ClientConnectEvent {
     Signal(ProductSignal),
+    ReloadRequest(UnixStream),
     Complete(Result<Box<crate::VpnClientProductEndpointRuntime>, VpnProductEndpointError>),
 }
 
 enum ClientActiveEvent {
     Signal(ProductSignal),
+    ReloadRequest(UnixStream),
+    CredentialReload,
     PumpStopped(VpnClientPacketPumpReport),
     ConnectionStopped(Box<crate::VpnClientProductEndpointReport>),
     NetworkEvent(io::Result<VpnNetworkRecoveryEvent>),
@@ -757,6 +934,7 @@ enum ClientActiveEvent {
 
 enum ClientReconnectWaitEvent {
     Signal(ProductSignal),
+    ReloadRequest(UnixStream),
     PumpStopped(VpnClientPacketPumpReport),
     Timer,
     NetworkEvent(VpnNetworkRecoveryEvent),
@@ -764,6 +942,7 @@ enum ClientReconnectWaitEvent {
 
 async fn wait_for_client_retry(
     signals: &mut ProductSignals,
+    reload_control: Option<&VpnReloadControl>,
     packet_pump: &mut crate::VpnClientPacketPump,
     network_event_monitor: &mut Option<VpnNetworkEventMonitor>,
     stats: &mut ClientSupervisorStats,
@@ -775,6 +954,9 @@ async fn wait_for_client_retry(
         let event = tokio::select! {
             biased;
             signal = signals.recv() => ClientReconnectWaitEvent::Signal(signal?),
+            request = accept_reload_request(reload_control) => {
+                ClientReconnectWaitEvent::ReloadRequest(request?)
+            }
             pump = packet_pump.join() => ClientReconnectWaitEvent::PumpStopped(pump),
             _ = &mut timer => ClientReconnectWaitEvent::Timer,
             event = wait_for_network_recovery_event(
@@ -920,7 +1102,9 @@ pub async fn run_vpn_client_product_process(
     config_path: impl AsRef<Path>,
 ) -> Result<VpnProductProcessReport, VpnProductProcessError> {
     let mut signals = ProductSignals::new()?;
-    let bootstrap = load_vpn_client_product_bootstrap(config_path.as_ref())?;
+    let config_path = config_path.as_ref().to_owned();
+    let mut bootstrap = load_vpn_client_product_bootstrap(&config_path)?;
+    let reload_control = VpnReloadControl::bind_from_environment(CLIENT_RELOAD_SOCKET_ENV)?;
     let attached =
         attach_existing_vpn_tun(bootstrap.config().tun_name(), bootstrap.config().tun_mtu())?;
     let mut packet_pump =
@@ -941,6 +1125,7 @@ pub async fn run_vpn_client_product_process(
     let startup_started = Instant::now();
     let mut startup_backoff = VpnClientReconnectBackoff::default();
     let mut retry_minimum = None;
+    let mut credential_activation_pending = false;
     let mut runtime = loop {
         if let Some(minimum) = retry_minimum.take() {
             let schedule = startup_backoff.next_schedule(minimum);
@@ -950,6 +1135,7 @@ pub async fn run_vpn_client_product_process(
             );
             let wait_event = wait_for_client_retry(
                 &mut signals,
+                reload_control.as_ref(),
                 &mut packet_pump,
                 &mut network_event_monitor,
                 &mut stats,
@@ -958,13 +1144,34 @@ pub async fn run_vpn_client_product_process(
             .await?;
             match wait_event {
                 ClientReconnectWaitEvent::Signal(signal) => {
-                    stats.record_startup_duration(startup_started.elapsed());
-                    let stopping = notify_systemd(STOPPING_NOTIFICATION);
-                    packet_pump.request_shutdown();
-                    let pump_report = packet_pump.join().await;
-                    drop(attached);
-                    stopping?;
-                    return finish_clean_stop(stats.report(signal, pump_report)?);
+                    if signal == ProductSignal::Hangup {
+                        if reload_client_credentials(&config_path, &mut bootstrap, &mut stats)
+                            == ClientCredentialReloadOutcome::Changed
+                        {
+                            credential_activation_pending = true;
+                        }
+                    } else {
+                        stats.record_startup_duration(startup_started.elapsed());
+                        let stopping = notify_systemd(STOPPING_NOTIFICATION);
+                        packet_pump.request_shutdown();
+                        let pump_report = packet_pump.join().await;
+                        drop(attached);
+                        stopping?;
+                        return finish_clean_stop(stats.report(signal, pump_report)?);
+                    }
+                }
+                ClientReconnectWaitEvent::ReloadRequest(stream) => {
+                    if handle_client_reload_request(
+                        stream,
+                        &config_path,
+                        &mut bootstrap,
+                        &mut stats,
+                    )
+                    .await
+                        == ClientCredentialReloadOutcome::Changed
+                    {
+                        credential_activation_pending = true;
+                    }
                 }
                 ClientReconnectWaitEvent::PumpStopped(pump_report) => {
                     stats.record_startup_duration(startup_started.elapsed());
@@ -985,6 +1192,9 @@ pub async fn run_vpn_client_product_process(
         let startup = tokio::select! {
             biased;
             signal = signals.recv() => ClientConnectEvent::Signal(signal?),
+            request = accept_reload_request(reload_control.as_ref()) => {
+                ClientConnectEvent::ReloadRequest(request?)
+            }
             runtime = connect_vpn_client_product_endpoint_with_packet_pump(
                 &bootstrap,
                 attached.device(),
@@ -1007,11 +1217,15 @@ pub async fn run_vpn_client_product_process(
                 }
                 stats.record_startup_duration(startup_started.elapsed());
                 discard_pending_network_events(&mut network_event_monitor, &mut stats);
+                if credential_activation_pending {
+                    complete_client_credential_activation(&runtime, &mut stats);
+                    credential_activation_pending = false;
+                }
                 break runtime;
             }
             ClientConnectEvent::Complete(Err(error)) => {
                 stats.startup_failures = stats.startup_failures.saturating_add(1);
-                if !client_connect_error_is_retryable(&error) {
+                if !credential_activation_pending && !client_connect_error_is_retryable(&error) {
                     let _ = packet_pump.shutdown().await;
                     drop(attached);
                     return Err(VpnProductProcessError::Endpoint(error));
@@ -1021,33 +1235,57 @@ pub async fn run_vpn_client_product_process(
                 retry_minimum = Some(endpoint_retry_after(&error));
             }
             ClientConnectEvent::Signal(signal) => {
-                stats.record_startup_duration(startup_started.elapsed());
-                let stopping = notify_systemd(STOPPING_NOTIFICATION);
-                packet_pump.request_shutdown();
-                let pump_report = packet_pump.join().await;
-                drop(attached);
-                stopping?;
-                return finish_clean_stop(stats.report(signal, pump_report)?);
+                if signal == ProductSignal::Hangup {
+                    if reload_client_credentials(&config_path, &mut bootstrap, &mut stats)
+                        == ClientCredentialReloadOutcome::Changed
+                    {
+                        credential_activation_pending = true;
+                    }
+                } else {
+                    stats.record_startup_duration(startup_started.elapsed());
+                    let stopping = notify_systemd(STOPPING_NOTIFICATION);
+                    packet_pump.request_shutdown();
+                    let pump_report = packet_pump.join().await;
+                    drop(attached);
+                    stopping?;
+                    return finish_clean_stop(stats.report(signal, pump_report)?);
+                }
+            }
+            ClientConnectEvent::ReloadRequest(stream) => {
+                if handle_client_reload_request(stream, &config_path, &mut bootstrap, &mut stats)
+                    .await
+                    == ClientCredentialReloadOutcome::Changed
+                {
+                    credential_activation_pending = true;
+                }
             }
         }
     };
     if let Some(signal) = signals.recv_pending().await? {
-        let stopping = notify_systemd(STOPPING_NOTIFICATION);
-        runtime.request_shutdown();
-        let report = runtime.join().await;
-        if !client_connection_stopped_cleanly(&report) {
+        if signal == ProductSignal::Hangup {
+            if reload_client_credentials(&config_path, &mut bootstrap, &mut stats)
+                == ClientCredentialReloadOutcome::Changed
+            {
+                credential_activation_pending = true;
+            }
+        } else {
+            let stopping = notify_systemd(STOPPING_NOTIFICATION);
+            runtime.request_shutdown();
+            let report = runtime.join().await;
+            if !client_connection_stopped_cleanly(&report) {
+                packet_pump.request_shutdown();
+                let _ = packet_pump.join().await;
+                drop(attached);
+                stopping?;
+                return Err(VpnProductProcessError::ClientShutdownIncomplete);
+            }
+            stats.record_connection(report);
             packet_pump.request_shutdown();
-            let _ = packet_pump.join().await;
+            let pump_report = packet_pump.join().await;
             drop(attached);
             stopping?;
-            return Err(VpnProductProcessError::ClientShutdownIncomplete);
+            return finish_clean_stop(stats.report(signal, pump_report)?);
         }
-        stats.record_connection(report);
-        packet_pump.request_shutdown();
-        let pump_report = packet_pump.join().await;
-        drop(attached);
-        stopping?;
-        return finish_clean_stop(stats.report(signal, pump_report)?);
     }
     emit_client_path_snapshot(&runtime);
     if let Err(error) = emit_ready(VpnProductProcessRole::Client) {
@@ -1060,33 +1298,62 @@ pub async fn run_vpn_client_product_process(
 
     let mut last_network_path_rebind = None;
     loop {
-        let active_event = tokio::select! {
-            biased;
-            signal = signals.recv() => ClientActiveEvent::Signal(signal?),
-            pump = packet_pump.join() => ClientActiveEvent::PumpStopped(pump),
-            report = runtime.join() => ClientActiveEvent::ConnectionStopped(Box::new(report)),
-            event = wait_for_network_event(&mut network_event_monitor) => {
-                ClientActiveEvent::NetworkEvent(event)
+        let active_event = if credential_activation_pending {
+            ClientActiveEvent::CredentialReload
+        } else {
+            tokio::select! {
+                biased;
+                signal = signals.recv() => ClientActiveEvent::Signal(signal?),
+                request = accept_reload_request(reload_control.as_ref()) => {
+                    ClientActiveEvent::ReloadRequest(request?)
+                }
+                pump = packet_pump.join() => ClientActiveEvent::PumpStopped(pump),
+                report = runtime.join() => ClientActiveEvent::ConnectionStopped(Box::new(report)),
+                event = wait_for_network_event(&mut network_event_monitor) => {
+                    ClientActiveEvent::NetworkEvent(event)
+                }
             }
         };
-        match active_event {
+        let reconnect_cause = match active_event {
             ClientActiveEvent::Signal(signal) => {
-                let stopping = notify_systemd(STOPPING_NOTIFICATION);
-                runtime.request_shutdown();
-                let report = runtime.join().await;
-                if !client_connection_stopped_cleanly(&report) {
+                if signal == ProductSignal::Hangup {
+                    if reload_client_credentials(&config_path, &mut bootstrap, &mut stats)
+                        == ClientCredentialReloadOutcome::Changed
+                    {
+                        credential_activation_pending = true;
+                        ClientReconnectCause::CredentialReload
+                    } else {
+                        continue;
+                    }
+                } else {
+                    let stopping = notify_systemd(STOPPING_NOTIFICATION);
+                    runtime.request_shutdown();
+                    let report = runtime.join().await;
+                    if !client_connection_stopped_cleanly(&report) {
+                        packet_pump.request_shutdown();
+                        let _ = packet_pump.join().await;
+                        drop(attached);
+                        stopping?;
+                        return Err(VpnProductProcessError::ClientShutdownIncomplete);
+                    }
+                    stats.record_connection(report);
                     packet_pump.request_shutdown();
-                    let _ = packet_pump.join().await;
+                    let pump_report = packet_pump.join().await;
                     drop(attached);
                     stopping?;
-                    return Err(VpnProductProcessError::ClientShutdownIncomplete);
+                    return finish_clean_stop(stats.report(signal, pump_report)?);
                 }
-                stats.record_connection(report);
-                packet_pump.request_shutdown();
-                let pump_report = packet_pump.join().await;
-                drop(attached);
-                stopping?;
-                return finish_clean_stop(stats.report(signal, pump_report)?);
+            }
+            ClientActiveEvent::ReloadRequest(stream) => {
+                if handle_client_reload_request(stream, &config_path, &mut bootstrap, &mut stats)
+                    .await
+                    == ClientCredentialReloadOutcome::Changed
+                {
+                    credential_activation_pending = true;
+                    ClientReconnectCause::CredentialReload
+                } else {
+                    continue;
+                }
             }
             ClientActiveEvent::PumpStopped(pump_report) => {
                 runtime.request_shutdown();
@@ -1098,6 +1365,7 @@ pub async fn run_vpn_client_product_process(
                     pump_report.stop_reason,
                 ));
             }
+            ClientActiveEvent::CredentialReload => ClientReconnectCause::CredentialReload,
             ClientActiveEvent::ConnectionStopped(report) => {
                 let report = *report;
                 if !client_connection_is_retryable(&report) {
@@ -1114,6 +1382,7 @@ pub async fn run_vpn_client_product_process(
                 );
                 stats.record_connection(report);
                 let _ = notify_systemd(CLIENT_RECONNECTING_STATUS);
+                ClientReconnectCause::ConnectionLoss
             }
             ClientActiveEvent::NetworkEvent(Ok(event)) => {
                 if event == VpnNetworkRecoveryEvent::RouteAdded {
@@ -1143,53 +1412,95 @@ pub async fn run_vpn_client_product_process(
                 network_event_monitor = None;
                 continue;
             }
+        };
+
+        if reconnect_cause == ClientReconnectCause::CredentialReload {
+            let _ = notify_systemd(CLIENT_CREDENTIAL_RECONNECTING_STATUS);
+            runtime.request_shutdown();
+            let report = runtime.join().await;
+            if !client_connection_stopped_cleanly(&report) {
+                packet_pump.request_shutdown();
+                let _ = packet_pump.join().await;
+                drop(attached);
+                return Err(VpnProductProcessError::ClientShutdownIncomplete);
+            }
+            stats.record_connection(report);
         }
 
         let offline_started = Instant::now();
         let mut backoff = VpnClientReconnectBackoff::default();
         let mut minimum_delay = Duration::ZERO;
+        let mut wait_before_attempt = reconnect_cause != ClientReconnectCause::CredentialReload;
         loop {
-            let schedule = backoff.next_schedule(std::mem::take(&mut minimum_delay));
-            eprintln!(
-                "vpn_client_reconnect_waiting:{}",
-                schedule.timer_delay.as_millis()
-            );
-            let wait_event = wait_for_client_retry(
-                &mut signals,
-                &mut packet_pump,
-                &mut network_event_monitor,
-                &mut stats,
-                schedule,
-            )
-            .await?;
-            match wait_event {
-                ClientReconnectWaitEvent::Signal(signal) => {
-                    stats.record_offline_duration(offline_started.elapsed());
-                    let stopping = notify_systemd(STOPPING_NOTIFICATION);
-                    packet_pump.request_shutdown();
-                    let pump_report = packet_pump.join().await;
-                    drop(attached);
-                    stopping?;
-                    return finish_clean_stop(stats.report(signal, pump_report)?);
-                }
-                ClientReconnectWaitEvent::PumpStopped(pump_report) => {
-                    stats.record_offline_duration(offline_started.elapsed());
-                    drop(attached);
-                    let _ = notify_systemd("STATUS=FlowWeave VPN client packet pump stopped");
-                    return Err(VpnProductProcessError::ClientPacketPumpStopped(
-                        pump_report.stop_reason,
-                    ));
-                }
-                ClientReconnectWaitEvent::Timer => {}
-                ClientReconnectWaitEvent::NetworkEvent(event) => {
-                    eprintln!("vpn_client_retry_network_event:reconnect:{event}");
+            if wait_before_attempt {
+                let schedule = backoff.next_schedule(std::mem::take(&mut minimum_delay));
+                eprintln!(
+                    "vpn_client_reconnect_waiting:{}",
+                    schedule.timer_delay.as_millis()
+                );
+                let wait_event = wait_for_client_retry(
+                    &mut signals,
+                    reload_control.as_ref(),
+                    &mut packet_pump,
+                    &mut network_event_monitor,
+                    &mut stats,
+                    schedule,
+                )
+                .await?;
+                match wait_event {
+                    ClientReconnectWaitEvent::Signal(signal) => {
+                        if signal == ProductSignal::Hangup {
+                            if reload_client_credentials(&config_path, &mut bootstrap, &mut stats)
+                                == ClientCredentialReloadOutcome::Changed
+                            {
+                                credential_activation_pending = true;
+                            }
+                        } else {
+                            stats.record_offline_duration(offline_started.elapsed());
+                            let stopping = notify_systemd(STOPPING_NOTIFICATION);
+                            packet_pump.request_shutdown();
+                            let pump_report = packet_pump.join().await;
+                            drop(attached);
+                            stopping?;
+                            return finish_clean_stop(stats.report(signal, pump_report)?);
+                        }
+                    }
+                    ClientReconnectWaitEvent::ReloadRequest(stream) => {
+                        if handle_client_reload_request(
+                            stream,
+                            &config_path,
+                            &mut bootstrap,
+                            &mut stats,
+                        )
+                        .await
+                            == ClientCredentialReloadOutcome::Changed
+                        {
+                            credential_activation_pending = true;
+                        }
+                    }
+                    ClientReconnectWaitEvent::PumpStopped(pump_report) => {
+                        stats.record_offline_duration(offline_started.elapsed());
+                        drop(attached);
+                        let _ = notify_systemd("STATUS=FlowWeave VPN client packet pump stopped");
+                        return Err(VpnProductProcessError::ClientPacketPumpStopped(
+                            pump_report.stop_reason,
+                        ));
+                    }
+                    ClientReconnectWaitEvent::Timer => {}
+                    ClientReconnectWaitEvent::NetworkEvent(event) => {
+                        eprintln!("vpn_client_retry_network_event:reconnect:{event}");
+                    }
                 }
             }
+            wait_before_attempt = true;
 
             stats.reconnect_attempts = stats.reconnect_attempts.saturating_add(1);
             let connect_event = tokio::select! {
                 biased;
                 signal = signals.recv() => ClientConnectEvent::Signal(signal?),
+                request = accept_reload_request(reload_control.as_ref()) => {
+                    ClientConnectEvent::ReloadRequest(request?)
+                }
                 runtime = connect_vpn_client_product_endpoint_with_packet_pump(
                     &bootstrap,
                     attached.device(),
@@ -1199,13 +1510,36 @@ pub async fn run_vpn_client_product_process(
             };
             match connect_event {
                 ClientConnectEvent::Signal(signal) => {
-                    stats.record_offline_duration(offline_started.elapsed());
-                    let stopping = notify_systemd(STOPPING_NOTIFICATION);
-                    packet_pump.request_shutdown();
-                    let pump_report = packet_pump.join().await;
-                    drop(attached);
-                    stopping?;
-                    return finish_clean_stop(stats.report(signal, pump_report)?);
+                    if signal == ProductSignal::Hangup {
+                        if reload_client_credentials(&config_path, &mut bootstrap, &mut stats)
+                            == ClientCredentialReloadOutcome::Changed
+                        {
+                            credential_activation_pending = true;
+                        }
+                        wait_before_attempt = false;
+                    } else {
+                        stats.record_offline_duration(offline_started.elapsed());
+                        let stopping = notify_systemd(STOPPING_NOTIFICATION);
+                        packet_pump.request_shutdown();
+                        let pump_report = packet_pump.join().await;
+                        drop(attached);
+                        stopping?;
+                        return finish_clean_stop(stats.report(signal, pump_report)?);
+                    }
+                }
+                ClientConnectEvent::ReloadRequest(stream) => {
+                    if handle_client_reload_request(
+                        stream,
+                        &config_path,
+                        &mut bootstrap,
+                        &mut stats,
+                    )
+                    .await
+                        == ClientCredentialReloadOutcome::Changed
+                    {
+                        credential_activation_pending = true;
+                    }
+                    wait_before_attempt = false;
                 }
                 ClientConnectEvent::Complete(Ok(reconnected)) => {
                     let reconnected = *reconnected;
@@ -1226,6 +1560,10 @@ pub async fn run_vpn_client_product_process(
                     stats.reconnect_successes = stats.reconnect_successes.saturating_add(1);
                     stats.record_offline_duration(offline_started.elapsed());
                     discard_pending_network_events(&mut network_event_monitor, &mut stats);
+                    if credential_activation_pending {
+                        complete_client_credential_activation(&runtime, &mut stats);
+                        credential_activation_pending = false;
+                    }
                     emit_client_path_snapshot(&runtime);
                     let metrics = packet_pump.metrics_snapshot();
                     eprintln!(
@@ -1239,7 +1577,8 @@ pub async fn run_vpn_client_product_process(
                 }
                 ClientConnectEvent::Complete(Err(error)) => {
                     stats.reconnect_failures = stats.reconnect_failures.saturating_add(1);
-                    if !client_connect_error_is_retryable(&error) {
+                    if !credential_activation_pending && !client_connect_error_is_retryable(&error)
+                    {
                         stats.record_offline_duration(offline_started.elapsed());
                         packet_pump.request_shutdown();
                         let _ = packet_pump.join().await;
@@ -1280,6 +1619,10 @@ fn finish_server_stop(
             .map(|connection| connection.packet_bridge.stop_reason),
         identity_reloads: reload_counters.succeeded,
         identity_reload_failures: reload_counters.failed,
+        credential_generation: 0,
+        credential_reloads: 0,
+        credential_reload_failures: 0,
+        credential_activations: 0,
         startup_attempts: 0,
         startup_failures: 0,
         startup_millis: 0,
@@ -1454,6 +1797,9 @@ mod tests {
             STOPPING_NOTIFICATION,
             SERVER_RELOAD_SUCCEEDED_STATUS,
             SERVER_RELOAD_FAILED_STATUS,
+            CLIENT_RELOAD_SUCCEEDED_STATUS,
+            CLIENT_RELOAD_FAILED_STATUS,
+            CLIENT_CREDENTIAL_RECONNECTING_STATUS,
             CLIENT_STARTING_STATUS,
             CLIENT_RECONNECTING_STATUS,
             CLIENT_RECONNECTED_STATUS,
@@ -1628,7 +1974,7 @@ mod tests {
         let socket_path = deployment.path.join("reload.sock");
         let bootstrap =
             Arc::new(crate::load_vpn_server_product_bootstrap(&deployment.server_config).unwrap());
-        let control = VpnServerReloadControl::bind(&socket_path).unwrap();
+        let control = VpnReloadControl::bind(&socket_path).unwrap();
         assert_eq!(
             fs::symlink_metadata(&socket_path)
                 .unwrap()
@@ -1721,6 +2067,88 @@ mod tests {
         fs::remove_file(&socket_path).unwrap();
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn client_reload_control_is_idempotent_and_commits_only_valid_credentials() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let deployment = crate::vpn_product_runtime::tests::TestDeployment::new();
+        fs::set_permissions(&deployment.path, fs::Permissions::from_mode(0o700)).unwrap();
+        let socket_path = deployment.path.join("client-reload.sock");
+        let original_config = fs::read(&deployment.client_config).unwrap();
+        let bootstrap =
+            crate::load_vpn_client_product_bootstrap(&deployment.client_config).unwrap();
+        let original_revision = bootstrap.credential_revision();
+        let control = VpnReloadControl::bind(&socket_path).unwrap();
+        let config_path = deployment.client_config.clone();
+        let server = tokio::spawn(async move {
+            let mut bootstrap = bootstrap;
+            let mut stats = ClientSupervisorStats::new();
+            let mut outcomes = Vec::new();
+            for _ in 0..4 {
+                let stream = control.accept().await.unwrap();
+                outcomes.push(
+                    handle_client_reload_request(stream, &config_path, &mut bootstrap, &mut stats)
+                        .await,
+                );
+            }
+            (bootstrap, stats, outcomes)
+        });
+
+        request_vpn_client_credential_reload(&socket_path)
+            .await
+            .unwrap();
+
+        let mut drifted: serde_json::Value = serde_json::from_slice(&original_config).unwrap();
+        drifted["tun_mtu"] = serde_json::Value::from(1400);
+        crate::vpn_product_runtime::tests::write_json(&deployment.client_config, &drifted);
+        assert_eq!(
+            request_vpn_client_credential_reload(&socket_path)
+                .await
+                .unwrap_err(),
+            VpnClientReloadRequestError::Rejected
+        );
+
+        fs::write(&deployment.client_config, &original_config).unwrap();
+        fs::set_permissions(&deployment.client_config, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::copy(
+            deployment.path.join("client-next.cert.der"),
+            deployment.path.join("client.cert.der"),
+        )
+        .unwrap();
+        assert_eq!(
+            request_vpn_client_credential_reload(&socket_path)
+                .await
+                .unwrap_err(),
+            VpnClientReloadRequestError::Rejected
+        );
+
+        fs::copy(
+            deployment.path.join("client-next.key.der"),
+            deployment.path.join("client.key.der"),
+        )
+        .unwrap();
+        request_vpn_client_credential_reload(&socket_path)
+            .await
+            .unwrap();
+
+        let (bootstrap, stats, outcomes) = server.await.unwrap();
+        assert_eq!(
+            outcomes,
+            vec![
+                ClientCredentialReloadOutcome::Unchanged,
+                ClientCredentialReloadOutcome::Rejected,
+                ClientCredentialReloadOutcome::Rejected,
+                ClientCredentialReloadOutcome::Changed,
+            ]
+        );
+        assert_eq!(stats.credential_reloads, 2);
+        assert_eq!(stats.credential_reload_failures, 2);
+        assert_eq!(stats.credential_generation, 1);
+        assert_ne!(bootstrap.credential_revision(), original_revision);
+        assert_eq!(bootstrap.config().tun_mtu(), 1500);
+        assert!(!socket_path.exists());
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn reload_control_rejects_relative_paths_and_shared_directories() {
         use std::os::unix::fs::PermissionsExt;
@@ -1732,14 +2160,14 @@ mod tests {
         let deployment = crate::vpn_product_runtime::tests::TestDeployment::new();
         fs::set_permissions(&deployment.path, fs::Permissions::from_mode(0o750)).unwrap();
         assert!(matches!(
-            VpnServerReloadControl::bind(&deployment.path.join("reload.sock")),
+            VpnReloadControl::bind(&deployment.path.join("reload.sock")),
             Err(VpnProductProcessError::ReloadSocketDirectoryUnsafe)
         ));
 
         fs::set_permissions(&deployment.path, fs::Permissions::from_mode(0o700)).unwrap();
         let socket_path = deployment.path.join("reload.sock");
         let moved_socket_path = deployment.path.join("moved.sock");
-        let control = VpnServerReloadControl::bind(&socket_path).unwrap();
+        let control = VpnReloadControl::bind(&socket_path).unwrap();
         fs::rename(&socket_path, &moved_socket_path).unwrap();
         let replacement = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
         drop(control);
@@ -1781,7 +2209,14 @@ mod tests {
                     &"ExecReload=/usr/local/bin/flowweave-vpn reload-server /run/flowweave-vpn-server/reload.sock"
                 ));
             } else {
-                assert!(!lines.iter().any(|line| line.starts_with("ExecReload=")));
+                assert!(lines.contains(&"RuntimeDirectory=flowweave-vpn-client"));
+                assert!(lines.contains(&"RuntimeDirectoryMode=0700"));
+                assert!(lines.contains(
+                    &"Environment=FLOWWEAVE_VPN_CLIENT_RELOAD_SOCKET=/run/flowweave-vpn-client/reload.sock"
+                ));
+                assert!(lines.contains(
+                    &"ExecReload=/usr/local/bin/flowweave-vpn reload-client /run/flowweave-vpn-client/reload.sock"
+                ));
             }
             assert!(lines.iter().any(|line| {
                 line.starts_with(&format!(

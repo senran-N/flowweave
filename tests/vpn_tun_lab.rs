@@ -700,12 +700,22 @@ fn prepare_endpoint_deployment(directory: &Path) {
         ExtendedKeyUsagePurpose::ClientAuth,
         &client_ca.1,
     );
+    let (next_client_certificate, next_client_key) = test_leaf(
+        "flowweave-client-next",
+        ExtendedKeyUsagePurpose::ClientAuth,
+        &client_ca.1,
+    );
     write_private_file(&directory.join("server-ca.cert.der"), server_ca.0.der());
     write_private_file(&directory.join("client-ca.cert.der"), client_ca.0.der());
     write_private_file(&directory.join("server.cert.der"), &server_certificate);
     write_private_file(&directory.join("server.key.der"), &server_key);
     write_private_file(&directory.join("client.cert.der"), &client_certificate);
     write_private_file(&directory.join("client.key.der"), &client_key);
+    write_private_file(
+        &directory.join("client-next.cert.der"),
+        &next_client_certificate,
+    );
+    write_private_file(&directory.join("client-next.key.der"), &next_client_key);
 
     write_private_json(
         &directory.join("vpn-identities.json"),

@@ -19,6 +19,7 @@ use noq::{
         pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer},
     },
 };
+use ring::digest::{Context, SHA256};
 
 use crate::vpn_packet_bridge::{
     VpnClientPacketPump, start_vpn_packet_bridge_with_client_pump,
@@ -232,6 +233,38 @@ impl Error for VpnServerIdentityReloadError {
     }
 }
 
+#[derive(Debug)]
+pub enum VpnClientCredentialReloadError {
+    ProductConfig(VpnProductConfigError),
+    ConfigurationChanged,
+    Bootstrap(VpnProductBootstrapError),
+}
+
+impl fmt::Display for VpnClientCredentialReloadError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ProductConfig(error) => {
+                write!(formatter, "vpn_client_credential_reload_config:{error}")
+            }
+            Self::Bootstrap(error) => {
+                write!(formatter, "vpn_client_credential_reload_candidate:{error}")
+            }
+            Self::ConfigurationChanged => formatter
+                .write_str("vpn_client_credential_reload_configuration_change_requires_restart"),
+        }
+    }
+}
+
+impl Error for VpnClientCredentialReloadError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::ProductConfig(error) => Some(error),
+            Self::Bootstrap(error) => Some(error),
+            Self::ConfigurationChanged => None,
+        }
+    }
+}
+
 pub struct VpnServerProductBootstrap {
     config: VpnServerProductConfig,
     tls_config: ServerConfig,
@@ -313,6 +346,7 @@ impl fmt::Debug for VpnServerProductBootstrap {
 pub struct VpnClientProductBootstrap {
     config: VpnClientProductConfig,
     tls_config: ClientConfig,
+    credential_revision: [u8; 32],
     hello: VpnHello,
     data_path_factory: VpnClientDataPathFactory,
     datagram: VpnDatagramRuntimeConfig,
@@ -327,6 +361,10 @@ impl VpnClientProductBootstrap {
 
     pub fn tls_config(&self) -> &ClientConfig {
         &self.tls_config
+    }
+
+    pub(crate) const fn credential_revision(&self) -> [u8; 32] {
+        self.credential_revision
     }
 
     pub const fn hello(&self) -> VpnHello {
@@ -876,6 +914,24 @@ pub fn load_vpn_client_product_bootstrap(
     build_client_bootstrap(config)
 }
 
+pub fn load_vpn_client_product_bootstrap_for_reload(
+    path: &Path,
+    current: &VpnClientProductBootstrap,
+) -> Result<VpnClientProductBootstrap, VpnClientCredentialReloadError> {
+    let config = load_vpn_client_product_config(path)
+        .map_err(VpnClientCredentialReloadError::ProductConfig)?;
+    if &config != current.config() {
+        return Err(VpnClientCredentialReloadError::ConfigurationChanged);
+    }
+    let mut candidate =
+        build_client_bootstrap(config).map_err(VpnClientCredentialReloadError::Bootstrap)?;
+    // Credential reload must not reset local quotas, metrics, or the single-runtime lease. The
+    // candidate differs only in its already-validated TLS material.
+    candidate.data_path_factory = current.data_path_factory.clone();
+    candidate.runtime_active = current.runtime_active.clone();
+    Ok(candidate)
+}
+
 fn validate_server_identity_budget(
     config: &VpnServerProductConfig,
     registry: &VpnIdentityRegistry,
@@ -995,15 +1051,25 @@ fn build_server_bootstrap(
 fn build_client_bootstrap(
     config: VpnClientProductConfig,
 ) -> Result<VpnClientProductBootstrap, VpnProductBootstrapError> {
-    let server_roots = read_ca_store(config.server_ca_der(), VpnProductCredentialFile::ServerCa)?;
-    let certificate = read_certificate(
+    let server_ca = read_credential(
+        config.server_ca_der(),
+        VpnProductCredentialFile::ServerCa,
+        false,
+    )?;
+    let certificate = read_credential(
         config.certificate_der(),
         VpnProductCredentialFile::ClientCertificate,
+        false,
     )?;
-    let private_key = read_private_key(
+    let private_key = read_credential(
         config.private_key_der(),
         VpnProductCredentialFile::ClientPrivateKey,
+        true,
     )?;
+    let credential_revision = client_credential_revision(&server_ca, &certificate, &private_key);
+    let server_roots = root_store_from_der(server_ca, VpnProductCredentialFile::ServerCa)?;
+    let certificate = CertificateDer::from(certificate);
+    let private_key = PrivatePkcs8KeyDer::from(private_key).into();
     let mut tls_config = build_vpn_client_tls_config(server_roots, vec![certificate], private_key)
         .map_err(VpnProductBootstrapError::TlsConfiguration)?;
     let mut transport = TransportConfig::default();
@@ -1052,6 +1118,7 @@ fn build_client_bootstrap(
     Ok(VpnClientProductBootstrap {
         config,
         tls_config,
+        credential_revision,
         hello,
         data_path_factory,
         datagram,
@@ -1116,12 +1183,38 @@ fn read_ca_store(
     path: &Path,
     file: VpnProductCredentialFile,
 ) -> Result<RootCertStore, VpnProductBootstrapError> {
-    let certificate = CertificateDer::from(read_credential(path, file, false)?);
+    root_store_from_der(read_credential(path, file, false)?, file)
+}
+
+fn root_store_from_der(
+    certificate: Vec<u8>,
+    file: VpnProductCredentialFile,
+) -> Result<RootCertStore, VpnProductBootstrapError> {
+    let certificate = CertificateDer::from(certificate);
     let mut roots = RootCertStore::empty();
     roots.add(certificate).map_err(|_| {
         VpnProductBootstrapError::Credential(VpnProductCredentialError::InvalidCertificate(file))
     })?;
     Ok(roots)
+}
+
+fn client_credential_revision(
+    server_ca: &[u8],
+    certificate: &[u8],
+    private_key: &[u8],
+) -> [u8; 32] {
+    let mut digest = Context::new(&SHA256);
+    for value in [server_ca, certificate, private_key] {
+        let length = u64::try_from(value.len())
+            .expect("credential size is bounded below the u64 conversion limit");
+        digest.update(&length.to_be_bytes());
+        digest.update(value);
+    }
+    digest
+        .finish()
+        .as_ref()
+        .try_into()
+        .expect("SHA-256 output is exactly 32 bytes")
 }
 
 fn read_credential(
@@ -1321,6 +1414,60 @@ pub(crate) mod tests {
             load_vpn_client_product_bootstrap(&mismatched.client_config),
             Err(VpnProductBootstrapError::TlsConfiguration(_))
         ));
+    }
+
+    #[test]
+    fn client_credential_reload_is_idempotent_preserves_runtime_state_and_rejects_config_drift() {
+        let deployment = TestDeployment::new();
+        let current = load_vpn_client_product_bootstrap(&deployment.client_config).unwrap();
+
+        let unchanged =
+            load_vpn_client_product_bootstrap_for_reload(&deployment.client_config, &current)
+                .unwrap();
+        assert_eq!(
+            unchanged.credential_revision(),
+            current.credential_revision()
+        );
+        assert!(Arc::ptr_eq(
+            &unchanged.runtime_active,
+            &current.runtime_active
+        ));
+
+        fs::copy(
+            deployment.path.join("client-next.cert.der"),
+            deployment.path.join("client.cert.der"),
+        )
+        .unwrap();
+        fs::copy(
+            deployment.path.join("client-next.key.der"),
+            deployment.path.join("client.key.der"),
+        )
+        .unwrap();
+        let candidate =
+            load_vpn_client_product_bootstrap_for_reload(&deployment.client_config, &current)
+                .unwrap();
+        assert_ne!(
+            candidate.credential_revision(),
+            current.credential_revision()
+        );
+        assert!(Arc::ptr_eq(
+            &candidate.runtime_active,
+            &current.runtime_active
+        ));
+
+        let mut config: serde_json::Value =
+            serde_json::from_slice(&fs::read(&deployment.client_config).unwrap()).unwrap();
+        config["tun_mtu"] = serde_json::Value::from(1400);
+        write_json(&deployment.client_config, &config);
+        assert!(matches!(
+            load_vpn_client_product_bootstrap_for_reload(&deployment.client_config, &current),
+            Err(VpnClientCredentialReloadError::ConfigurationChanged)
+        ));
+        assert_eq!(
+            current.config().tun_mtu(),
+            1500,
+            "rejected candidate must leave the current bootstrap unchanged"
+        );
     }
 
     #[test]
@@ -1631,12 +1778,23 @@ pub(crate) mod tests {
                 ExtendedKeyUsagePurpose::ClientAuth,
                 &client_ca.1,
             );
+            let (next_client_certificate, next_client_key) = test_leaf(
+                "flowweave-client-next",
+                ExtendedKeyUsagePurpose::ClientAuth,
+                &client_ca.1,
+            );
             write_file(&path.join("server-ca.cert.der"), server_ca.0.der(), 0o644);
             write_file(&path.join("client-ca.cert.der"), client_ca.0.der(), 0o644);
             write_file(&path.join("server.cert.der"), &server_certificate, 0o644);
             write_file(&path.join("server.key.der"), &server_key, 0o600);
             write_file(&path.join("client.cert.der"), &client_certificate, 0o644);
             write_file(&path.join("client.key.der"), &client_key, 0o600);
+            write_file(
+                &path.join("client-next.cert.der"),
+                &next_client_certificate,
+                0o644,
+            );
+            write_file(&path.join("client-next.key.der"), &next_client_key, 0o600);
 
             let identity = json!({
                 "config_version": 1,

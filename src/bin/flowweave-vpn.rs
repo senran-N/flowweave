@@ -3,8 +3,8 @@
 use std::{env, ffi::OsString, path::PathBuf, process::ExitCode};
 
 use flowweave_lab::{
-    request_vpn_server_identity_reload, run_vpn_client_product_process,
-    run_vpn_server_product_process,
+    request_vpn_client_credential_reload, request_vpn_server_identity_reload,
+    run_vpn_client_product_process, run_vpn_server_product_process,
 };
 
 #[tokio::main(flavor = "multi_thread")]
@@ -41,13 +41,16 @@ async fn run() -> Result<(), String> {
         (Some("reload-server"), Some(socket)) => request_vpn_server_identity_reload(socket)
             .await
             .map_err(|error| error.to_string()),
+        (Some("reload-client"), Some(socket)) => request_vpn_client_credential_reload(socket)
+            .await
+            .map_err(|error| error.to_string()),
         _ => Err(usage(&program)),
     }
 }
 
 fn usage(program: &OsString) -> String {
     format!(
-        "用法：{} <server|client> <config-path> | reload-server <control-socket>",
+        "用法：{} <server|client> <config-path> | reload-<server|client> <control-socket>",
         PathBuf::from(program).display()
     )
 }

@@ -12,10 +12,14 @@ NotifyAccess=main
 User=flowweave
 Group=flowweave
 UMask=0077
+RuntimeDirectory=flowweave-vpn-client
+RuntimeDirectoryMode=0700
+Environment=FLOWWEAVE_VPN_CLIENT_RELOAD_SOCKET=/run/flowweave-vpn-client/reload.sock
 
 ExecStartPre=+/usr/local/bin/flowweave-vpn-net prepare-client /etc/flowweave/vpn-client.json /run/flowweave-vpn-client.network.json @flowweave
 ExecStart=/usr/local/bin/flowweave-vpn client /etc/flowweave/vpn-client.json
 ExecStartPost=+/usr/local/bin/flowweave-vpn-net activate-client /etc/flowweave/vpn-client.json /run/flowweave-vpn-client.network.json
+ExecReload=/usr/local/bin/flowweave-vpn reload-client /run/flowweave-vpn-client/reload.sock
 ExecStopPost=+/usr/local/bin/flowweave-vpn-net deactivate-client /run/flowweave-vpn-client.network.json
 ExecStopPost=+/usr/local/bin/flowweave-vpn-net cleanup /run/flowweave-vpn-client.network.json
 
